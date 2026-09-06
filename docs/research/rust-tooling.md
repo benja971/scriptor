@@ -101,3 +101,29 @@ Sources : [rust-cli-recommendations (Rain)](https://rust-cli-recommendations.sun
   ancienne à l'usage.
 - Détachement de process : `process_group(0)` d'abord, `nix`/`setsid` en secours si insuffisant
   empiriquement.
+
+## 5. Lints clippy (qualité de code)
+
+`[lints.clippy]` dans `Cargo.toml` (pas `[workspace.lints.clippy]` : un seul crate, pas de
+workspace multi-paquets ici) : `pedantic` + `nursery` en `deny`, plus des lints anti-panic
+explicites (`unwrap_used`, `expect_used`, `indexing_slicing`, `arithmetic_side_effects`,
+`unreachable`, `unimplemented`, `panic`, `panic_in_result_fn`, `exit`, `as_conversions`,
+`string_slice`) et quelques lints d'idiome (`clone_on_ref_ptr`, `clone_on_copy`,
+`undocumented_unsafe_blocks = "forbid"`).
+
+Conséquence directe sur le choix d'erreurs (section 2) : `unwrap_used`/`expect_used`/`panic`
+étant interdits, `anyhow` avec `.context(...)` systématique à chaque point d'échec devient la
+voie normale de gestion d'erreur, pas une option parmi d'autres. `eyre` (fork d'anyhow, meilleur
+reporting/coloration) reste une alternative valable mais sans bénéfice concret ici (pas de
+terminal interactif pour la majorité de l'exécution, cf. process détaché) ; `thiserror` reste
+hors scope tant que scriptor n'expose pas de lib consommée par un autre crate.
+
+## 6. Parallélisme
+
+Pas de runtime async (`tokio`) : le pipeline est séquentiel par fichier (download → extraction →
+transcription), et les binaires externes sont déjà le goulot d'étranglement, pas le code Rust.
+Si un besoin de parallélisme apparaît plus tard (ex : traiter plusieurs fichiers/URLs en une
+invocation), privilégier **`rayon`** (parallel iterators, synchrone) plutôt qu'un runtime async :
+plus simple, pas de coloration `async`/`await` à propager dans tout le code pour un cas d'usage
+qui reste fondamentalement du travail CPU/IO bloquant par nature (spawn de process). Pas encore
+ajouté en dépendance : aucun besoin actuel dans le scaffold.
