@@ -38,7 +38,7 @@ fn download_with_path(url: &str, output_dir: &Path, path_env: &OsStr) -> Result<
     ensure_present_in("yt-dlp", path_env)?;
 
     fs::create_dir_all(output_dir)
-        .with_context(|| format!("impossible de créer le répertoire {}", output_dir.display()))?;
+        .with_context(|| format!("could not create directory {}", output_dir.display()))?;
 
     let filepath_marker = output_dir.join(".yt-dlp-filepath");
 
@@ -53,11 +53,11 @@ fn download_with_path(url: &str, output_dir: &Path, path_env: &OsStr) -> Result<
         .arg("after_move:filepath")
         .arg(&filepath_marker)
         .output()
-        .context("échec du lancement de `yt-dlp`")?;
+        .context("failed to launch `yt-dlp`")?;
 
     if !output.status.success() {
         bail!(
-            "`yt-dlp` a échoué (code {:?})\nstdout:\n{}\nstderr:\n{}",
+            "`yt-dlp` failed (exit code {:?})\nstdout:\n{}\nstderr:\n{}",
             output.status.code(),
             String::from_utf8_lossy(&output.stdout),
             String::from_utf8_lossy(&output.stderr),
@@ -66,7 +66,7 @@ fn download_with_path(url: &str, output_dir: &Path, path_env: &OsStr) -> Result<
 
     let recorded_path = fs::read_to_string(&filepath_marker).with_context(|| {
         format!(
-            "impossible de lire le chemin téléchargé depuis {}",
+            "could not read downloaded path from {}",
             filepath_marker.display()
         )
     })?;
@@ -76,7 +76,7 @@ fn download_with_path(url: &str, output_dir: &Path, path_env: &OsStr) -> Result<
     let title = path
         .file_stem()
         .and_then(OsStr::to_str)
-        .with_context(|| format!("impossible d'extraire le titre depuis {}", path.display()))?
+        .with_context(|| format!("could not extract title from {}", path.display()))?
         .to_owned();
 
     Ok(DownloadedMedia { path, title })
@@ -106,18 +106,18 @@ mod tests {
             "scriptor-test-download-{label}-{}-{n}",
             std::process::id()
         ));
-        fs::create_dir_all(&dir).expect("création du répertoire temporaire de test");
+        fs::create_dir_all(&dir).expect("creating test temporary directory");
         dir
     }
 
     fn write_fake_yt_dlp(bin_dir: &Path, script: &str) {
         let path = bin_dir.join("yt-dlp");
-        fs::write(&path, script).expect("écriture du faux yt-dlp");
+        fs::write(&path, script).expect("writing fake yt-dlp");
         let mut perms = fs::metadata(&path)
-            .expect("lecture des métadonnées du faux yt-dlp")
+            .expect("reading fake yt-dlp metadata")
             .permissions();
         perms.set_mode(0o755);
-        fs::set_permissions(&path, perms).expect("chmod du faux yt-dlp");
+        fs::set_permissions(&path, perms).expect("chmod on fake yt-dlp");
     }
 
     const FAKE_YT_DLP_SUCCESS: &str = r#"#!/bin/sh
@@ -160,7 +160,7 @@ exit 1
             &output_dir,
             bin_dir.as_os_str(),
         )
-        .expect("le téléchargement mocké doit réussir");
+        .expect("mocked download should succeed");
 
         assert_eq!(media.title, "Fake Title");
         assert!(media.path.is_file());
@@ -180,7 +180,7 @@ exit 1
             &output_dir,
             bin_dir.as_os_str(),
         )
-        .expect_err("le téléchargement mocké doit échouer");
+        .expect_err("mocked download should fail");
 
         assert!(format!("{err:#}").contains("boom: fake yt-dlp failure"));
 
@@ -198,7 +198,7 @@ exit 1
             &output_dir,
             empty_bin_dir.as_os_str(),
         )
-        .expect_err("doit échouer si yt-dlp est absent du PATH");
+        .expect_err("should fail if yt-dlp is absent from PATH");
 
         assert!(format!("{err:#}").contains("yt-dlp"));
 

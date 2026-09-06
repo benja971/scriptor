@@ -32,7 +32,7 @@ pub fn ensure_present(name: &str) -> Result<()> {
 /// Retourne une erreur si le binaire est absent de `path_env`.
 pub fn ensure_present_in(name: &str, path_env: &OsStr) -> Result<()> {
     if !binary_exists_in(name, path_env) {
-        bail!("binaire `{name}` introuvable dans le PATH");
+        bail!("binary `{name}` not found in PATH");
     }
     Ok(())
 }
@@ -69,18 +69,18 @@ mod tests {
             "scriptor-test-binary-{label}-{}-{n}",
             std::process::id()
         ));
-        fs::create_dir_all(&dir).expect("création du répertoire temporaire de test");
+        fs::create_dir_all(&dir).expect("creating test temporary directory");
         dir
     }
 
     fn write_executable(dir: &std::path::Path, name: &str) {
         let path = dir.join(name);
-        fs::write(&path, "#!/bin/sh\nexit 0\n").expect("écriture du faux binaire");
+        fs::write(&path, "#!/bin/sh\nexit 0\n").expect("writing fake binary");
         let mut perms = fs::metadata(&path)
-            .expect("lecture des métadonnées du faux binaire")
+            .expect("reading fake binary metadata")
             .permissions();
         perms.set_mode(0o755);
-        fs::set_permissions(&path, perms).expect("chmod du faux binaire");
+        fs::set_permissions(&path, perms).expect("chmod on fake binary");
     }
 
     #[test]
@@ -106,12 +106,10 @@ mod tests {
     fn returns_false_for_non_executable_file() {
         let dir = unique_temp_dir("non-exec");
         let path = dir.join("notexec");
-        fs::write(&path, "not a script").expect("écriture du fichier non-exécutable");
-        let mut perms = fs::metadata(&path)
-            .expect("lecture des métadonnées")
-            .permissions();
+        fs::write(&path, "not a script").expect("writing non-executable file");
+        let mut perms = fs::metadata(&path).expect("reading metadata").permissions();
         perms.set_mode(0o644);
-        fs::set_permissions(&path, perms).expect("chmod du fichier non-exécutable");
+        fs::set_permissions(&path, perms).expect("chmod on non-executable file");
 
         assert!(!binary_exists_in("notexec", OsStr::new(&dir)));
 

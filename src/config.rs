@@ -75,9 +75,9 @@ impl Config {
         }
 
         let content = fs::read_to_string(path)
-            .with_context(|| format!("lecture du fichier de configuration {}", path.display()))?;
+            .with_context(|| format!("reading configuration file {}", path.display()))?;
         let config: Self = toml::from_str(&content)
-            .with_context(|| format!("parsing du fichier de configuration {}", path.display()))?;
+            .with_context(|| format!("parsing configuration file {}", path.display()))?;
         Ok(config)
     }
 
@@ -86,24 +86,21 @@ impl Config {
     fn write_to(&self, path: &Path) -> Result<()> {
         if let Some(parent) = path.parent() {
             fs::create_dir_all(parent).with_context(|| {
-                format!(
-                    "création du répertoire de configuration {}",
-                    parent.display()
-                )
+                format!("creating configuration directory {}", parent.display())
             })?;
         }
         let serialized =
-            toml::to_string_pretty(self).context("sérialisation de la configuration en TOML")?;
+            toml::to_string_pretty(self).context("serializing configuration to TOML")?;
         fs::write(path, serialized)
-            .with_context(|| format!("écriture du fichier de configuration {}", path.display()))?;
+            .with_context(|| format!("writing configuration file {}", path.display()))?;
         Ok(())
     }
 }
 
 /// Chemin du fichier `config.toml` : `<dirs::config_dir>/scriptor/config.toml`.
 fn config_file_path() -> Result<PathBuf> {
-    let config_dir = dirs::config_dir()
-        .context("impossible de déterminer le répertoire de configuration utilisateur")?;
+    let config_dir =
+        dirs::config_dir().context("could not determine user configuration directory")?;
     Ok(config_dir.join("scriptor").join("config.toml"))
 }
 
@@ -148,10 +145,10 @@ mod tests {
 
     #[test]
     fn defaults_applied_when_file_absent() {
-        let temp = assert_fs::TempDir::new().expect("répertoire temporaire");
+        let temp = assert_fs::TempDir::new().expect("temporary directory");
         let path = temp.path().join("scriptor").join("config.toml");
 
-        let config = Config::load_from_path(&path).expect("le chargement doit réussir");
+        let config = Config::load_from_path(&path).expect("loading should succeed");
 
         assert_eq!(config.output_dir, default_output_dir());
         assert_eq!(config.model, default_model());
@@ -162,33 +159,30 @@ mod tests {
 
     #[test]
     fn creates_file_on_first_load() {
-        let temp = assert_fs::TempDir::new().expect("répertoire temporaire");
+        let temp = assert_fs::TempDir::new().expect("temporary directory");
         let path = temp.path().join("scriptor").join("config.toml");
         assert!(
             !path.exists(),
-            "le fichier ne doit pas exister avant le premier chargement"
+            "file should not exist before the first load"
         );
 
-        let config = Config::load_from_path(&path).expect("le chargement doit réussir");
+        let config = Config::load_from_path(&path).expect("loading should succeed");
 
-        assert!(
-            path.exists(),
-            "le fichier doit être créé au premier chargement"
-        );
-        let reloaded = Config::load_from_path(&path).expect("le rechargement doit réussir");
+        assert!(path.exists(), "file should be created on first load");
+        let reloaded = Config::load_from_path(&path).expect("reload should succeed");
         assert_eq!(config, reloaded);
     }
 
     #[test]
     fn defaults_applied_when_fields_missing() {
-        let temp = assert_fs::TempDir::new().expect("répertoire temporaire");
+        let temp = assert_fs::TempDir::new().expect("temporary directory");
         let path = temp.path().join("scriptor").join("config.toml");
-        std::fs::create_dir_all(path.parent().expect("le chemin a un parent"))
-            .expect("création du répertoire parent");
+        std::fs::create_dir_all(path.parent().expect("path has a parent"))
+            .expect("creating parent directory");
         std::fs::write(&path, "model = \"medium\"\nthreads = 4\n")
-            .expect("écriture du fichier de configuration partiel");
+            .expect("writing partial configuration file");
 
-        let config = Config::load_from_path(&path).expect("le chargement doit réussir");
+        let config = Config::load_from_path(&path).expect("loading should succeed");
 
         assert_eq!(config.model, "medium");
         assert_eq!(config.threads, 4);

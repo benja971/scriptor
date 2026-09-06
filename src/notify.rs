@@ -24,10 +24,10 @@ fn send(message: &str) -> Result<()> {
     let status = Command::new("notify-send")
         .arg(message)
         .status()
-        .context("échec du lancement de notify-send")?;
+        .context("failed to launch notify-send")?;
 
     if !status.success() {
-        anyhow::bail!("notify-send a retourné un code d'échec : {status}");
+        anyhow::bail!("notify-send exited with a failure status: {status}");
     }
 
     Ok(())
@@ -94,13 +94,12 @@ mod tests {
             "#!/bin/sh\nprintf '%s\\n' \"$@\" > \"{}\"\n",
             capture_path.display()
         );
-        fs::write(&script_path, script).context("écriture du faux notify-send")?;
+        fs::write(&script_path, script).context("writing fake notify-send")?;
         let mut perms = fs::metadata(&script_path)
-            .context("lecture des permissions du faux notify-send")?
+            .context("reading fake notify-send permissions")?
             .permissions();
         perms.set_mode(0o755);
-        fs::set_permissions(&script_path, perms)
-            .context("passage en exécutable du faux notify-send")?;
+        fs::set_permissions(&script_path, perms).context("making fake notify-send executable")?;
         Ok(capture_path)
     }
 
@@ -110,14 +109,13 @@ mod tests {
         let _lock = ENV_LOCK
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
-        let dir = TempDir::new().context("création du dossier temporaire")?;
+        let dir = TempDir::new().context("creating temporary directory")?;
         let capture_path = install_fake_notify_send(&dir)?;
         let _guard = PathOverrideGuard::isolated_to(dir.path());
 
         notify_success(Path::new("/home/user/video.txt"))?;
 
-        let captured =
-            fs::read_to_string(&capture_path).context("lecture des arguments capturés")?;
+        let captured = fs::read_to_string(&capture_path).context("reading captured arguments")?;
         assert_eq!(
             captured.trim_end_matches('\n'),
             "Transcription terminée : /home/user/video.txt"
@@ -131,7 +129,7 @@ mod tests {
         let _lock = ENV_LOCK
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
-        let dir = TempDir::new().context("création du dossier temporaire")?;
+        let dir = TempDir::new().context("creating temporary directory")?;
         let capture_path = install_fake_notify_send(&dir)?;
         let _guard = PathOverrideGuard::isolated_to(dir.path());
 
@@ -140,8 +138,7 @@ mod tests {
             Path::new("/home/user/.cache/scriptor/logs/2026-09-06.log"),
         )?;
 
-        let captured =
-            fs::read_to_string(&capture_path).context("lecture des arguments capturés")?;
+        let captured = fs::read_to_string(&capture_path).context("reading captured arguments")?;
         assert_eq!(
             captured.trim_end_matches('\n'),
             "Échec transcription https://example.com/video : voir /home/user/.cache/scriptor/logs/2026-09-06.log"
@@ -155,7 +152,7 @@ mod tests {
         let _lock = ENV_LOCK
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
-        let dir = TempDir::new().context("création du dossier temporaire")?;
+        let dir = TempDir::new().context("creating temporary directory")?;
         let _guard = PathOverrideGuard::isolated_to(dir.path());
 
         let result = notify_success(Path::new("/home/user/video.txt"));

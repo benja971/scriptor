@@ -113,23 +113,23 @@ impl Args {
                 path,
                 output: self
                     .output
-                    .context("le Worker nécessite --output pour une Source locale")?,
+                    .context("the Worker requires --output for a local Source")?,
             },
             Source::Remote(url) => ResolvedSource::Remote {
                 url,
                 output_dir: self
                     .output_dir
-                    .context("le Worker nécessite --output-dir pour une Source distante")?,
+                    .context("the Worker requires --output-dir for a remote Source")?,
             },
         };
         Ok(WorkerParams {
             source,
-            log: self.log.context("le Worker nécessite --log")?,
+            log: self.log.context("the Worker requires --log")?,
             model_path: self
                 .model_path
-                .context("le Worker nécessite --model-path")?,
-            language: self.language.context("le Worker nécessite --language")?,
-            threads: self.threads.context("le Worker nécessite --threads")?,
+                .context("the Worker requires --model-path")?,
+            language: self.language.context("the Worker requires --language")?,
+            threads: self.threads.context("the Worker requires --threads")?,
         })
     }
 }

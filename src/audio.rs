@@ -32,11 +32,11 @@ fn extract_audio_with_path(input: &Path, output_wav: &Path, path_env: &OsStr) ->
         .args(["-ar", "16000", "-ac", "1", "-c:a", "pcm_s16le"])
         .arg(output_wav)
         .output()
-        .context("échec du lancement de `ffmpeg`")?;
+        .context("failed to launch `ffmpeg`")?;
 
     if !output.status.success() {
         bail!(
-            "`ffmpeg` a échoué (code {:?})\nstdout:\n{}\nstderr:\n{}",
+            "`ffmpeg` failed (exit code {:?})\nstdout:\n{}\nstderr:\n{}",
             output.status.code(),
             String::from_utf8_lossy(&output.stdout),
             String::from_utf8_lossy(&output.stderr),
@@ -70,18 +70,18 @@ mod tests {
             "scriptor-test-audio-{label}-{}-{n}",
             std::process::id()
         ));
-        fs::create_dir_all(&dir).expect("création du répertoire temporaire de test");
+        fs::create_dir_all(&dir).expect("creating test temporary directory");
         dir
     }
 
     fn write_fake_ffmpeg(bin_dir: &Path, script: &str) {
         let path = bin_dir.join("ffmpeg");
-        fs::write(&path, script).expect("écriture du faux ffmpeg");
+        fs::write(&path, script).expect("writing fake ffmpeg");
         let mut perms = fs::metadata(&path)
-            .expect("lecture des métadonnées du faux ffmpeg")
+            .expect("reading fake ffmpeg metadata")
             .permissions();
         perms.set_mode(0o755);
-        fs::set_permissions(&path, perms).expect("chmod du faux ffmpeg");
+        fs::set_permissions(&path, perms).expect("chmod on fake ffmpeg");
     }
 
     const FAKE_FFMPEG_SUCCESS: &str = r#"#!/bin/sh
@@ -104,11 +104,11 @@ exit 1
         write_fake_ffmpeg(&bin_dir, FAKE_FFMPEG_SUCCESS);
         let work_dir = unique_temp_dir("work-ok");
         let input = work_dir.join("input.mp4");
-        fs::write(&input, "fake video bytes").expect("écriture du faux fichier d'entrée");
+        fs::write(&input, "fake video bytes").expect("writing fake input file");
         let output_wav = work_dir.join("output.wav");
 
         extract_audio_with_path(&input, &output_wav, bin_dir.as_os_str())
-            .expect("l'extraction mockée doit réussir");
+            .expect("mocked extraction should succeed");
 
         assert!(output_wav.is_file());
 
@@ -122,11 +122,11 @@ exit 1
         write_fake_ffmpeg(&bin_dir, FAKE_FFMPEG_FAILURE);
         let work_dir = unique_temp_dir("work-fail");
         let input = work_dir.join("input.mp4");
-        fs::write(&input, "fake video bytes").expect("écriture du faux fichier d'entrée");
+        fs::write(&input, "fake video bytes").expect("writing fake input file");
         let output_wav = work_dir.join("output.wav");
 
         let err = extract_audio_with_path(&input, &output_wav, bin_dir.as_os_str())
-            .expect_err("l'extraction mockée doit échouer");
+            .expect_err("mocked extraction should fail");
 
         assert!(format!("{err:#}").contains("boom: fake ffmpeg failure"));
 
@@ -139,11 +139,11 @@ exit 1
         let empty_bin_dir = unique_temp_dir("bin-missing");
         let work_dir = unique_temp_dir("work-missing");
         let input = work_dir.join("input.mp4");
-        fs::write(&input, "fake video bytes").expect("écriture du faux fichier d'entrée");
+        fs::write(&input, "fake video bytes").expect("writing fake input file");
         let output_wav = work_dir.join("output.wav");
 
         let err = extract_audio_with_path(&input, &output_wav, empty_bin_dir.as_os_str())
-            .expect_err("doit échouer si ffmpeg est absent du PATH");
+            .expect_err("should fail if ffmpeg is absent from PATH");
 
         assert!(format!("{err:#}").contains("ffmpeg"));
 

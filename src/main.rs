@@ -57,14 +57,14 @@ fn launch(args: &Args) -> Result<()> {
     let output = match &source {
         Source::Local(path) => Some(
             output::output_path_for_local(std::path::Path::new(path))
-                .context("échec de la résolution du chemin de Sortie")?,
+                .context("failed to resolve output path")?,
         ),
         Source::Remote(_) => None,
     };
 
-    let log_path = create_log_file_path().context("échec de la création du fichier de log")?;
-    let threads = u32::try_from(config.threads)
-        .context("valeur de `threads` invalide dans la configuration")?;
+    let log_path = create_log_file_path().context("failed to create log file")?;
+    let threads =
+        u32::try_from(config.threads).context("invalid `threads` value in configuration")?;
 
     spawn_worker(
         args,
@@ -83,7 +83,7 @@ fn ensure_required_binaries_present(source: &Source) -> Result<()> {
     binary::ensure_present("ffmpeg")?;
     binary::ensure_present("whisper-cli")?;
     if matches!(source, Source::Remote(_)) {
-        binary::ensure_present("yt-dlp").context("nécessaire pour une Source distante")?;
+        binary::ensure_present("yt-dlp").context("required for a remote Source")?;
     }
     Ok(())
 }
@@ -99,14 +99,13 @@ fn spawn_worker(
     model_path: &std::path::Path,
     threads: u32,
 ) -> Result<()> {
-    let exe = std::env::current_exe()
-        .context("impossible de déterminer le chemin de l'exécutable courant")?;
+    let exe = std::env::current_exe().context("could not determine current executable path")?;
 
     let stdout_file = File::create(log_path)
-        .with_context(|| format!("création du fichier de log {}", log_path.display()))?;
+        .with_context(|| format!("creating log file {}", log_path.display()))?;
     let stderr_file = stdout_file
         .try_clone()
-        .context("duplication du descripteur du fichier de log")?;
+        .context("duplicating log file descriptor")?;
 
     let mut command = Command::new(&exe);
     command
@@ -135,7 +134,7 @@ fn spawn_worker(
 
     command
         .spawn()
-        .context("impossible de lancer le Worker détaché")?;
+        .context("could not launch detached Worker")?;
 
     println!("Worker lancé, log : {}", log_path.display());
 
@@ -146,11 +145,10 @@ fn spawn_worker(
 /// `dirs::cache_dir()/scriptor/logs/<id-unique>.log`. Le répertoire parent
 /// est créé si besoin.
 fn create_log_file_path() -> Result<PathBuf> {
-    let cache_dir =
-        dirs::cache_dir().context("impossible de déterminer le répertoire de cache utilisateur")?;
+    let cache_dir = dirs::cache_dir().context("could not determine user cache directory")?;
     let logs_dir = cache_dir.join("scriptor").join("logs");
     fs::create_dir_all(&logs_dir)
-        .with_context(|| format!("création du répertoire de logs {}", logs_dir.display()))?;
+        .with_context(|| format!("creating logs directory {}", logs_dir.display()))?;
 
     let filename = format!("{}.log", unique_id::unique_id());
     Ok(logs_dir.join(filename))

@@ -60,11 +60,11 @@ fn transcribe_with_path(
         .arg(output_basename)
         .args(["-np", "-nt"])
         .output()
-        .context("échec du lancement de `whisper-cli`")?;
+        .context("failed to launch `whisper-cli`")?;
 
     if !output.status.success() {
         bail!(
-            "`whisper-cli` a échoué (code {:?})\nstdout:\n{}\nstderr:\n{}",
+            "`whisper-cli` failed (exit code {:?})\nstdout:\n{}\nstderr:\n{}",
             output.status.code(),
             String::from_utf8_lossy(&output.stdout),
             String::from_utf8_lossy(&output.stderr),
@@ -98,18 +98,18 @@ mod tests {
             "scriptor-test-transcribe-{label}-{}-{n}",
             std::process::id()
         ));
-        fs::create_dir_all(&dir).expect("création du répertoire temporaire de test");
+        fs::create_dir_all(&dir).expect("creating test temporary directory");
         dir
     }
 
     fn write_fake_whisper_cli(bin_dir: &Path, script: &str) {
         let path = bin_dir.join("whisper-cli");
-        fs::write(&path, script).expect("écriture du faux whisper-cli");
+        fs::write(&path, script).expect("writing fake whisper-cli");
         let mut perms = fs::metadata(&path)
-            .expect("lecture des métadonnées du faux whisper-cli")
+            .expect("reading fake whisper-cli metadata")
             .permissions();
         perms.set_mode(0o755);
-        fs::set_permissions(&path, perms).expect("chmod du faux whisper-cli");
+        fs::set_permissions(&path, perms).expect("chmod on fake whisper-cli");
     }
 
     const FAKE_WHISPER_CLI_SUCCESS: &str = r#"#!/bin/sh
@@ -140,9 +140,9 @@ exit 1
         write_fake_whisper_cli(&bin_dir, FAKE_WHISPER_CLI_SUCCESS);
         let work_dir = unique_temp_dir("work-ok");
         let model_path = work_dir.join("ggml-small.bin");
-        fs::write(&model_path, "fake model bytes").expect("écriture du faux modèle");
+        fs::write(&model_path, "fake model bytes").expect("writing fake model");
         let audio_wav = work_dir.join("audio.wav");
-        fs::write(&audio_wav, "fake wav bytes").expect("écriture du faux wav");
+        fs::write(&audio_wav, "fake wav bytes").expect("writing fake wav");
         let output_basename = work_dir.join("output");
 
         let txt_path = transcribe_with_path(
@@ -153,11 +153,11 @@ exit 1
             &output_basename,
             bin_dir.as_os_str(),
         )
-        .expect("la transcription mockée doit réussir");
+        .expect("mocked transcription should succeed");
 
         assert_eq!(txt_path, output_basename.with_extension("txt"));
         assert!(txt_path.is_file());
-        let content = fs::read_to_string(&txt_path).expect("lecture du .txt produit");
+        let content = fs::read_to_string(&txt_path).expect("reading produced .txt");
         assert_eq!(content, "fake transcription\n");
 
         let _ = fs::remove_dir_all(&bin_dir);
@@ -170,9 +170,9 @@ exit 1
         write_fake_whisper_cli(&bin_dir, FAKE_WHISPER_CLI_FAILURE);
         let work_dir = unique_temp_dir("work-fail");
         let model_path = work_dir.join("ggml-small.bin");
-        fs::write(&model_path, "fake model bytes").expect("écriture du faux modèle");
+        fs::write(&model_path, "fake model bytes").expect("writing fake model");
         let audio_wav = work_dir.join("audio.wav");
-        fs::write(&audio_wav, "fake wav bytes").expect("écriture du faux wav");
+        fs::write(&audio_wav, "fake wav bytes").expect("writing fake wav");
         let output_basename = work_dir.join("output");
 
         let err = transcribe_with_path(
@@ -183,7 +183,7 @@ exit 1
             &output_basename,
             bin_dir.as_os_str(),
         )
-        .expect_err("la transcription mockée doit échouer");
+        .expect_err("mocked transcription should fail");
 
         assert!(format!("{err:#}").contains("boom: fake whisper-cli failure"));
 
@@ -196,9 +196,9 @@ exit 1
         let empty_bin_dir = unique_temp_dir("bin-missing");
         let work_dir = unique_temp_dir("work-missing");
         let model_path = work_dir.join("ggml-small.bin");
-        fs::write(&model_path, "fake model bytes").expect("écriture du faux modèle");
+        fs::write(&model_path, "fake model bytes").expect("writing fake model");
         let audio_wav = work_dir.join("audio.wav");
-        fs::write(&audio_wav, "fake wav bytes").expect("écriture du faux wav");
+        fs::write(&audio_wav, "fake wav bytes").expect("writing fake wav");
         let output_basename = work_dir.join("output");
 
         let err = transcribe_with_path(
@@ -209,7 +209,7 @@ exit 1
             &output_basename,
             empty_bin_dir.as_os_str(),
         )
-        .expect_err("doit échouer si whisper-cli est absent du PATH");
+        .expect_err("should fail if whisper-cli is absent from PATH");
 
         assert!(format!("{err:#}").contains("whisper-cli"));
 

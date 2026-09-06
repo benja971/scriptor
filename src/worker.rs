@@ -32,20 +32,20 @@ use crate::{audio, download, notify, output, transcribe};
 pub fn run(params: &WorkerParams) -> Result<()> {
     init_logging()?;
 
-    tracing::info!(source = params.source.display(), "démarrage du Worker");
+    tracing::info!(source = params.source.display(), "starting Worker");
 
     match run_pipeline(params) {
         Ok(output_path) => {
-            tracing::info!(output = %output_path.display(), "Pipeline terminé avec succès");
+            tracing::info!(output = %output_path.display(), "Pipeline completed successfully");
             if let Err(notify_err) = notify::notify_success(&output_path) {
-                tracing::error!(error = %notify_err, "échec de la notification de succès");
+                tracing::error!(error = %notify_err, "success notification failed");
             }
             Ok(())
         }
         Err(err) => {
-            tracing::error!(error = format!("{err:#}"), "échec du Pipeline");
+            tracing::error!(error = format!("{err:#}"), "Pipeline failed");
             if let Err(notify_err) = notify::notify_failure(params.source.display(), &params.log) {
-                tracing::error!(error = %notify_err, "échec de la notification d'échec");
+                tracing::error!(error = %notify_err, "failure notification failed");
             }
             Err(err)
         }
@@ -59,7 +59,7 @@ fn init_logging() -> Result<()> {
         .with_writer(io::stdout)
         .with_ansi(false)
         .try_init()
-        .map_err(|err| anyhow!("initialisation du logging du Worker : {err}"))
+        .map_err(|err| anyhow!("initializing Worker logging: {err}"))
 }
 
 /// Exécute le Pipeline complet et retourne le chemin de la Sortie produite.
@@ -70,26 +70,26 @@ fn run_pipeline(params: &WorkerParams) -> Result<PathBuf> {
     let (media_path, output_path) = match &params.source {
         ResolvedSource::Local { path, output } => (PathBuf::from(path), output.clone()),
         ResolvedSource::Remote { url, output_dir } => {
-            tracing::info!(url, "téléchargement de la Source distante");
-            let downloaded = download::download(url, &tmp_dir)
-                .context("échec du téléchargement de la Source")?;
+            tracing::info!(url, "downloading remote Source");
+            let downloaded =
+                download::download(url, &tmp_dir).context("failed to download the Source")?;
             let output_path = output::output_path_for_remote(output_dir, &downloaded.title)
-                .context("échec de la résolution du chemin de Sortie")?;
+                .context("failed to resolve output path")?;
             (downloaded.path, output_path)
         }
     };
 
     if let Some(parent) = output_path.parent() {
         fs::create_dir_all(parent)
-            .with_context(|| format!("création du répertoire de sortie {}", parent.display()))?;
+            .with_context(|| format!("creating output directory {}", parent.display()))?;
     }
 
     let audio_wav = tmp_dir.join("audio.wav");
-    tracing::info!(input = %media_path.display(), "extraction audio");
-    audio::extract_audio(&media_path, &audio_wav).context("échec de l'extraction audio")?;
+    tracing::info!(input = %media_path.display(), "extracting audio");
+    audio::extract_audio(&media_path, &audio_wav).context("failed to extract audio")?;
 
     let basename = output::basename_for_transcription(&output_path);
-    tracing::info!(output = %output_path.display(), "transcription");
+    tracing::info!(output = %output_path.display(), "transcribing");
     transcribe::transcribe(
         &params.model_path,
         &audio_wav,
@@ -97,7 +97,7 @@ fn run_pipeline(params: &WorkerParams) -> Result<PathBuf> {
         params.threads,
         &basename,
     )
-    .context("échec de la transcription")?;
+    .context("failed to transcribe")?;
 
     Ok(output_path)
 }
@@ -105,11 +105,10 @@ fn run_pipeline(params: &WorkerParams) -> Result<PathBuf> {
 /// Crée et retourne un dossier temporaire dédié à cette exécution du
 /// Pipeline : `dirs::cache_dir()/scriptor/tmp/<id-unique>/`.
 fn create_tmp_dir() -> Result<PathBuf> {
-    let cache_dir =
-        dirs::cache_dir().context("impossible de déterminer le répertoire de cache utilisateur")?;
+    let cache_dir = dirs::cache_dir().context("could not determine user cache directory")?;
     let tmp_dir = cache_dir.join("scriptor").join("tmp").join(unique_id());
     fs::create_dir_all(&tmp_dir)
-        .with_context(|| format!("création du dossier temporaire {}", tmp_dir.display()))?;
+        .with_context(|| format!("creating temporary directory {}", tmp_dir.display()))?;
     Ok(tmp_dir)
 }
 
@@ -124,7 +123,7 @@ impl Drop for TmpDirGuard {
             tracing::warn!(
                 path = %self.0.display(),
                 error = %err,
-                "échec du nettoyage du dossier temporaire"
+                "temporary directory cleanup failed"
             );
         }
     }

@@ -74,12 +74,7 @@ fn resolve_collision(candidate: &Path) -> Result<PathBuf> {
     let stem = candidate
         .file_stem()
         .and_then(OsStr::to_str)
-        .with_context(|| {
-            format!(
-                "impossible de déterminer le nom de fichier de {}",
-                candidate.display()
-            )
-        })?;
+        .with_context(|| format!("could not determine file name of {}", candidate.display()))?;
     let extension = candidate.extension().and_then(OsStr::to_str);
 
     (1..=u32::MAX)
@@ -91,7 +86,7 @@ fn resolve_collision(candidate: &Path) -> Result<PathBuf> {
             parent.join(filename)
         })
         .find(|path| !path.exists())
-        .context("plus aucun suffixe de collision disponible pour la Sortie")
+        .context("ran out of collision suffixes for the output")
 }
 
 #[cfg(test)]
@@ -105,69 +100,68 @@ mod tests {
 
     #[test]
     fn local_output_uses_same_basename_with_txt_extension() {
-        let temp = TempDir::new().expect("répertoire temporaire");
+        let temp = TempDir::new().expect("temporary directory");
         let source = temp.path().join("interview.mp4");
-        fs::write(&source, b"fake video").expect("écriture du faux fichier source");
+        fs::write(&source, b"fake video").expect("writing fake source file");
 
-        let output = output_path_for_local(&source).expect("résolution de la Sortie");
+        let output = output_path_for_local(&source).expect("resolving output");
 
         assert_eq!(output, temp.path().join("interview.txt"));
     }
 
     #[test]
     fn local_output_adds_numeric_suffix_on_collision() {
-        let temp = TempDir::new().expect("répertoire temporaire");
+        let temp = TempDir::new().expect("temporary directory");
         let source = temp.path().join("interview.mp4");
-        fs::write(&source, b"fake video").expect("écriture du faux fichier source");
+        fs::write(&source, b"fake video").expect("writing fake source file");
         fs::write(temp.path().join("interview.txt"), b"already there")
-            .expect("écriture d'une Sortie déjà existante");
+            .expect("writing an already existing output");
 
-        let output = output_path_for_local(&source).expect("résolution de la Sortie");
+        let output = output_path_for_local(&source).expect("resolving output");
 
         assert_eq!(output, temp.path().join("interview-1.txt"));
     }
 
     #[test]
     fn local_output_skips_taken_suffixes() {
-        let temp = TempDir::new().expect("répertoire temporaire");
+        let temp = TempDir::new().expect("temporary directory");
         let source = temp.path().join("interview.mp4");
-        fs::write(&source, b"fake video").expect("écriture du faux fichier source");
-        fs::write(temp.path().join("interview.txt"), b"1").expect("écriture Sortie -0");
-        fs::write(temp.path().join("interview-1.txt"), b"2").expect("écriture Sortie -1");
-        fs::write(temp.path().join("interview-2.txt"), b"3").expect("écriture Sortie -2");
+        fs::write(&source, b"fake video").expect("writing fake source file");
+        fs::write(temp.path().join("interview.txt"), b"1").expect("writing output -0");
+        fs::write(temp.path().join("interview-1.txt"), b"2").expect("writing output -1");
+        fs::write(temp.path().join("interview-2.txt"), b"3").expect("writing output -2");
 
-        let output = output_path_for_local(&source).expect("résolution de la Sortie");
+        let output = output_path_for_local(&source).expect("resolving output");
 
         assert_eq!(output, temp.path().join("interview-3.txt"));
     }
 
     #[test]
     fn remote_output_slugifies_title() {
-        let temp = TempDir::new().expect("répertoire temporaire");
+        let temp = TempDir::new().expect("temporary directory");
 
-        let output = output_path_for_remote(temp.path(), "Amazing Video! (2026)")
-            .expect("résolution de la Sortie");
+        let output =
+            output_path_for_remote(temp.path(), "Amazing Video! (2026)").expect("resolving output");
 
         assert_eq!(output, temp.path().join("amazing-video-2026.txt"));
     }
 
     #[test]
     fn remote_output_falls_back_when_title_has_no_alphanumeric() {
-        let temp = TempDir::new().expect("répertoire temporaire");
+        let temp = TempDir::new().expect("temporary directory");
 
-        let output = output_path_for_remote(temp.path(), "***").expect("résolution de la Sortie");
+        let output = output_path_for_remote(temp.path(), "***").expect("resolving output");
 
         assert_eq!(output, temp.path().join("sans-titre.txt"));
     }
 
     #[test]
     fn remote_output_adds_numeric_suffix_on_collision() {
-        let temp = TempDir::new().expect("répertoire temporaire");
+        let temp = TempDir::new().expect("temporary directory");
         fs::write(temp.path().join("my-video.txt"), b"already there")
-            .expect("écriture d'une Sortie déjà existante");
+            .expect("writing an already existing output");
 
-        let output =
-            output_path_for_remote(temp.path(), "My Video").expect("résolution de la Sortie");
+        let output = output_path_for_remote(temp.path(), "My Video").expect("resolving output");
 
         assert_eq!(output, temp.path().join("my-video-1.txt"));
     }
