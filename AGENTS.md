@@ -20,6 +20,16 @@ pas à chaque PR.
   et publie le binaire (`scriptor-linux-x86_64`) comme asset d'une **release GitHub**. Aucune
   release n'est créée par un simple push ou merge de PR.
 
+### Convention de commit
+
+À partir de maintenant, préfixer les messages de commit en **Conventional Commits** :
+`feat: ...`, `fix: ...`, `chore: ...`, `docs: ...`, `refactor: ...`, `test: ...`, `ci: ...`.
+Le job `release` génère le changelog de chaque release via `git-cliff` (`orhun/git-cliff-action`
+dans `.github/workflows/ci.yml`), qui classe les entrées d'après ce préfixe. Pas rétroactif :
+l'historique déjà commité (en français, sans préfixe) reste tel quel, il tombera dans une
+section générique du changelog généré. Pas de `CHANGELOG.md` versionné dans le repo : le
+changelog vit uniquement dans le corps de chaque release GitHub.
+
 ### Conventions de code
 
 - Lints clippy stricts dans `Cargo.toml` (`[lints.clippy]`) : `pedantic`/`nursery` en `deny`, plus

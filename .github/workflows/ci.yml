@@ -27,10 +27,20 @@ jobs:
       contents: write
     steps:
       - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
       - uses: DeterminateSystems/nix-installer-action@main
       - uses: DeterminateSystems/magic-nix-cache-action@main
       - run: nix develop -c cargo build --release
       - run: cp target/release/scriptor scriptor-linux-x86_64
+      - name: Generate changelog
+        uses: orhun/git-cliff-action@v4
+        id: git-cliff
+        with:
+          args: --latest --strip header
+        env:
+          OUTPUT: CHANGES.md
       - uses: softprops/action-gh-release@v2
         with:
           files: scriptor-linux-x86_64
+          body_path: CHANGES.md
