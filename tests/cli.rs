@@ -1,8 +1,10 @@
 //! Tests d'intégration du binaire `scriptor` compilé (seam unique décrit
 //! dans `docs/spec/scriptor-v1.md`, section "Testing Decisions") : couvre le
-//! happy path Source locale, le binaire manquant (échec immédiat sans
-//! détachement), la gestion de collision de Sortie, et la création
-//! automatique de `config.toml` au premier lancement.
+//! happy path Source locale, le happy path Source distante, le binaire
+//! manquant (échec immédiat sans détachement), la gestion de collision de
+//! Sortie, la notification de succès, la notification d'échec (message et
+//! contenu du fichier de log), et la création automatique de `config.toml`
+//! au premier lancement.
 //!
 //! `yt-dlp`/`ffmpeg`/`whisper-cli`/`notify-send` sont remplacés par de faux
 //! scripts shell injectés en tête de `PATH`. Le Worker étant détaché, ces
@@ -73,6 +75,49 @@ printf 'faux contenu transcrit\n' > "${of}.txt"
 const FAKE_NOTIFY_SEND_SUCCESS: &str = r"#!/bin/sh
 exit 0
 ";
+
+const FAKE_WHISPER_CLI_FAILURE: &str = r#"#!/bin/sh
+echo "boom: fake whisper-cli failure" >&2
+exit 1
+"#;
+
+/// Faux `yt-dlp` reproduisant exactement les arguments passés par
+/// `download.rs` (`--paths`, `--output`, `--print-to-file after_move:filepath
+/// <marker>`) : écrit un faux fichier vidéo dont le nom sert de titre, et
+/// enregistre son chemin dans le fichier marqueur attendu.
+const FAKE_YT_DLP_SUCCESS: &str = r#"#!/bin/sh
+set -eu
+output_dir=""
+marker=""
+while [ "$#" -gt 0 ]; do
+  case "$1" in
+    --paths)
+      output_dir="$2"
+      shift 2
+      ;;
+    --print-to-file)
+      marker="$3"
+      shift 3
+      ;;
+    *)
+      shift
+      ;;
+  esac
+done
+video_path="$output_dir/My Remote Video.mp4"
+: > "$video_path"
+printf '%s' "$video_path" > "$marker"
+"#;
+
+/// Faux `notify-send` qui capture ses arguments (le message) dans
+/// `capture_path`, un argument par ligne, pour vérifier le contenu exact de
+/// la notification envoyée.
+fn fake_notify_send_capture_script(capture_path: &Path) -> String {
+    format!(
+        "#!/bin/sh\nprintf '%s\\n' \"$@\" > \"{}\"\n",
+        capture_path.display()
+    )
+}
 
 /// Environnement isolé pour un test : dossier de faux binaires, config XDG
 /// dédiée, dossier de travail pour la Source et la Sortie.
@@ -257,5 +302,118 @@ fn creates_default_config_on_first_launch() {
     assert!(
         config_path.is_file(),
         "le config.toml doit être créé au premier lancement"
+    );
+}
+
+#[test]
+fn remote_source_happy_path_produces_output_named_from_title() {
+    let env = TestEnv::new("remote-happy");
+    let output_dir = env.work_dir.join("out");
+    env.write_config(&output_dir);
+    write_executable(&env.bin_dir, "yt-dlp", FAKE_YT_DLP_SUCCESS);
+
+    env.command()
+        .arg("https://example.com/video")
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("Worker lancé"));
+
+    let expected_output = output_dir.join("my-remote-video.txt");
+    assert!(
+        wait_for_file(&expected_output, Duration::from_secs(5)),
+        "la Sortie {} n'est jamais apparue",
+        expected_output.display()
+    );
+    let content = fs::read_to_string(&expected_output).expect("lecture de la Sortie produite");
+    assert_eq!(content, "faux contenu transcrit\n");
+}
+
+#[test]
+fn success_notification_reports_output_path() {
+    let env = TestEnv::new("notify-success");
+    env.write_config(&env.work_dir.join("out"));
+    let media = env.write_media_file("interview.mp4");
+    let capture_path = env.bin_dir.join("notify-capture.txt");
+    write_executable(
+        &env.bin_dir,
+        "notify-send",
+        &fake_notify_send_capture_script(&capture_path),
+    );
+
+    env.command()
+        .arg(media.to_str().expect("chemin utf-8"))
+        .assert()
+        .success();
+
+    let expected_output = env.work_dir.join("interview.txt");
+    assert!(
+        wait_for_file(&expected_output, Duration::from_secs(5)),
+        "la Sortie {} n'est jamais apparue",
+        expected_output.display()
+    );
+    assert!(
+        wait_for_file(&capture_path, Duration::from_secs(5)),
+        "notify-send n'a jamais été appelé"
+    );
+    let captured = fs::read_to_string(&capture_path).expect("lecture des arguments capturés");
+    assert_eq!(
+        captured.trim_end_matches('\n'),
+        format!("Transcription terminée : {}", expected_output.display())
+    );
+}
+
+#[test]
+fn failure_notification_reports_source_and_log_which_contains_the_error() {
+    let env = TestEnv::new("notify-failure");
+    env.write_config(&env.work_dir.join("out"));
+    let media = env.write_media_file("interview.mp4");
+    write_executable(&env.bin_dir, "whisper-cli", FAKE_WHISPER_CLI_FAILURE);
+    let capture_path = env.bin_dir.join("notify-capture.txt");
+    write_executable(
+        &env.bin_dir,
+        "notify-send",
+        &fake_notify_send_capture_script(&capture_path),
+    );
+
+    let assert = env
+        .command()
+        .arg(media.to_str().expect("chemin utf-8"))
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("Worker lancé"));
+
+    let stdout = String::from_utf8_lossy(&assert.get_output().stdout).into_owned();
+    let log_path = stdout
+        .lines()
+        .find_map(|line| line.strip_prefix("Worker lancé, log : "))
+        .map(PathBuf::from)
+        .expect("le message affiché doit contenir le chemin du log");
+
+    assert!(
+        wait_for_file(&capture_path, Duration::from_secs(5)),
+        "notify-send n'a jamais été appelé"
+    );
+    let captured = fs::read_to_string(&capture_path).expect("lecture des arguments capturés");
+    let expected_message = format!(
+        "Échec transcription {} : voir {}",
+        media.display(),
+        log_path.display()
+    );
+    assert_eq!(captured.trim_end_matches('\n'), expected_message);
+
+    assert!(
+        wait_for_file(&log_path, Duration::from_secs(5)),
+        "le fichier de log {} n'est jamais apparu",
+        log_path.display()
+    );
+    let log_content = fs::read_to_string(&log_path).expect("lecture du fichier de log");
+    assert!(
+        log_content.contains("boom: fake whisper-cli failure"),
+        "le fichier de log doit contenir le détail de l'échec, contenu : {log_content}"
+    );
+
+    assert!(
+        !env.work_dir.join("interview.txt").exists(),
+        "aucune Sortie ne doit être produite si le Pipeline échoue"
     );
 }

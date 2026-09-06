@@ -24,8 +24,10 @@ use crate::{audio, download, notify, output, transcribe};
 /// # Errors
 ///
 /// Retourne une erreur si le logging ne peut pas être initialisé, ou si le
-/// Pipeline échoue (après notification d'échec, elle-même best-effort : un
-/// échec de notification est logué mais n'écrase pas l'erreur d'origine).
+/// Pipeline échoue. La notification (succès ou échec) est toujours best-effort :
+/// un échec de notification est logué mais n'écrase jamais le résultat du
+/// Pipeline lui-même (la Sortie a déjà été produite avec succès, ou l'erreur
+/// d'origine du Pipeline doit rester celle remontée).
 pub fn run(args: &Args) -> Result<()> {
     init_logging()?;
 
@@ -34,7 +36,9 @@ pub fn run(args: &Args) -> Result<()> {
     match run_pipeline(args) {
         Ok(output_path) => {
             tracing::info!(output = %output_path.display(), "Pipeline terminé avec succès");
-            notify::notify_success(&output_path).context("échec de la notification de succès")?;
+            if let Err(notify_err) = notify::notify_success(&output_path) {
+                tracing::error!(error = %notify_err, "échec de la notification de succès");
+            }
             Ok(())
         }
         Err(err) => {
