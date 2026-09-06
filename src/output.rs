@@ -3,6 +3,8 @@
 //! gestion de collision (suffixe `-N`, jamais d'écrasement).
 
 use std::ffi::OsStr;
+use std::fs::OpenOptions;
+use std::io;
 use std::path::{Path, PathBuf};
 
 use anyhow::{Context, Result};
@@ -63,10 +65,18 @@ fn slugify(title: &str) -> String {
     }
 }
 
-/// Retourne `candidate` si aucun fichier n'existe déjà à ce chemin, sinon le
+/// Réserve `candidate` si aucun fichier n'existe déjà à ce chemin, sinon le
 /// premier chemin `<stem>-N.<ext>` libre à partir de `N = 1`.
+///
+/// La réservation est atomique (création exclusive du fichier, `O_CREAT |
+/// O_EXCL`) plutôt qu'un `exists()` suivi d'une écriture séparée : deux
+/// lancements concurrents sur la même Source ne peuvent jamais calculer le
+/// même chemin de Sortie, contrairement à un simple test d'existence qui
+/// laisserait une fenêtre entre la vérification et l'écriture réelle par
+/// `whisper-cli`. Le fichier réservé est vide ; `whisper-cli` l'écrase
+/// ensuite avec la transcription réelle.
 fn resolve_collision(candidate: &Path) -> Result<PathBuf> {
-    if !candidate.exists() {
+    if try_reserve(candidate)? {
         return Ok(candidate.to_path_buf());
     }
 
@@ -77,16 +87,30 @@ fn resolve_collision(candidate: &Path) -> Result<PathBuf> {
         .with_context(|| format!("could not determine file name of {}", candidate.display()))?;
     let extension = candidate.extension().and_then(OsStr::to_str);
 
-    (1..=u32::MAX)
-        .map(|n| {
-            let filename = extension.map_or_else(
-                || format!("{stem}-{n}"),
-                |extension| format!("{stem}-{n}.{extension}"),
-            );
-            parent.join(filename)
-        })
-        .find(|path| !path.exists())
-        .context("ran out of collision suffixes for the output")
+    for n in 1..=u32::MAX {
+        let filename = extension.map_or_else(
+            || format!("{stem}-{n}"),
+            |extension| format!("{stem}-{n}.{extension}"),
+        );
+        let path = parent.join(filename);
+        if try_reserve(&path)? {
+            return Ok(path);
+        }
+    }
+
+    Err(anyhow::anyhow!(
+        "ran out of collision suffixes for the output"
+    ))
+}
+
+/// Tente de créer `path` de façon exclusive (échoue si le fichier existe déjà).
+/// Retourne `true` si la réservation a réussi, `false` en cas de collision.
+fn try_reserve(path: &Path) -> Result<bool> {
+    match OpenOptions::new().write(true).create_new(true).open(path) {
+        Ok(_) => Ok(true),
+        Err(err) if err.kind() == io::ErrorKind::AlreadyExists => Ok(false),
+        Err(err) => Err(err).with_context(|| format!("reserving output path {}", path.display())),
+    }
 }
 
 #[cfg(test)]
@@ -96,7 +120,9 @@ mod tests {
 
     use assert_fs::TempDir;
 
-    use super::{basename_for_transcription, output_path_for_local, output_path_for_remote};
+    use super::{
+        basename_for_transcription, output_path_for_local, output_path_for_remote, try_reserve,
+    };
 
     #[test]
     fn local_output_uses_same_basename_with_txt_extension() {
@@ -174,5 +200,20 @@ mod tests {
             basename_for_transcription(path),
             std::path::PathBuf::from("/tmp/out/interview-1")
         );
+    }
+
+    #[test]
+    fn local_output_reserves_the_path_atomically() {
+        let temp = TempDir::new().expect("temporary directory");
+        let source = temp.path().join("interview.mp4");
+        fs::write(&source, b"fake video").expect("writing fake source file");
+
+        let output = output_path_for_local(&source).expect("resolving output");
+
+        // La réservation crée le fichier : un lancement concurrent qui
+        // tenterait le même chemin échouerait immédiatement, sans jamais
+        // pouvoir croire (à tort) que le chemin est encore libre.
+        assert!(output.is_file());
+        assert!(!try_reserve(&output).expect("checking reservation"));
     }
 }

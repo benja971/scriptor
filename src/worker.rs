@@ -73,16 +73,20 @@ fn run_pipeline(params: &WorkerParams) -> Result<PathBuf> {
             tracing::info!(url, "downloading remote Source");
             let downloaded =
                 download::download(url, &tmp_dir).context("failed to download the Source")?;
+            // Le dossier de sortie doit exister avant de réserver le chemin
+            // (la réservation crée le fichier, ce qui exige que son parent existe).
+            fs::create_dir_all(output_dir)
+                .with_context(|| format!("creating output directory {}", output_dir.display()))?;
             let output_path = output::output_path_for_remote(output_dir, &downloaded.title)
                 .context("failed to resolve output path")?;
             (downloaded.path, output_path)
         }
     };
-
-    if let Some(parent) = output_path.parent() {
-        fs::create_dir_all(parent)
-            .with_context(|| format!("creating output directory {}", parent.display()))?;
-    }
+    // La Sortie a déjà été réservée (fichier créé de façon atomique) par
+    // output_path_for_local/output_path_for_remote : si le Pipeline échoue
+    // à partir d'ici, ce guard supprime le fichier réservé au lieu de
+    // laisser une Sortie vide/partielle après un échec.
+    let output_guard = ReservedOutputGuard::new(output_path.clone());
 
     let audio_wav = tmp_dir.join("audio.wav");
     tracing::info!(input = %media_path.display(), "extracting audio");
@@ -99,6 +103,7 @@ fn run_pipeline(params: &WorkerParams) -> Result<PathBuf> {
     )
     .context("failed to transcribe")?;
 
+    output_guard.commit();
     Ok(output_path)
 }
 
@@ -124,6 +129,46 @@ impl Drop for TmpDirGuard {
                 path = %self.0.display(),
                 error = %err,
                 "temporary directory cleanup failed"
+            );
+        }
+    }
+}
+
+/// Supprime le fichier de Sortie déjà réservé si le Pipeline échoue avant
+/// [`ReservedOutputGuard::commit`] : `output_path_for_local`/
+/// `output_path_for_remote` réservent le chemin de façon atomique (fichier
+/// vide créé) avant même que la transcription ne commence, pour éviter toute
+/// collision entre lancements concurrents. Sans ce guard, un échec en cours
+/// de Pipeline laisserait cette Sortie vide/partielle en place.
+struct ReservedOutputGuard {
+    path: PathBuf,
+    committed: bool,
+}
+
+impl ReservedOutputGuard {
+    const fn new(path: PathBuf) -> Self {
+        Self {
+            path,
+            committed: false,
+        }
+    }
+
+    /// Marque la Sortie comme définitive : ne sera pas supprimée au `Drop`.
+    /// À appeler uniquement une fois le Pipeline terminé avec succès.
+    fn commit(mut self) {
+        self.committed = true;
+    }
+}
+
+impl Drop for ReservedOutputGuard {
+    fn drop(&mut self) {
+        if !self.committed
+            && let Err(err) = fs::remove_file(&self.path)
+        {
+            tracing::warn!(
+                path = %self.path.display(),
+                error = %err,
+                "reserved output cleanup failed"
             );
         }
     }

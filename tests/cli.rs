@@ -188,19 +188,24 @@ impl Drop for TestEnv {
     }
 }
 
-/// Attend l'apparition de `path`, avec un timeout court : le Worker étant
-/// détaché, le process initial rend la main avant que le fichier n'existe.
+/// Attend que `path` existe avec un contenu non vide, avec un timeout court :
+/// le Worker étant détaché, le process initial rend la main avant que le
+/// fichier n'existe. Vérifier uniquement l'existence ne suffit plus depuis
+/// que la Sortie est réservée (fichier vide créé de façon atomique) avant
+/// même que la transcription ne commence : `path.is_file()` deviendrait vrai
+/// bien avant la fin réelle du Pipeline.
 fn wait_for_file(path: &Path, timeout: Duration) -> bool {
     let deadline = Instant::now()
         .checked_add(timeout)
         .unwrap_or_else(Instant::now);
+    let has_content = |p: &Path| p.metadata().is_ok_and(|meta| meta.len() > 0);
     while Instant::now() < deadline {
-        if path.is_file() {
+        if has_content(path) {
             return true;
         }
         std::thread::sleep(Duration::from_millis(50));
     }
-    path.is_file()
+    has_content(path)
 }
 
 #[test]
