@@ -43,7 +43,7 @@ Un CLI Rust (`scriptor`) qui prend une Source (chemin de fichier local ou URL) e
 - **Nom de la Sortie (Source distante)** : titre de la vidéo obtenu via `yt-dlp --print filename` (gabarit sur le titre), slugifié, extension `.txt`, écrit dans `output_dir`.
 - **Nom de la Sortie (Source locale)** : même basename que le fichier Source, extension `.txt`, à côté du fichier.
 - **Collision de Sortie** : recherche du premier suffixe `-N` libre à partir de 1 (`video.txt` existe → `video-1.txt`, etc.), jamais d'écrasement ni d'erreur.
-- **Défauts de configuration** (utilisés si `config.toml` absent ou champ manquant) : `output_dir = "~/Transcriptions"`, `model = "small"`, `models_dir = dirs::data_dir()/scriptor/models`, `language = "auto"`, `threads = std::thread::available_parallelism()`.
+- **Défauts de configuration** (utilisés si `config.toml` absent ou champ manquant) : `output_dir = "~/Downloads/Transcriptions"`, `model = "small"`, `models_dir = dirs::data_dir()/scriptor/models`, `language = "auto"`, `threads = std::thread::available_parallelism()`.
 - **`config.toml` absent** : créé automatiquement avec les défauts ci-dessus au premier lancement ; le chemin créé est annoncé sur stdout avant le détachement.
 - **Fichiers temporaires** : `dirs::cache_dir()/scriptor/tmp/<id-unique>/`, supprimés après le Pipeline (succès ou échec).
 - **Log du Worker** : `dirs::cache_dir()/scriptor/logs/<horodatage>.log` (via `tracing` + `tracing-subscriber`), conservé après un échec (et un succès).

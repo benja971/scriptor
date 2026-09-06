@@ -108,7 +108,8 @@ fn config_file_path() -> Result<PathBuf> {
 }
 
 fn default_output_dir() -> PathBuf {
-    dirs::home_dir()
+    dirs::download_dir()
+        .or_else(dirs::home_dir)
         .unwrap_or_else(|| PathBuf::from("."))
         .join("Transcriptions")
 }
