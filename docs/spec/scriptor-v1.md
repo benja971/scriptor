@@ -2,6 +2,8 @@
 
 Publié comme issue GitHub : [benja971/scriptor#1](https://github.com/benja971/scriptor/issues/1).
 
+Découpée en tickets d'implémentation (task graph) : [config.rs (#2)](https://github.com/benja971/scriptor/issues/2), [cli.rs (#3)](https://github.com/benja971/scriptor/issues/3), [wrappers subprocess (#4)](https://github.com/benja971/scriptor/issues/4), [notify.rs (#5)](https://github.com/benja971/scriptor/issues/5), [orchestration main.rs (#6, bloqué par #2-#5)](https://github.com/benja971/scriptor/issues/6), [tests + validation réelle (#7, bloqué par #6)](https://github.com/benja971/scriptor/issues/7).
+
 ## Problem Statement
 
 L'utilisateur veut transcrire en texte l'audio de vidéos ou fichiers audio, locaux ou en ligne (Instagram, TikTok, YouTube, lien direct), sans dépendre d'un service cloud, en réutilisant les outils déjà validés manuellement sur son laptop NixOS (whisper.cpp, ffmpeg, yt-dlp). Il veut lancer une seule commande, retrouver immédiatement la main sur son terminal, et être averti sur son bureau quand la transcription est prête (ou a échoué).
