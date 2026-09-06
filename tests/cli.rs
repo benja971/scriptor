@@ -417,3 +417,79 @@ fn failure_notification_reports_source_and_log_which_contains_the_error() {
         "aucune Sortie ne doit être produite si le Pipeline échoue"
     );
 }
+
+/// Test end-to-end avec les **vrais** binaires (`ffmpeg`, `whisper-cli`,
+/// aucun mock) et un **vrai** modèle whisper installé à l'emplacement par
+/// défaut (`~/.local/share/scriptor/models/ggml-small.bin`, cf. spec section
+/// "Further Notes"). Génère lui-même son fichier audio de test (silence de
+/// 2 secondes via le vrai `ffmpeg`) plutôt que de dépendre d'un fichier
+/// externe.
+///
+/// Volontairement ignoré par défaut : la Testing Decision de la spec
+/// (`docs/spec/scriptor-v1.md`) est explicite - "Tests avec vrais binaires :
+/// marqués `#[ignore]`, lancés manuellement uniquement" (la CI n'a ni le
+/// modèle whisper ni forcément les binaires réels installés). À lancer
+/// manuellement, dans le devShell Nix, via `cargo test -- --ignored`.
+#[test]
+#[ignore = "vrais binaires + vrai modèle whisper requis ; lancer via `cargo test -- --ignored`"]
+fn real_binaries_local_source_happy_path() {
+    let xdg_config = unique_temp_dir("real-xdg-config");
+    let xdg_cache = unique_temp_dir("real-xdg-cache");
+    let work_dir = unique_temp_dir("real-work");
+
+    // Génère 2 secondes de silence avec le vrai `ffmpeg` (attendu sur le
+    // PATH du devShell Nix), plutôt que de dépendre d'un fichier audio/vidéo
+    // externe versionné dans le dépôt.
+    let media = work_dir.join("silence.wav");
+    let status = std::process::Command::new("ffmpeg")
+        .args([
+            "-f",
+            "lavfi",
+            "-i",
+            "anullsrc=r=16000:cl=mono",
+            "-t",
+            "2",
+            "-y",
+        ])
+        .arg(&media)
+        .status()
+        .expect("lancement du vrai ffmpeg pour générer le fichier audio de test");
+    assert!(
+        status.success(),
+        "la génération du fichier audio de test (vrai ffmpeg) a échoué"
+    );
+
+    // `models_dir` volontairement absent de la config de test : le défaut
+    // (`~/.local/share/scriptor/models`) est l'emplacement réel où le vrai
+    // modèle `ggml-small.bin` est installé sur cette machine (cf. spec).
+    // `XDG_DATA_HOME` n'est donc pas surchargé ici, contrairement à
+    // `XDG_CONFIG_HOME`/`XDG_CACHE_HOME` qui restent isolés dans un
+    // répertoire temporaire propre à ce test.
+    let config_dir = xdg_config.join("scriptor");
+    fs::create_dir_all(&config_dir).expect("création du répertoire de config de test");
+    fs::write(
+        config_dir.join("config.toml"),
+        "output_dir = \"/tmp/scriptor-real-test-unused\"\nmodel = \"small\"\nlanguage = \"en\"\nthreads = 1\n",
+    )
+    .expect("écriture du config.toml de test");
+
+    Command::cargo_bin("scriptor")
+        .expect("binaire scriptor introuvable")
+        .env("XDG_CONFIG_HOME", &xdg_config)
+        .env("XDG_CACHE_HOME", &xdg_cache)
+        .arg(media.to_str().expect("chemin utf-8"))
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("Worker lancé"));
+
+    let expected_output = work_dir.join("silence.txt");
+    assert!(
+        wait_for_file(&expected_output, Duration::from_mins(1)),
+        "la Sortie {} n'est jamais apparue (transcription réelle, peut être lente)",
+        expected_output.display()
+    );
+
+    let _ = fs::remove_dir_all(&xdg_config);
+    let _ = fs::remove_dir_all(&xdg_cache);
+    let _ = fs::remove_dir_all(&work_dir);
+}

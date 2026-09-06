@@ -5,7 +5,7 @@ use std::process::Command;
 
 use anyhow::{Context, Result, bail};
 
-use crate::binary::binary_exists_in;
+use crate::binary::ensure_present_in;
 
 /// Extrait la piste audio de `input` vers `output_wav`, au format PCM16 mono
 /// 16 kHz, via `ffmpeg`.
@@ -22,9 +22,7 @@ pub fn extract_audio(input: &Path, output_wav: &Path) -> Result<()> {
 }
 
 fn extract_audio_with_path(input: &Path, output_wav: &Path, path_env: &OsStr) -> Result<()> {
-    if !binary_exists_in("ffmpeg", path_env) {
-        bail!("binaire `ffmpeg` introuvable dans le PATH");
-    }
+    ensure_present_in("ffmpeg", path_env)?;
 
     let output = Command::new("ffmpeg")
         .env("PATH", path_env)

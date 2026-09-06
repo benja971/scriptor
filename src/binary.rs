@@ -3,24 +3,38 @@ use std::ffi::OsStr;
 use std::os::unix::fs::PermissionsExt;
 use std::path::Path;
 
-/// Indique si un binaire nommé `name` est présent et exécutable quelque part
-/// dans le `PATH` du process courant.
-///
-/// Utilisée par les wrappers subprocess (`download`, `audio`, `transcribe`)
-/// avant tout lancement de binaire externe, et par l'orchestration pour la
-/// vérification préalable des dépendances requises.
-#[must_use]
-pub fn binary_exists(name: &str) -> bool {
-    let path_env = env::var_os("PATH").unwrap_or_default();
-    binary_exists_in(name, &path_env)
-}
+use anyhow::{Result, bail};
 
-/// Variante de [`binary_exists`] acceptant un `PATH` explicite plutôt que
-/// celui, ambiant, du process courant. Permet aux wrappers subprocess de
-/// vérifier et d'exécuter un binaire mocké lors des tests, sans dépendre du
-/// `PATH` réel de la machine.
+/// Indique si un binaire nommé `name` est présent et exécutable dans le
+/// `PATH` explicite fourni. Permet aux wrappers subprocess de vérifier et
+/// d'exécuter un binaire mocké lors des tests, sans dépendre du `PATH` réel
+/// de la machine.
 pub fn binary_exists_in(name: &str, path_env: &OsStr) -> bool {
     env::split_paths(path_env).any(|dir| is_executable_file(&dir.join(name)))
+}
+
+/// Vérifie que le binaire `name` est présent dans le `PATH` ambiant du
+/// process courant, avec le message d'erreur standard sinon.
+///
+/// # Errors
+///
+/// Retourne une erreur si le binaire est absent du `PATH`.
+pub fn ensure_present(name: &str) -> Result<()> {
+    let path_env = env::var_os("PATH").unwrap_or_default();
+    ensure_present_in(name, &path_env)
+}
+
+/// Variante de [`ensure_present`] acceptant un `PATH` explicite (cf.
+/// [`binary_exists_in`]).
+///
+/// # Errors
+///
+/// Retourne une erreur si le binaire est absent de `path_env`.
+pub fn ensure_present_in(name: &str, path_env: &OsStr) -> Result<()> {
+    if !binary_exists_in(name, path_env) {
+        bail!("binaire `{name}` introuvable dans le PATH");
+    }
+    Ok(())
 }
 
 fn is_executable_file(candidate: &Path) -> bool {

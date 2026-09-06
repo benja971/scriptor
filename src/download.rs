@@ -6,7 +6,7 @@ use std::process::Command;
 
 use anyhow::{Context, Result, bail};
 
-use crate::binary::binary_exists_in;
+use crate::binary::ensure_present_in;
 
 /// Résultat d'un téléchargement réussi : chemin du fichier téléchargé et
 /// titre de la vidéo (utilisé plus tard pour nommer la Sortie).
@@ -35,9 +35,7 @@ pub fn download(url: &str, output_dir: &Path) -> Result<DownloadedMedia> {
 }
 
 fn download_with_path(url: &str, output_dir: &Path, path_env: &OsStr) -> Result<DownloadedMedia> {
-    if !binary_exists_in("yt-dlp", path_env) {
-        bail!("binaire `yt-dlp` introuvable dans le PATH");
-    }
+    ensure_present_in("yt-dlp", path_env)?;
 
     fs::create_dir_all(output_dir)
         .with_context(|| format!("impossible de créer le répertoire {}", output_dir.display()))?;

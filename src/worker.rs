@@ -9,13 +9,14 @@
 //! fichier simplement en écrivant sur stdout, sans avoir besoin de rouvrir
 //! le fichier lui-même.
 
+use std::fs;
+use std::io;
 use std::path::PathBuf;
-use std::time::{SystemTime, UNIX_EPOCH};
-use std::{fs, io};
 
 use anyhow::{Context, Result, anyhow};
 
 use crate::cli::{Args, Source, detect_source};
+use crate::unique_id::unique_id;
 use crate::{audio, download, notify, output, transcribe};
 
 /// Point d'entrée du mode Worker : initialise le logging fichier, exécute le
@@ -126,15 +127,6 @@ fn create_tmp_dir() -> Result<PathBuf> {
     fs::create_dir_all(&tmp_dir)
         .with_context(|| format!("création du dossier temporaire {}", tmp_dir.display()))?;
     Ok(tmp_dir)
-}
-
-/// Identifiant unique (pid + horodatage nanoseconde) pour le dossier
-/// temporaire d'une exécution du Pipeline.
-fn unique_id() -> String {
-    let nanos = SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .map_or(0, |duration| duration.as_nanos());
-    format!("{}-{nanos}", std::process::id())
 }
 
 /// Supprime le dossier temporaire du Pipeline à la fin de son scope, que le

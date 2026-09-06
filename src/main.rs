@@ -11,18 +11,17 @@ mod download;
 mod notify;
 mod output;
 mod transcribe;
+mod unique_id;
 mod worker;
 
 use std::fs::{self, File};
 use std::os::unix::process::CommandExt;
 use std::path::PathBuf;
 use std::process::{Command, ExitCode, Stdio};
-use std::time::{SystemTime, UNIX_EPOCH};
 
-use anyhow::{Context, Result, bail};
+use anyhow::{Context, Result};
 use clap::Parser;
 
-use binary::binary_exists;
 use cli::{Args, Source, detect_source};
 use config::Config;
 
@@ -80,14 +79,10 @@ fn launch(args: &Args) -> Result<()> {
 /// et `whisper-cli` toujours, `yt-dlp` seulement pour une Source distante.
 /// Échoue immédiatement (avant tout détachement) si l'un d'eux est absent.
 fn ensure_required_binaries_present(source: &Source) -> Result<()> {
-    if !binary_exists("ffmpeg") {
-        bail!("binaire `ffmpeg` introuvable dans le PATH");
-    }
-    if !binary_exists("whisper-cli") {
-        bail!("binaire `whisper-cli` introuvable dans le PATH");
-    }
-    if matches!(source, Source::Remote(_)) && !binary_exists("yt-dlp") {
-        bail!("binaire `yt-dlp` introuvable dans le PATH (nécessaire pour une Source distante)");
+    binary::ensure_present("ffmpeg")?;
+    binary::ensure_present("whisper-cli")?;
+    if matches!(source, Source::Remote(_)) {
+        binary::ensure_present("yt-dlp").context("nécessaire pour une Source distante")?;
     }
     Ok(())
 }
@@ -147,7 +142,7 @@ fn spawn_worker(
 }
 
 /// Chemin du fichier de log du Worker :
-/// `dirs::cache_dir()/scriptor/logs/<horodatage>.log`. Le répertoire parent
+/// `dirs::cache_dir()/scriptor/logs/<id-unique>.log`. Le répertoire parent
 /// est créé si besoin.
 fn create_log_file_path() -> Result<PathBuf> {
     let cache_dir =
@@ -156,9 +151,6 @@ fn create_log_file_path() -> Result<PathBuf> {
     fs::create_dir_all(&logs_dir)
         .with_context(|| format!("création du répertoire de logs {}", logs_dir.display()))?;
 
-    let nanos = SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .map_or(0, |duration| duration.as_nanos());
-    let filename = format!("{nanos}-{}.log", std::process::id());
+    let filename = format!("{}.log", unique_id::unique_id());
     Ok(logs_dir.join(filename))
 }

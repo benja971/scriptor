@@ -20,7 +20,7 @@ _Avoid_: traitement, job, workflow
 **Worker**:
 Le process qui exécute réellement le Pipeline en arrière-plan, détaché du
 process CLI initial. Le CLI lance le Worker puis rend la main immédiatement ;
-le Worker notifie la fin du Pipeline via ntfy.
+le Worker notifie la fin du Pipeline via notify-send.
 _Avoid_: daemon, process de fond, tâche de fond
 
 **Sortie**:

@@ -5,7 +5,7 @@ use std::process::Command;
 
 use anyhow::{Context, Result, bail};
 
-use crate::binary::binary_exists_in;
+use crate::binary::ensure_present_in;
 
 /// Transcrit `audio_wav` avec `whisper-cli`, en utilisant le modèle situé à
 /// `model_path`, la langue `language` et `threads` threads. Écrit le
@@ -43,9 +43,7 @@ fn transcribe_with_path(
     output_basename: &Path,
     path_env: &OsStr,
 ) -> Result<PathBuf> {
-    if !binary_exists_in("whisper-cli", path_env) {
-        bail!("binaire `whisper-cli` introuvable dans le PATH");
-    }
+    ensure_present_in("whisper-cli", path_env)?;
 
     let output = Command::new("whisper-cli")
         .env("PATH", path_env)
