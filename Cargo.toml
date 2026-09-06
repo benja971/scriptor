@@ -1,0 +1,21 @@
+[package]
+name = "scriptor"
+version = "0.1.0"
+edition = "2024"
+license = "MIT"
+description = "CLI de transcription audio/vidéo vers texte, 100% local (whisper.cpp)"
+repository = "https://github.com/benja971/scriptor"
+
+[dependencies]
+anyhow = "1.0.104"
+clap = { version = "4.6.6", features = ["derive"] }
+dirs = "7.0.0"
+serde = { version = "1.0.229", features = ["derive"] }
+toml = "1.1.5"
+tracing = "0.1.44"
+tracing-subscriber = { version = "0.3.23", features = ["fmt", "env-filter"] }
+
+[dev-dependencies]
+assert_cmd = "2.2.2"
+assert_fs = "1.1.4"
+predicates = "3.1.4"
