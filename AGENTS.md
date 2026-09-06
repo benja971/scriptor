@@ -25,8 +25,10 @@ pas à chaque PR.
 - Lints clippy stricts dans `Cargo.toml` (`[lints.clippy]`) : `pedantic`/`nursery` en `deny`, plus
   anti-panic explicite (`unwrap_used`, `expect_used`, `panic`, `panic_in_result_fn`, etc.).
   `anyhow` + `.context(...)` à chaque point d'échec, jamais de raccourci qui paniquerait.
-- Un fichier par module (`src/foo.rs`), jamais `src/foo/mod.rs`. Pas de `lib.rs` sauf besoin futur
-  (second binaire, tests appelant directement les fonctions).
+- Un module se nomme `src/foo.rs`, jamais `src/foo/mod.rs` (style pré-2018) : c'est une règle de
+  résolution du fichier racine du module, pas une interdiction de sous-dossier. Si `foo` a besoin
+  de sous-modules, ils vivent dans `src/foo/` à côté de `src/foo.rs`. Pas de `lib.rs` sauf besoin
+  futur (second binaire, tests appelant directement les fonctions).
 - Vocabulaire du domaine dans `CONTEXT.md` (Source, Pipeline, Worker, Sortie, Modèle) : à utiliser
   de façon cohérente dans le code et les tickets, pas de synonymes.
 

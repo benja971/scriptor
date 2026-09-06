@@ -121,8 +121,10 @@ src/
 ```
 
 Pas de `lib.rs` sauf besoin futur (second binaire, ou tests d'intégration appelant directement
-les fonctions sans passer par le process). Un fichier par module (`src/foo.rs`), pas
-`src/foo/mod.rs` (style pré-2018, déprécié).
+les fonctions sans passer par le process). Un module se nomme `src/foo.rs`, pas `src/foo/mod.rs`
+(style pré-2018, déprécié) : c'est la convention de résolution du fichier racine, pas une
+interdiction de sous-dossier. Un module qui a besoin de sous-modules garde `src/foo.rs` et les
+range dans `src/foo/` à côté.
 
 ## 4. Tests
 
