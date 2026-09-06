@@ -29,7 +29,8 @@ fn main() -> ExitCode {
     let args = Args::parse();
 
     let result = if args.worker {
-        worker::run(&args)
+        args.into_worker_params()
+            .and_then(|params| worker::run(&params))
     } else {
         launch(&args)
     };

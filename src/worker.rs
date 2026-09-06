@@ -15,7 +15,7 @@ use std::path::PathBuf;
 
 use anyhow::{Context, Result, anyhow};
 
-use crate::cli::{Args, Source, detect_source};
+use crate::cli::{ResolvedSource, WorkerParams};
 use crate::unique_id::unique_id;
 use crate::{audio, download, notify, output, transcribe};
 
@@ -29,12 +29,12 @@ use crate::{audio, download, notify, output, transcribe};
 /// un échec de notification est logué mais n'écrase jamais le résultat du
 /// Pipeline lui-même (la Sortie a déjà été produite avec succès, ou l'erreur
 /// d'origine du Pipeline doit rester celle remontée).
-pub fn run(args: &Args) -> Result<()> {
+pub fn run(params: &WorkerParams) -> Result<()> {
     init_logging()?;
 
-    tracing::info!(source = %args.source, "démarrage du Worker");
+    tracing::info!(source = params.source.display(), "démarrage du Worker");
 
-    match run_pipeline(args) {
+    match run_pipeline(params) {
         Ok(output_path) => {
             tracing::info!(output = %output_path.display(), "Pipeline terminé avec succès");
             if let Err(notify_err) = notify::notify_success(&output_path) {
@@ -44,8 +44,7 @@ pub fn run(args: &Args) -> Result<()> {
         }
         Err(err) => {
             tracing::error!(error = format!("{err:#}"), "échec du Pipeline");
-            let log_path = args.log.clone().unwrap_or_else(|| PathBuf::from("?"));
-            if let Err(notify_err) = notify::notify_failure(&args.source, &log_path) {
+            if let Err(notify_err) = notify::notify_failure(params.source.display(), &params.log) {
                 tracing::error!(error = %notify_err, "échec de la notification d'échec");
             }
             Err(err)
@@ -64,38 +63,17 @@ fn init_logging() -> Result<()> {
 }
 
 /// Exécute le Pipeline complet et retourne le chemin de la Sortie produite.
-fn run_pipeline(args: &Args) -> Result<PathBuf> {
-    let source = detect_source(&args.source);
-    let model_path = args
-        .model_path
-        .clone()
-        .context("le Worker nécessite --model-path")?;
-    let language = args
-        .language
-        .clone()
-        .context("le Worker nécessite --language")?;
-    let threads = args.threads.context("le Worker nécessite --threads")?;
-
+fn run_pipeline(params: &WorkerParams) -> Result<PathBuf> {
     let tmp_dir = create_tmp_dir()?;
     let _cleanup = TmpDirGuard(tmp_dir.clone());
 
-    let (media_path, output_path) = match &source {
-        Source::Local(path) => {
-            let output_path = args
-                .output
-                .clone()
-                .context("le Worker nécessite --output pour une Source locale")?;
-            (PathBuf::from(path), output_path)
-        }
-        Source::Remote(url) => {
+    let (media_path, output_path) = match &params.source {
+        ResolvedSource::Local { path, output } => (PathBuf::from(path), output.clone()),
+        ResolvedSource::Remote { url, output_dir } => {
             tracing::info!(url, "téléchargement de la Source distante");
             let downloaded = download::download(url, &tmp_dir)
                 .context("échec du téléchargement de la Source")?;
-            let output_dir = args
-                .output_dir
-                .clone()
-                .context("le Worker nécessite --output-dir pour une Source distante")?;
-            let output_path = output::output_path_for_remote(&output_dir, &downloaded.title)
+            let output_path = output::output_path_for_remote(output_dir, &downloaded.title)
                 .context("échec de la résolution du chemin de Sortie")?;
             (downloaded.path, output_path)
         }
@@ -112,8 +90,14 @@ fn run_pipeline(args: &Args) -> Result<PathBuf> {
 
     let basename = output::basename_for_transcription(&output_path);
     tracing::info!(output = %output_path.display(), "transcription");
-    transcribe::transcribe(&model_path, &audio_wav, &language, threads, &basename)
-        .context("échec de la transcription")?;
+    transcribe::transcribe(
+        &params.model_path,
+        &audio_wav,
+        &params.language,
+        params.threads,
+        &basename,
+    )
+    .context("échec de la transcription")?;
 
     Ok(output_path)
 }

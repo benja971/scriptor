@@ -1,5 +1,6 @@
 use std::path::PathBuf;
 
+use anyhow::{Context, Result};
 use clap::Parser;
 
 /// Arguments du CLI `scriptor`.
@@ -63,6 +64,73 @@ pub fn detect_source(input: &str) -> Source {
         Source::Remote(input.to_string())
     } else {
         Source::Local(input.to_string())
+    }
+}
+
+/// Source déjà résolue par le process initial, portant par variante
+/// exactement la Destination qui lui correspond : impossible de représenter
+/// une Source locale avec un dossier de sortie, ou une Source distante avec
+/// un chemin de Sortie déjà figé.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ResolvedSource {
+    Local { path: String, output: PathBuf },
+    Remote { url: String, output_dir: PathBuf },
+}
+
+impl ResolvedSource {
+    /// Représentation textuelle de la Source, pour les messages à l'utilisateur
+    /// (notification d'échec notamment).
+    pub fn display(&self) -> &str {
+        match self {
+            Self::Local { path, .. } => path,
+            Self::Remote { url, .. } => url,
+        }
+    }
+}
+
+/// Tout ce dont le Worker a besoin pour exécuter le Pipeline, déjà validé :
+/// contrairement à `Args`, aucun champ n'est optionnel ici.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct WorkerParams {
+    pub source: ResolvedSource,
+    pub log: PathBuf,
+    pub model_path: PathBuf,
+    pub language: String,
+    pub threads: u32,
+}
+
+impl Args {
+    /// Convertit les arguments bruts du mode Worker en paramètres validés.
+    ///
+    /// # Errors
+    ///
+    /// Retourne une erreur si un champ interne requis par le mode Worker est
+    /// absent. Ne devrait jamais arriver via l'usage normal : le process
+    /// initial fournit toujours l'ensemble complet (cf. `main.rs::spawn_worker`).
+    pub fn into_worker_params(self) -> Result<WorkerParams> {
+        let source = match detect_source(&self.source) {
+            Source::Local(path) => ResolvedSource::Local {
+                path,
+                output: self
+                    .output
+                    .context("le Worker nécessite --output pour une Source locale")?,
+            },
+            Source::Remote(url) => ResolvedSource::Remote {
+                url,
+                output_dir: self
+                    .output_dir
+                    .context("le Worker nécessite --output-dir pour une Source distante")?,
+            },
+        };
+        Ok(WorkerParams {
+            source,
+            log: self.log.context("le Worker nécessite --log")?,
+            model_path: self
+                .model_path
+                .context("le Worker nécessite --model-path")?,
+            language: self.language.context("le Worker nécessite --language")?,
+            threads: self.threads.context("le Worker nécessite --threads")?,
+        })
     }
 }
 
