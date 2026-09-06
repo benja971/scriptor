@@ -25,7 +25,7 @@ Modèle whisper à télécharger séparément : `whisper-cpp-download-ggml-model
 `~/.config/scriptor/config.toml` :
 
 ```toml
-output_dir = "~/transcriptions"
+output_dir = "~/Downloads/Transcriptions"
 model = "small"
 threads = 16
 ```

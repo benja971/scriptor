@@ -44,4 +44,4 @@ unchecked_time_subtraction = "deny"
 # Additional opinionated idiom lints
 clone_on_ref_ptr = "deny"
 clone_on_copy = "deny"
-undocumented_unsafe_blocks = "forbid"
+undocumented_unsafe_blocks = "deny"

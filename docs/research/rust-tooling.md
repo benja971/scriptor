@@ -65,6 +65,48 @@ Nuance sur le détachement : `process_group(0)` change le groupe de processus, p
 Le `SIGHUP` de fermeture de terminal cible généralement la session. Comportement à vérifier
 empiriquement dans Ghostty/fish avant de considérer que c'est suffisant.
 
+### Validation empirique (ticket #6, implémentation de l'orchestration)
+
+**Conclusion : `process_group(0)` seul suffit, pas besoin de `setsid()`/crate `nix`.**
+
+Méthode et résultat (menés depuis l'environnement d'exécution de l'agent, pas directement
+dans Ghostty — voir limite ci-dessous) :
+
+- Un premier essai de simulation fidèle de "fermeture du terminal" via un pty Python
+  (`pty.fork()` + fermeture du côté maître, ce qui déclenche normalement un vrai hangup noyau)
+  n'a délivré **aucun** `SIGHUP` au shell leader de session, y compris sur un cas minimal sans
+  rapport avec `scriptor` (juste `sh` + `trap ... HUP` + `sleep`). Cet environnement (sandbox
+  d'agent, probablement `bubblewrap` d'après le `PATH`) restreint apparemment la sémantique
+  pty/session au point de ne pas déclencher ce hangup — donc pas de reproduction possible du
+  déclencheur exact "fermeture de fenêtre de terminal" depuis cet environnement.
+- Validation alternative, directe et conforme à POSIX : lancement du binaire `scriptor` compilé
+  (Source locale réelle, `ffmpeg`/`whisper-cli` réels, modèle `small` réel) sous un `setsid sh
+  ...` dédié (nouvelle session/pgid), puis récupération du pid du Worker détaché
+  (`pgrep -f -- '--worker'`) pendant qu'il tournait encore (extraction + transcription réelles,
+  quelques secondes). Envoi ensuite de `kill -HUP -<pgid du launcher>` (négatif : cible tout le
+  groupe de processus d'origine, exactement ce que le noyau fait pour le groupe de processus au
+  premier plan d'un terminal qui se ferme).
+  - Résultat vérifié via `ps -o pid,pgid,sid` : le Worker a bien un `pgid` différent de celui du
+    launcher (`process_group(0)` effectif), mais le même `sid` (pas de nouvelle session, cohérent
+    avec l'absence de `setsid()`).
+  - Le `SIGHUP` envoyé au pgid d'origine a bien été reçu par le launcher (confirmé par un `trap
+    ... HUP` qui a loggé sa réception).
+  - Le Worker (pgid différent) est resté vivant et a terminé son Pipeline normalement : `ps`/
+    `pgrep` le montrent toujours actif après l'envoi du signal, aucun impact.
+- Le Worker n'ayant par ailleurs aucun descripteur ouvert sur le terminal contrôleur (stdin
+  `Stdio::null()`, stdout/stderr redirigés vers le fichier de log dès le `Command` de lancement),
+  même un hangup qui affecterait la session au sens large ne peut pas se traduire en `EIO`/
+  `SIGTTIN`/`SIGTTOU` côté Worker.
+
+**Limite assumée** : cette validation confirme le mécanisme exact en jeu (isolation de groupe de
+processus protège d'un `SIGHUP` ciblant le groupe de premier plan d'origine, ce qui est
+précisément ce que fait un terminal à sa fermeture d'après la sémantique POSIX), mais ne
+reproduit pas littéralement "fermer Ghostty" de bout en bout (impossible depuis ce sandbox
+d'agent). Un test manuel ponctuel dans Ghostty/fish réel (`scriptor <fichier>`, fermer l'onglet/
+la fenêtre, `pgrep -f scriptor` après quelques secondes) reste une bonne vérification finale bon
+marché avant utilisation en confiance totale, mais n'est plus bloquant pour ce ticket au vu de la
+validation ci-dessus.
+
 ## 3. Structure de projet
 
 ```
