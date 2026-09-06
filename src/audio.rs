@@ -16,7 +16,6 @@ use crate::binary::binary_exists_in;
 /// process ne peut pas être lancé, ou si `ffmpeg` termine avec un code de
 /// sortie non nul (le message d'erreur inclut alors stdout/stderr du
 /// process).
-#[allow(dead_code)]
 pub fn extract_audio(input: &Path, output_wav: &Path) -> Result<()> {
     let path_env = env::var_os("PATH").unwrap_or_default();
     extract_audio_with_path(input, output_wav, &path_env)

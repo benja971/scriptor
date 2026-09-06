@@ -17,7 +17,6 @@ use crate::binary::binary_exists_in;
 /// le process ne peut pas être lancé, ou si `whisper-cli` termine avec un
 /// code de sortie non nul (le message d'erreur inclut alors stdout/stderr du
 /// process).
-#[allow(dead_code)]
 pub fn transcribe(
     model_path: &Path,
     audio_wav: &Path,

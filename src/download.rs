@@ -11,7 +11,6 @@ use crate::binary::binary_exists_in;
 /// Résultat d'un téléchargement réussi : chemin du fichier téléchargé et
 /// titre de la vidéo (utilisé plus tard pour nommer la Sortie).
 #[derive(Debug, Clone, PartialEq, Eq)]
-#[allow(dead_code)]
 pub struct DownloadedMedia {
     pub path: PathBuf,
     pub title: String,
@@ -30,7 +29,6 @@ pub struct DownloadedMedia {
 /// `output_dir` ne peut pas être créé, si le process ne peut pas être
 /// lancé, ou si `yt-dlp` termine avec un code de sortie non nul (le message
 /// d'erreur inclut alors stdout/stderr du process).
-#[allow(dead_code)]
 pub fn download(url: &str, output_dir: &Path) -> Result<DownloadedMedia> {
     let path_env = env::var_os("PATH").unwrap_or_default();
     download_with_path(url, output_dir, &path_env)

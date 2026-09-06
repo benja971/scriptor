@@ -4,7 +4,6 @@ use std::process::Command;
 use anyhow::{Context, Result};
 
 /// Notifie sur le bureau qu'une transcription s'est terminée avec succès.
-#[allow(dead_code)]
 pub fn notify_success(output_path: &Path) -> Result<()> {
     send(&format!(
         "Transcription terminée : {}",
@@ -13,7 +12,6 @@ pub fn notify_success(output_path: &Path) -> Result<()> {
 }
 
 /// Notifie sur le bureau qu'une transcription a échoué.
-#[allow(dead_code)]
 pub fn notify_failure(source: &str, log_path: &Path) -> Result<()> {
     send(&format!(
         "Échec transcription {source} : voir {}",

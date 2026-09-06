@@ -10,7 +10,6 @@ use std::path::Path;
 /// avant tout lancement de binaire externe, et par l'orchestration pour la
 /// vérification préalable des dépendances requises.
 #[must_use]
-#[allow(dead_code)]
 pub fn binary_exists(name: &str) -> bool {
     let path_env = env::var_os("PATH").unwrap_or_default();
     binary_exists_in(name, &path_env)
