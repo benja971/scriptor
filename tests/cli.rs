@@ -46,14 +46,43 @@ fn write_executable(dir: &Path, name: &str, script: &str) {
     fs::set_permissions(&path, perms).expect("chmod du faux binaire");
 }
 
+/// Faux `ffmpeg` couvrant les usages du Pipeline : extraction audio et
+/// conservation d'artefacts (`-an`/`-vn`/copie, écrit un octet au dernier
+/// argument - `wait_for_file` exige une taille non nulle, comme le ferait un
+/// vrai `ffmpeg`), extraction de Frames (reconnue à la présence de `-map`,
+/// écrit une seule Frame et une ligne `showinfo` par passe, pour les deux
+/// passes intervalle/scène), et filtre couleur unie (reconnu à
+/// `signalstats`, annonce toujours un large écart de luminance : aucune
+/// Frame de ces tests n'est censée être filtrée).
 const FAKE_FFMPEG: &str = r#"#!/bin/sh
 set -eu
 last=""
+has_map=0
+has_signalstats=0
 for arg in "$@"; do
   last="$arg"
+  if [ "$arg" = "-map" ]; then
+    has_map=1
+  fi
+  case "$arg" in
+    *signalstats*) has_signalstats=1 ;;
+  esac
 done
-: > "$last"
+if [ "$has_signalstats" = "1" ]; then
+  echo "[Parsed_metadata_1 @ 0x0] lavfi.signalstats.YMIN=0" >&2
+  echo "[Parsed_metadata_1 @ 0x0] lavfi.signalstats.YMAX=255" >&2
+elif [ "$has_map" = "1" ]; then
+  dir="${last%/*}"
+  printf 'x' > "$dir/frame-000001.jpg"
+  echo "[Parsed_showinfo @ 0x0] n:0 pts_time:0.000" >&2
+else
+  printf 'x' > "$last"
+fi
 "#;
+
+/// Faux `ffprobe` annonçant la présence d'un flux vidéo (cf. `frames.rs`,
+/// `has_video_stream`) : sortie non vide sur stdout.
+const FAKE_FFPROBE: &str = "#!/bin/sh\necho 0\n";
 
 const FAKE_WHISPER_CLI: &str = r#"#!/bin/sh
 set -eu
@@ -83,8 +112,9 @@ exit 1
 
 /// Faux `yt-dlp` reproduisant exactement les arguments passés par
 /// `download.rs` (`--paths`, `--output`, `--print-to-file after_move:filepath
-/// <marker>`) : écrit un faux fichier vidéo dont le nom sert de titre, et
-/// enregistre son chemin dans le fichier marqueur attendu.
+/// <marker>`) : écrit un faux fichier vidéo (non vide - `wait_for_file` exige
+/// une taille non nulle, comme le ferait un vrai téléchargement) dont le nom
+/// sert de titre, et enregistre son chemin dans le fichier marqueur attendu.
 const FAKE_YT_DLP_SUCCESS: &str = r#"#!/bin/sh
 set -eu
 output_dir=""
@@ -105,7 +135,7 @@ while [ "$#" -gt 0 ]; do
   esac
 done
 video_path="$output_dir/My Remote Video.mp4"
-: > "$video_path"
+printf 'x' > "$video_path"
 printf '%s' "$video_path" > "$marker"
 "#;
 
@@ -138,6 +168,7 @@ impl TestEnv {
         let work_dir = unique_temp_dir(&format!("{label}-work"));
 
         write_executable(&bin_dir, "ffmpeg", FAKE_FFMPEG);
+        write_executable(&bin_dir, "ffprobe", FAKE_FFPROBE);
         write_executable(&bin_dir, "whisper-cli", FAKE_WHISPER_CLI);
         write_executable(&bin_dir, "notify-send", FAKE_NOTIFY_SEND_SUCCESS);
 
@@ -190,10 +221,7 @@ impl Drop for TestEnv {
 
 /// Attend que `path` existe avec un contenu non vide, avec un timeout court :
 /// le Worker étant détaché, le process initial rend la main avant que le
-/// fichier n'existe. Vérifier uniquement l'existence ne suffit plus depuis
-/// que la Sortie est réservée (fichier vide créé de façon atomique) avant
-/// même que la transcription ne commence : `path.is_file()` deviendrait vrai
-/// bien avant la fin réelle du Pipeline.
+/// fichier n'existe.
 fn wait_for_file(path: &Path, timeout: Duration) -> bool {
     let deadline = Instant::now()
         .checked_add(timeout)
@@ -220,14 +248,47 @@ fn local_source_happy_path_produces_output_next_to_source() {
         .success()
         .stdout(predicate::str::contains("Worker lancé"));
 
-    let expected_output = env.work_dir.join("interview.txt");
+    let expected_output = env.work_dir.join("interview").join("transcription.txt");
     assert!(
         wait_for_file(&expected_output, Duration::from_secs(5)),
         "la Sortie {} n'est jamais apparue",
         expected_output.display()
     );
     let content = fs::read_to_string(&expected_output).expect("lecture de la Sortie produite");
-    assert_eq!(content, "faux contenu transcrit\n");
+    assert_eq!(
+        content,
+        format!("Source : {}\n\nfaux contenu transcrit\n", media.display())
+    );
+}
+
+#[test]
+fn frames_directory_is_produced_inside_output_dir() {
+    let env = TestEnv::new("frames");
+    env.write_config(&env.work_dir.join("out"));
+    let media = env.write_media_file("interview.mp4");
+
+    env.command()
+        .arg(media.to_str().expect("chemin utf-8"))
+        .assert()
+        .success();
+
+    let expected_output = env.work_dir.join("interview").join("transcription.txt");
+    assert!(
+        wait_for_file(&expected_output, Duration::from_secs(5)),
+        "la Sortie {} n'est jamais apparue",
+        expected_output.display()
+    );
+
+    let expected_frame = env
+        .work_dir
+        .join("interview")
+        .join("frames")
+        .join("frame-0001-0.000s.jpg");
+    assert!(
+        wait_for_file(&expected_frame, Duration::from_secs(5)),
+        "la Frame {} n'est jamais apparue",
+        expected_frame.display()
+    );
 }
 
 #[test]
@@ -251,8 +312,8 @@ fn missing_required_binary_fails_immediately_without_output() {
         .stderr(predicate::str::contains("ffmpeg"));
 
     assert!(
-        !env.work_dir.join("interview.txt").exists(),
-        "aucune Sortie ne doit être produite si un binaire requis est absent"
+        !env.work_dir.join("interview").exists(),
+        "aucun dossier de Sortie ne doit être produit si un binaire requis est absent"
     );
     assert!(
         !env.xdg_cache.join("scriptor").join("logs").exists(),
@@ -267,24 +328,26 @@ fn output_collision_appends_numeric_suffix() {
     let env = TestEnv::new("collision");
     env.write_config(&env.work_dir.join("out"));
     let media = env.write_media_file("interview.mp4");
-    fs::write(env.work_dir.join("interview.txt"), "sortie déjà existante")
-        .expect("écriture d'une Sortie déjà existante");
+    fs::create_dir(env.work_dir.join("interview"))
+        .expect("écriture d'un dossier de Sortie déjà existant");
 
     env.command()
         .arg(media.to_str().expect("chemin utf-8"))
         .assert()
         .success();
 
-    let expected_output = env.work_dir.join("interview-1.txt");
+    let expected_output = env.work_dir.join("interview-1").join("transcription.txt");
     assert!(
         wait_for_file(&expected_output, Duration::from_secs(5)),
         "la Sortie {} n'est jamais apparue",
         expected_output.display()
     );
-    assert_eq!(
-        fs::read_to_string(env.work_dir.join("interview.txt")).expect("lecture Sortie existante"),
-        "sortie déjà existante",
-        "la Sortie déjà existante ne doit jamais être écrasée"
+    assert!(
+        !env.work_dir
+            .join("interview")
+            .join("transcription.txt")
+            .exists(),
+        "le dossier de Sortie déjà existant ne doit jamais recevoir de nouvelle transcription"
     );
 }
 
@@ -323,14 +386,75 @@ fn remote_source_happy_path_produces_output_named_from_title() {
         .success()
         .stdout(predicate::str::contains("Worker lancé"));
 
-    let expected_output = output_dir.join("my-remote-video.txt");
+    let expected_output = output_dir.join("my-remote-video").join("transcription.txt");
     assert!(
         wait_for_file(&expected_output, Duration::from_secs(5)),
         "la Sortie {} n'est jamais apparue",
         expected_output.display()
     );
     let content = fs::read_to_string(&expected_output).expect("lecture de la Sortie produite");
-    assert_eq!(content, "faux contenu transcrit\n");
+    assert_eq!(
+        content,
+        "Source : https://example.com/video\n\nfaux contenu transcrit\n"
+    );
+
+    let output_video_dir = output_dir.join("my-remote-video");
+    assert!(
+        !output_video_dir.join("source.mp4").exists(),
+        "aucun artefact conservé par défaut (source.mp4)"
+    );
+    assert!(
+        !output_video_dir.join("video-muted.mp4").exists(),
+        "aucun artefact conservé par défaut (video-muted.mp4)"
+    );
+    assert!(
+        !output_video_dir.join("audio.mka").exists(),
+        "aucun artefact conservé par défaut (audio.mka)"
+    );
+}
+
+#[test]
+fn keep_flags_produce_extra_artifacts_for_remote_source() {
+    let env = TestEnv::new("remote-keep");
+    let output_dir = env.work_dir.join("out");
+    env.write_config(&output_dir);
+    write_executable(&env.bin_dir, "yt-dlp", FAKE_YT_DLP_SUCCESS);
+
+    env.command()
+        .arg("https://example.com/video")
+        .arg("--keep-source-video")
+        .arg("--keep-muted-video")
+        .arg("--keep-audio")
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("Worker lancé"));
+
+    let output_video_dir = output_dir.join("my-remote-video");
+    let expected_output = output_video_dir.join("transcription.txt");
+    assert!(
+        wait_for_file(&expected_output, Duration::from_secs(5)),
+        "la Sortie {} n'est jamais apparue",
+        expected_output.display()
+    );
+
+    let source_video = output_video_dir.join("source.mp4");
+    assert!(
+        wait_for_file(&source_video, Duration::from_secs(5)),
+        "la vidéo source {} n'est jamais apparue",
+        source_video.display()
+    );
+    let muted_video = output_video_dir.join("video-muted.mp4");
+    assert!(
+        wait_for_file(&muted_video, Duration::from_secs(5)),
+        "la vidéo muette {} n'est jamais apparue",
+        muted_video.display()
+    );
+    let audio = output_video_dir.join("audio.mka");
+    assert!(
+        wait_for_file(&audio, Duration::from_secs(5)),
+        "l'audio {} n'est jamais apparu",
+        audio.display()
+    );
 }
 
 #[test]
@@ -350,7 +474,7 @@ fn success_notification_reports_output_path() {
         .assert()
         .success();
 
-    let expected_output = env.work_dir.join("interview.txt");
+    let expected_output = env.work_dir.join("interview").join("transcription.txt");
     assert!(
         wait_for_file(&expected_output, Duration::from_secs(5)),
         "la Sortie {} n'est jamais apparue",
@@ -361,9 +485,10 @@ fn success_notification_reports_output_path() {
         "notify-send n'a jamais été appelé"
     );
     let captured = fs::read_to_string(&capture_path).expect("lecture des arguments capturés");
+    let expected_output_dir = env.work_dir.join("interview");
     assert_eq!(
         captured.trim_end_matches('\n'),
-        format!("Transcription terminée : {}", expected_output.display())
+        format!("Transcription terminée : {}", expected_output_dir.display())
     );
 }
 
@@ -418,8 +543,8 @@ fn failure_notification_reports_source_and_log_which_contains_the_error() {
     );
 
     assert!(
-        !env.work_dir.join("interview.txt").exists(),
-        "aucune Sortie ne doit être produite si le Pipeline échoue"
+        !env.work_dir.join("interview").exists(),
+        "aucun dossier de Sortie orphelin ne doit rester si le Pipeline échoue"
     );
 }
 
@@ -487,7 +612,7 @@ fn real_binaries_local_source_happy_path() {
         .success()
         .stdout(predicate::str::contains("Worker lancé"));
 
-    let expected_output = work_dir.join("silence.txt");
+    let expected_output = work_dir.join("silence").join("transcription.txt");
     assert!(
         wait_for_file(&expected_output, Duration::from_mins(1)),
         "la Sortie {} n'est jamais apparue (transcription réelle, peut être lente)",

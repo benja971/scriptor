@@ -1,13 +1,15 @@
 //! Orchestration de `scriptor` : parse les arguments, charge la config,
-//! détecte la Source, vérifie les binaires requis, calcule le chemin de
+//! détecte la Source, vérifie les binaires requis, calcule le dossier de
 //! Sortie, puis relance ce même binaire en mode Worker détaché (cf.
 //! `worker.rs`) avant de rendre la main.
 
+mod artifacts;
 mod audio;
 mod binary;
 mod cli;
 mod config;
 mod download;
+mod frames;
 mod notify;
 mod output;
 mod transcribe;
@@ -46,7 +48,7 @@ fn main() -> ExitCode {
 
 /// Étapes réalisées par le process CLI initial, avant tout détachement :
 /// charge la config, détecte la Source, vérifie les binaires requis,
-/// calcule le chemin de Sortie (pour une Source locale), puis relance ce
+/// calcule le dossier de Sortie (pour une Source locale), puis relance ce
 /// même binaire en mode Worker détaché.
 fn launch(args: &Args) -> Result<()> {
     let config = Config::load()?;
@@ -56,8 +58,8 @@ fn launch(args: &Args) -> Result<()> {
 
     let output = match &source {
         Source::Local(path) => Some(
-            output::output_path_for_local(std::path::Path::new(path))
-                .context("failed to resolve output path")?,
+            output::output_dir_for_local(std::path::Path::new(path))
+                .context("failed to resolve output directory")?,
         ),
         Source::Remote(_) => None,
     };
@@ -76,11 +78,13 @@ fn launch(args: &Args) -> Result<()> {
     )
 }
 
-/// Vérifie la présence des binaires requis par la Source donnée : `ffmpeg`
-/// et `whisper-cli` toujours, `yt-dlp` seulement pour une Source distante.
-/// Échoue immédiatement (avant tout détachement) si l'un d'eux est absent.
+/// Vérifie la présence des binaires requis par la Source donnée : `ffmpeg`,
+/// `ffprobe` et `whisper-cli` toujours, `yt-dlp` seulement pour une Source
+/// distante. Échoue immédiatement (avant tout détachement) si l'un d'eux est
+/// absent.
 fn ensure_required_binaries_present(source: &Source) -> Result<()> {
     binary::ensure_present("ffmpeg")?;
+    binary::ensure_present("ffprobe")?;
     binary::ensure_present("whisper-cli")?;
     if matches!(source, Source::Remote(_)) {
         binary::ensure_present("yt-dlp").context("required for a remote Source")?;
@@ -118,7 +122,23 @@ fn spawn_worker(
         .arg("--language")
         .arg(&config.language)
         .arg("--threads")
-        .arg(threads.to_string());
+        .arg(threads.to_string())
+        .arg("--frame-interval-secs")
+        .arg(config.frame_interval_secs.to_string())
+        .arg("--frame-scene-threshold")
+        .arg(config.frame_scene_threshold.to_string())
+        .arg("--frame-dedup-window-secs")
+        .arg(config.frame_dedup_window_secs.to_string());
+
+    if args.keep_source_video || config.keep_source_video {
+        command.arg("--keep-source-video");
+    }
+    if args.keep_muted_video || config.keep_muted_video {
+        command.arg("--keep-muted-video");
+    }
+    if args.keep_audio || config.keep_audio {
+        command.arg("--keep-audio");
+    }
 
     if let Some(output) = output {
         command.arg("--output").arg(output);

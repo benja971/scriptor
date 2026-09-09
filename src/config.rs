@@ -10,7 +10,7 @@ use serde::{Deserialize, Serialize};
 
 /// Configuration de `scriptor`, chargée depuis `config.toml` avec application de
 /// défauts pour tout champ absent.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct Config {
     /// Dossier de sortie des transcriptions issues d'une Source distante.
     #[serde(default = "default_output_dir")]
@@ -27,6 +27,30 @@ pub struct Config {
     /// Nombre de threads utilisés par la transcription.
     #[serde(default = "default_threads")]
     pub threads: usize,
+    /// Intervalle (en secondes) entre deux Frames extraites à fréquence fixe.
+    #[serde(default = "default_frame_interval_secs")]
+    pub frame_interval_secs: u32,
+    /// Seuil de détection ffmpeg (`0.0`-`1.0`) au-delà duquel un changement de
+    /// scène déclenche l'extraction d'une Frame supplémentaire.
+    #[serde(default = "default_frame_scene_threshold")]
+    pub frame_scene_threshold: f64,
+    /// Fenêtre (en secondes) en-deçà de laquelle une Frame de changement de
+    /// scène trop proche d'une Frame à intervalle fixe est ignorée.
+    #[serde(default = "default_frame_dedup_window_secs")]
+    pub frame_dedup_window_secs: u32,
+    /// Conserve, pour une Source distante, la vidéo telle que téléchargée
+    /// (avec son) dans le dossier de Sortie.
+    #[serde(default = "default_keep_source_video")]
+    pub keep_source_video: bool,
+    /// Conserve, pour une Source distante, une version de la vidéo sans
+    /// piste audio dans le dossier de Sortie.
+    #[serde(default = "default_keep_muted_video")]
+    pub keep_muted_video: bool,
+    /// Conserve, pour une Source distante, l'audio d'origine (qualité
+    /// native, pas le WAV dégradé produit pour la transcription) dans le
+    /// dossier de Sortie.
+    #[serde(default = "default_keep_audio")]
+    pub keep_audio: bool,
 }
 
 impl Default for Config {
@@ -37,6 +61,12 @@ impl Default for Config {
             models_dir: default_models_dir(),
             language: default_language(),
             threads: default_threads(),
+            frame_interval_secs: default_frame_interval_secs(),
+            frame_scene_threshold: default_frame_scene_threshold(),
+            frame_dedup_window_secs: default_frame_dedup_window_secs(),
+            keep_source_video: default_keep_source_video(),
+            keep_muted_video: default_keep_muted_video(),
+            keep_audio: default_keep_audio(),
         }
     }
 }
@@ -108,7 +138,7 @@ fn default_output_dir() -> PathBuf {
     dirs::download_dir()
         .or_else(dirs::home_dir)
         .unwrap_or_else(|| PathBuf::from("."))
-        .join("Transcriptions")
+        .join("scriptor")
 }
 
 fn default_model() -> String {
@@ -130,6 +160,37 @@ fn default_threads() -> usize {
     std::thread::available_parallelism().map_or(1, std::num::NonZeroUsize::get)
 }
 
+const fn default_frame_interval_secs() -> u32 {
+    10
+}
+
+// Validé empiriquement sur une vraie vidéo Instagram (UI/dashboard, transitions
+// "avant/après" par simple changement de couleur d'accent sur un layout par
+// ailleurs identique) : à 0.4 (et même 0.3/0.2/0.15), la passe de détection de
+// scène ne produisait STRICTEMENT AUCUNE Frame sur toute la vidéo (le score de
+// différence globale de ffmpeg est trop insensible à un changement de teinte
+// sur fond stable). À 0.05, les 5 transitions détectées correspondaient
+// exactement aux vraies coupures du script (0.1 n'en capturait que 2 sur 5).
+const fn default_frame_scene_threshold() -> f64 {
+    0.05
+}
+
+const fn default_frame_dedup_window_secs() -> u32 {
+    3
+}
+
+const fn default_keep_source_video() -> bool {
+    false
+}
+
+const fn default_keep_muted_video() -> bool {
+    false
+}
+
+const fn default_keep_audio() -> bool {
+    false
+}
+
 // Les lints anti-panic (`unwrap_used`, `expect_used`, `panic`) sont désactivés ici :
 // ils protègent le code de production, pas les assertions de test qui doivent
 // justement échouer bruyamment.
@@ -139,8 +200,10 @@ mod tests {
     use std::path::PathBuf;
 
     use super::{
-        Config, default_language, default_model, default_models_dir, default_output_dir,
-        default_threads,
+        Config, default_frame_dedup_window_secs, default_frame_interval_secs,
+        default_frame_scene_threshold, default_keep_audio, default_keep_muted_video,
+        default_keep_source_video, default_language, default_model, default_models_dir,
+        default_output_dir, default_threads,
     };
 
     #[test]
@@ -155,6 +218,17 @@ mod tests {
         assert_eq!(config.models_dir, default_models_dir());
         assert_eq!(config.language, default_language());
         assert_eq!(config.threads, default_threads());
+        assert_eq!(config.frame_interval_secs, default_frame_interval_secs());
+        assert!(
+            (config.frame_scene_threshold - default_frame_scene_threshold()).abs() < f64::EPSILON
+        );
+        assert_eq!(
+            config.frame_dedup_window_secs,
+            default_frame_dedup_window_secs()
+        );
+        assert_eq!(config.keep_source_video, default_keep_source_video());
+        assert_eq!(config.keep_muted_video, default_keep_muted_video());
+        assert_eq!(config.keep_audio, default_keep_audio());
     }
 
     #[test]
