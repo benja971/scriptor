@@ -1,42 +1,53 @@
-//! Calcul du chemin de la Sortie : à côté du fichier pour une Source locale,
+//! Calcul du dossier de Sortie : à côté du fichier pour une Source locale,
 //! dans `output_dir` nommé d'après le titre pour une Source distante, avec
-//! gestion de collision (suffixe `-N`, jamais d'écrasement).
+//! gestion de collision (suffixe `-N`, jamais d'écrasement). Le dossier
+//! réservé contient `transcription.txt` et, si la Source a produit des
+//! Frames, un sous-dossier `frames/`.
 
 use std::ffi::OsStr;
-use std::fs::OpenOptions;
 use std::io;
 use std::path::{Path, PathBuf};
 
 use anyhow::{Context, Result};
 
-/// Chemin de Sortie pour une Source locale : même basename que `source_path`,
-/// extension `.txt`, à côté du fichier, avec gestion de collision.
+/// Dossier de Sortie pour une Source locale : même basename que `source_path`
+/// (extension retirée), à côté du fichier, avec gestion de collision.
 ///
 /// # Errors
 ///
-/// Retourne une erreur si `source_path` n'a pas de nom de fichier exploitable.
-pub fn output_path_for_local(source_path: &Path) -> Result<PathBuf> {
-    let candidate = source_path.with_extension("txt");
-    resolve_collision(&candidate)
+/// Retourne une erreur si `source_path` n'a pas de nom de fichier exploitable,
+/// ou si plus aucun suffixe de collision n'est disponible.
+pub fn output_dir_for_local(source_path: &Path) -> Result<PathBuf> {
+    let candidate = source_path.with_extension("");
+    resolve_dir_collision(&candidate)
 }
 
-/// Chemin de Sortie pour une Source distante : titre slugifié, extension
-/// `.txt`, dans `output_dir`, avec gestion de collision.
+/// Dossier de Sortie pour une Source distante : titre slugifié, dans
+/// `output_dir`, avec gestion de collision.
 ///
 /// # Errors
 ///
 /// Retourne une erreur si plus aucun suffixe de collision n'est disponible.
-pub fn output_path_for_remote(output_dir: &Path, title: &str) -> Result<PathBuf> {
-    let candidate = output_dir.join(format!("{}.txt", slugify(title)));
-    resolve_collision(&candidate)
+pub fn output_dir_for_remote(output_dir: &Path, title: &str) -> Result<PathBuf> {
+    let candidate = output_dir.join(slugify(title));
+    resolve_dir_collision(&candidate)
 }
 
 /// Basename à transmettre à `whisper-cli` (`-of`) pour que le `.txt` qu'il
-/// produit corresponde exactement à `output_path` (whisper-cli ajoutant
-/// lui-même l'extension `.txt`).
+/// produit atterrisse dans le dossier de Sortie sous le nom
+/// `transcription.txt` (whisper-cli ajoutant lui-même l'extension `.txt`).
 #[must_use]
-pub fn basename_for_transcription(output_path: &Path) -> PathBuf {
-    output_path.with_extension("")
+pub fn transcription_basename(output_dir: &Path) -> PathBuf {
+    output_dir.join("transcription")
+}
+
+/// Chemin du sous-dossier de Frames à l'intérieur du dossier de Sortie déjà
+/// réservé : `frames/`. Pas de gestion de collision séparée nécessaire ici,
+/// le dossier de Sortie étant déjà unique. N'est créé sur disque que si des
+/// Frames sont effectivement écrites (cf. `frames::extract_frames`).
+#[must_use]
+pub fn frames_dir_for(output_dir: &Path) -> PathBuf {
+    output_dir.join("frames")
 }
 
 /// Convertit un titre libre en slug de nom de fichier : minuscules,
@@ -65,51 +76,52 @@ fn slugify(title: &str) -> String {
     }
 }
 
-/// Réserve `candidate` si aucun fichier n'existe déjà à ce chemin, sinon le
-/// premier chemin `<stem>-N.<ext>` libre à partir de `N = 1`.
+/// Réserve `candidate` comme dossier de Sortie si aucun n'existe déjà à ce
+/// chemin, sinon le premier `<candidate>-N` libre à partir de `N = 1`.
 ///
-/// La réservation est atomique (création exclusive du fichier, `O_CREAT |
-/// O_EXCL`) plutôt qu'un `exists()` suivi d'une écriture séparée : deux
-/// lancements concurrents sur la même Source ne peuvent jamais calculer le
-/// même chemin de Sortie, contrairement à un simple test d'existence qui
-/// laisserait une fenêtre entre la vérification et l'écriture réelle par
-/// `whisper-cli`. Le fichier réservé est vide ; `whisper-cli` l'écrase
-/// ensuite avec la transcription réelle.
-fn resolve_collision(candidate: &Path) -> Result<PathBuf> {
-    if try_reserve(candidate)? {
+/// La réservation est atomique (création exclusive du dossier) plutôt qu'un
+/// `exists()` suivi d'une création séparée : deux lancements concurrents sur
+/// la même Source ne peuvent jamais calculer le même dossier de Sortie,
+/// contrairement à un simple test d'existence qui laisserait une fenêtre
+/// entre la vérification et l'écriture réelle par le Pipeline.
+fn resolve_dir_collision(candidate: &Path) -> Result<PathBuf> {
+    if try_reserve_dir(candidate)? {
         return Ok(candidate.to_path_buf());
     }
 
     let parent = candidate.parent().unwrap_or_else(|| Path::new("."));
-    let stem = candidate
-        .file_stem()
+    let name = candidate
+        .file_name()
         .and_then(OsStr::to_str)
-        .with_context(|| format!("could not determine file name of {}", candidate.display()))?;
-    let extension = candidate.extension().and_then(OsStr::to_str);
+        .with_context(|| {
+            format!(
+                "could not determine directory name of {}",
+                candidate.display()
+            )
+        })?;
 
     for n in 1..=u32::MAX {
-        let filename = extension.map_or_else(
-            || format!("{stem}-{n}"),
-            |extension| format!("{stem}-{n}.{extension}"),
-        );
-        let path = parent.join(filename);
-        if try_reserve(&path)? {
+        let path = parent.join(format!("{name}-{n}"));
+        if try_reserve_dir(&path)? {
             return Ok(path);
         }
     }
 
     Err(anyhow::anyhow!(
-        "ran out of collision suffixes for the output"
+        "ran out of collision suffixes for the output directory"
     ))
 }
 
-/// Tente de créer `path` de façon exclusive (échoue si le fichier existe déjà).
+/// Tente de créer le dossier `path` de façon exclusive (`fs::create_dir`
+/// échoue si le chemin existe déjà, que ce soit un fichier ou un dossier).
 /// Retourne `true` si la réservation a réussi, `false` en cas de collision.
-fn try_reserve(path: &Path) -> Result<bool> {
-    match OpenOptions::new().write(true).create_new(true).open(path) {
-        Ok(_) => Ok(true),
+fn try_reserve_dir(path: &Path) -> Result<bool> {
+    match std::fs::create_dir(path) {
+        Ok(()) => Ok(true),
         Err(err) if err.kind() == io::ErrorKind::AlreadyExists => Ok(false),
-        Err(err) => Err(err).with_context(|| format!("reserving output path {}", path.display())),
+        Err(err) => {
+            Err(err).with_context(|| format!("reserving output directory {}", path.display()))
+        }
     }
 }
 
@@ -121,99 +133,113 @@ mod tests {
     use assert_fs::TempDir;
 
     use super::{
-        basename_for_transcription, output_path_for_local, output_path_for_remote, try_reserve,
+        frames_dir_for, output_dir_for_local, output_dir_for_remote, transcription_basename,
+        try_reserve_dir,
     };
 
     #[test]
-    fn local_output_uses_same_basename_with_txt_extension() {
+    fn local_output_dir_uses_source_basename_without_extension() {
         let temp = TempDir::new().expect("temporary directory");
         let source = temp.path().join("interview.mp4");
         fs::write(&source, b"fake video").expect("writing fake source file");
 
-        let output = output_path_for_local(&source).expect("resolving output");
+        let output_dir = output_dir_for_local(&source).expect("resolving output directory");
 
-        assert_eq!(output, temp.path().join("interview.txt"));
+        assert_eq!(output_dir, temp.path().join("interview"));
+        assert!(output_dir.is_dir());
     }
 
     #[test]
-    fn local_output_adds_numeric_suffix_on_collision() {
+    fn local_output_dir_adds_numeric_suffix_on_collision() {
         let temp = TempDir::new().expect("temporary directory");
         let source = temp.path().join("interview.mp4");
         fs::write(&source, b"fake video").expect("writing fake source file");
-        fs::write(temp.path().join("interview.txt"), b"already there")
-            .expect("writing an already existing output");
+        fs::create_dir(temp.path().join("interview"))
+            .expect("writing an already existing output directory");
 
-        let output = output_path_for_local(&source).expect("resolving output");
+        let output_dir = output_dir_for_local(&source).expect("resolving output directory");
 
-        assert_eq!(output, temp.path().join("interview-1.txt"));
+        assert_eq!(output_dir, temp.path().join("interview-1"));
     }
 
     #[test]
-    fn local_output_skips_taken_suffixes() {
+    fn local_output_dir_skips_taken_suffixes() {
         let temp = TempDir::new().expect("temporary directory");
         let source = temp.path().join("interview.mp4");
         fs::write(&source, b"fake video").expect("writing fake source file");
-        fs::write(temp.path().join("interview.txt"), b"1").expect("writing output -0");
-        fs::write(temp.path().join("interview-1.txt"), b"2").expect("writing output -1");
-        fs::write(temp.path().join("interview-2.txt"), b"3").expect("writing output -2");
+        fs::create_dir(temp.path().join("interview")).expect("writing output dir -0");
+        fs::create_dir(temp.path().join("interview-1")).expect("writing output dir -1");
+        fs::create_dir(temp.path().join("interview-2")).expect("writing output dir -2");
 
-        let output = output_path_for_local(&source).expect("resolving output");
+        let output_dir = output_dir_for_local(&source).expect("resolving output directory");
 
-        assert_eq!(output, temp.path().join("interview-3.txt"));
+        assert_eq!(output_dir, temp.path().join("interview-3"));
     }
 
     #[test]
-    fn remote_output_slugifies_title() {
+    fn remote_output_dir_slugifies_title() {
         let temp = TempDir::new().expect("temporary directory");
 
-        let output =
-            output_path_for_remote(temp.path(), "Amazing Video! (2026)").expect("resolving output");
+        let output_dir = output_dir_for_remote(temp.path(), "Amazing Video! (2026)")
+            .expect("resolving output directory");
 
-        assert_eq!(output, temp.path().join("amazing-video-2026.txt"));
+        assert_eq!(output_dir, temp.path().join("amazing-video-2026"));
     }
 
     #[test]
-    fn remote_output_falls_back_when_title_has_no_alphanumeric() {
+    fn remote_output_dir_falls_back_when_title_has_no_alphanumeric() {
         let temp = TempDir::new().expect("temporary directory");
 
-        let output = output_path_for_remote(temp.path(), "***").expect("resolving output");
+        let output_dir =
+            output_dir_for_remote(temp.path(), "***").expect("resolving output directory");
 
-        assert_eq!(output, temp.path().join("sans-titre.txt"));
+        assert_eq!(output_dir, temp.path().join("sans-titre"));
     }
 
     #[test]
-    fn remote_output_adds_numeric_suffix_on_collision() {
+    fn remote_output_dir_adds_numeric_suffix_on_collision() {
         let temp = TempDir::new().expect("temporary directory");
-        fs::write(temp.path().join("my-video.txt"), b"already there")
-            .expect("writing an already existing output");
+        fs::create_dir(temp.path().join("my-video"))
+            .expect("writing an already existing output directory");
 
-        let output = output_path_for_remote(temp.path(), "My Video").expect("resolving output");
+        let output_dir =
+            output_dir_for_remote(temp.path(), "My Video").expect("resolving output directory");
 
-        assert_eq!(output, temp.path().join("my-video-1.txt"));
+        assert_eq!(output_dir, temp.path().join("my-video-1"));
     }
 
     #[test]
-    fn basename_for_transcription_strips_txt_extension() {
-        let path = std::path::Path::new("/tmp/out/interview-1.txt");
+    fn transcription_basename_joins_output_dir() {
+        let output_dir = std::path::Path::new("/tmp/out/interview-1");
 
         assert_eq!(
-            basename_for_transcription(path),
-            std::path::PathBuf::from("/tmp/out/interview-1")
+            transcription_basename(output_dir),
+            std::path::PathBuf::from("/tmp/out/interview-1/transcription")
         );
     }
 
     #[test]
-    fn local_output_reserves_the_path_atomically() {
+    fn frames_dir_for_joins_output_dir_with_frames() {
+        let output_dir = std::path::Path::new("/tmp/out/interview-1");
+
+        assert_eq!(
+            frames_dir_for(output_dir),
+            std::path::PathBuf::from("/tmp/out/interview-1/frames")
+        );
+    }
+
+    #[test]
+    fn local_output_dir_reserves_the_path_atomically() {
         let temp = TempDir::new().expect("temporary directory");
         let source = temp.path().join("interview.mp4");
         fs::write(&source, b"fake video").expect("writing fake source file");
 
-        let output = output_path_for_local(&source).expect("resolving output");
+        let output_dir = output_dir_for_local(&source).expect("resolving output directory");
 
-        // La réservation crée le fichier : un lancement concurrent qui
+        // La réservation crée le dossier : un lancement concurrent qui
         // tenterait le même chemin échouerait immédiatement, sans jamais
         // pouvoir croire (à tort) que le chemin est encore libre.
-        assert!(output.is_file());
-        assert!(!try_reserve(&output).expect("checking reservation"));
+        assert!(output_dir.is_dir());
+        assert!(!try_reserve_dir(&output_dir).expect("checking reservation"));
     }
 }

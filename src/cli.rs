@@ -5,23 +5,47 @@ use clap::Parser;
 
 /// Arguments du CLI `scriptor`.
 ///
-/// Les champs autres que `source` forment le mode interne "Worker" : ils ne
-/// sont pas destinés à un usage direct par l'utilisateur (masqués du
+/// Les champs marqués `hide = true` forment le mode interne "Worker" : ils
+/// ne sont pas destinés à un usage direct par l'utilisateur (masqués du
 /// `--help`), mais utilisés par le process CLI initial pour relancer
 /// lui-même le binaire en mode détaché, en lui transmettant tout ce qui a
-/// déjà été résolu (Sortie, Modèle, config) avant le détachement.
+/// déjà été résolu (Sortie, Modèle, config, réglages de conservation
+/// d'artefacts) avant le détachement. Les autres champs (`source`, les
+/// options `--keep-*`) sont visibles de l'utilisateur.
+// Chaque booléen est un flag CLI indépendant (clap), pas un état combiné :
+// pas de state machine ni d'enum à deux variantes pertinent ici.
+#[allow(clippy::struct_excessive_bools)]
 #[derive(Parser, Debug)]
 #[command(version, about, long_about = None)]
 pub struct Args {
     /// Chemin de fichier local ou URL (Instagram, `TikTok`, `YouTube`, lien direct...).
     pub source: String,
 
+    /// Conserve, pour une Source distante, la vidéo telle que téléchargée
+    /// (avec son) dans le dossier de Sortie. Surcharge `keep_source_video`
+    /// de la configuration pour cet appel.
+    #[arg(long)]
+    pub keep_source_video: bool,
+
+    /// Conserve, pour une Source distante, une version de la vidéo sans
+    /// piste audio dans le dossier de Sortie. Surcharge `keep_muted_video`
+    /// de la configuration pour cet appel.
+    #[arg(long)]
+    pub keep_muted_video: bool,
+
+    /// Conserve, pour une Source distante, l'audio d'origine (qualité
+    /// native, pas le WAV dégradé produit pour la transcription) dans le
+    /// dossier de Sortie. Surcharge `keep_audio` de la configuration pour
+    /// cet appel.
+    #[arg(long)]
+    pub keep_audio: bool,
+
     /// Indique que ce process est le Worker détaché, relancé par le process
     /// CLI initial. Non destiné à un usage direct.
     #[arg(long, hide = true)]
     pub worker: bool,
 
-    /// Chemin de Sortie déjà résolu (Source locale, gestion de collision
+    /// Dossier de Sortie déjà résolu (Source locale, gestion de collision
     /// déjà faite par le process initial).
     #[arg(long, hide = true)]
     pub output: Option<PathBuf>,
@@ -48,6 +72,21 @@ pub struct Args {
     /// Nombre de threads résolu par le process initial.
     #[arg(long, hide = true)]
     pub threads: Option<u32>,
+
+    /// Intervalle (en secondes) entre deux Frames extraites à fréquence fixe,
+    /// résolu par le process initial.
+    #[arg(long, hide = true)]
+    pub frame_interval_secs: Option<u32>,
+
+    /// Seuil de détection de changement de scène ffmpeg, résolu par le
+    /// process initial.
+    #[arg(long, hide = true)]
+    pub frame_scene_threshold: Option<f64>,
+
+    /// Fenêtre anti-doublon (en secondes) entre Frames, résolue par le
+    /// process initial.
+    #[arg(long, hide = true)]
+    pub frame_dedup_window_secs: Option<u32>,
 }
 
 /// Distinction Source locale / Source distante, déterminée à partir du préfixe
@@ -69,8 +108,10 @@ pub fn detect_source(input: &str) -> Source {
 
 /// Source déjà résolue par le process initial, portant par variante
 /// exactement la Destination qui lui correspond : impossible de représenter
-/// une Source locale avec un dossier de sortie, ou une Source distante avec
-/// un chemin de Sortie déjà figé.
+/// une Source locale avec le dossier de sortie configuré (non résolu avant
+/// téléchargement), ou une Source distante avec un dossier de Sortie déjà
+/// figé avant même le téléchargement (le titre, donc le nom du dossier,
+/// n'est connu qu'après).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ResolvedSource {
     Local { path: String, output: PathBuf },
@@ -90,13 +131,19 @@ impl ResolvedSource {
 
 /// Tout ce dont le Worker a besoin pour exécuter le Pipeline, déjà validé :
 /// contrairement à `Args`, aucun champ n'est optionnel ici.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq)]
 pub struct WorkerParams {
     pub source: ResolvedSource,
     pub log: PathBuf,
     pub model_path: PathBuf,
     pub language: String,
     pub threads: u32,
+    pub frame_interval_secs: u32,
+    pub frame_scene_threshold: f64,
+    pub frame_dedup_window_secs: u32,
+    pub keep_source_video: bool,
+    pub keep_muted_video: bool,
+    pub keep_audio: bool,
 }
 
 impl Args {
@@ -130,6 +177,18 @@ impl Args {
                 .context("the Worker requires --model-path")?,
             language: self.language.context("the Worker requires --language")?,
             threads: self.threads.context("the Worker requires --threads")?,
+            frame_interval_secs: self
+                .frame_interval_secs
+                .context("the Worker requires --frame-interval-secs")?,
+            frame_scene_threshold: self
+                .frame_scene_threshold
+                .context("the Worker requires --frame-scene-threshold")?,
+            frame_dedup_window_secs: self
+                .frame_dedup_window_secs
+                .context("the Worker requires --frame-dedup-window-secs")?,
+            keep_source_video: self.keep_source_video,
+            keep_muted_video: self.keep_muted_video,
+            keep_audio: self.keep_audio,
         })
     }
 }
