@@ -112,6 +112,22 @@ const FAKE_NOTIFY_SEND_SUCCESS: &str = r"#!/bin/sh
 exit 0
 ";
 
+const FAKE_PAGE_RENDERER: &str = r#"#!/bin/sh
+set -eu
+out=""
+while [ "$#" -gt 0 ]; do
+  case "$1" in
+    --output-dir) out="$2"; shift 2 ;;
+    *) shift ;;
+  esac
+done
+printf '<main><h1>Rendered page</h1></main>' > "$out/proofs/dom.html"
+printf 'PNG' > "$out/proofs/screenshot.png"
+printf '# Rendered page\n' > "$out/extractions/page.md"
+printf '[{"order":0,"locator":"img","url":"https://cdn.example/image.png","status":"inventoried"}]' > "$out/discoveries.json"
+printf '{"initial_url":"https://93.184.216.34/","final_url":"https://93.184.216.34/final","browser":"firefox"}' > "$out/provenance.json"
+"#;
+
 const FAKE_WHISPER_CLI_FAILURE: &str = r#"#!/bin/sh
 echo "boom: fake whisper-cli failure" >&2
 exit 1
@@ -724,6 +740,97 @@ fn capture_budget_failure_is_reported_as_a_structured_job_error() {
         finished["error"]["message"]
             .as_str()
             .is_some_and(|message| message.contains("disk budget"))
+    );
+}
+
+#[test]
+fn web_capture_requires_safe_web_policy_and_publishes_renderer_artifacts() {
+    let env = TestEnv::new("safe-web-capture");
+    write_executable(&env.bin_dir, "scriptor-page-renderer", FAKE_PAGE_RENDERER);
+    let url = "https://93.184.216.34/";
+
+    env.command()
+        .args(["capture", url, "--policy", "safe-local@1"])
+        .assert()
+        .failure();
+
+    let rejected_output = env
+        .command()
+        .args(["capture", "https://127.0.0.1/", "--policy", "safe-web@1"])
+        .assert()
+        .success()
+        .get_output()
+        .stdout
+        .clone();
+    let rejected_id = serde_json::from_slice::<Value>(&rejected_output).expect("Job JSON valide")
+        ["job"]["job_id"]
+        .as_str()
+        .expect("identifiant de Job")
+        .to_string();
+    let rejected: Value = serde_json::from_slice(
+        &env.command()
+            .args(["job", "wait", &rejected_id, "--timeout-secs", "5"])
+            .assert()
+            .success()
+            .get_output()
+            .stdout,
+    )
+    .expect("Job JSON valide");
+    assert_eq!(rejected["state"], "failed");
+    assert_eq!(rejected["error"]["code"], "web_private_target_refused");
+
+    let output = env
+        .command()
+        .args(["capture", url, "--policy", "safe-web@1"])
+        .assert()
+        .success()
+        .get_output()
+        .stdout
+        .clone();
+    let created: Value = serde_json::from_slice(&output).expect("Job JSON valide");
+    assert_eq!(created["job"]["policy"]["id"], "safe-web");
+    assert_eq!(
+        created["job"]["policy"]["snapshot"]["allows_remote_calls"],
+        true
+    );
+    assert_eq!(
+        created["job"]["policy"]["snapshot"]["allowed_providers"],
+        serde_json::json!([])
+    );
+    let job_id = created["job"]["job_id"]
+        .as_str()
+        .expect("identifiant de Job");
+
+    let finished: Value = serde_json::from_slice(
+        &env.command()
+            .args(["job", "wait", job_id, "--timeout-secs", "5"])
+            .assert()
+            .success()
+            .get_output()
+            .stdout,
+    )
+    .expect("Job JSON valide");
+    assert_eq!(finished["state"], "succeeded");
+    let capture_id = finished["capture_id"]
+        .as_str()
+        .expect("identifiant de Capture");
+    let capture: Value = serde_json::from_slice(
+        &env.command()
+            .args(["capture", "inspect", capture_id])
+            .assert()
+            .success()
+            .get_output()
+            .stdout,
+    )
+    .expect("Capture JSON valide");
+    assert_eq!(
+        capture["manifest"]["source"]["locator"],
+        "https://93.184.216.34/final"
+    );
+    assert_eq!(capture["manifest"]["proof"]["path"], "proofs/dom.html");
+    assert_eq!(
+        capture["manifest"]["artifacts"].as_array().map(Vec::len),
+        Some(5)
     );
 }
 
