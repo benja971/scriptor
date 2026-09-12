@@ -727,6 +727,152 @@ fn capture_budget_failure_is_reported_as_a_structured_job_error() {
     );
 }
 
+#[test]
+fn capture_local_media_publishes_proof_and_located_extractions() {
+    let env = TestEnv::new("capture-local-media");
+    env.write_config(&env.work_dir.join("out"));
+    let source = env.write_media_file("interview.mp4");
+
+    let created: Value = serde_json::from_slice(
+        &env.command()
+            .args([
+                "capture",
+                source.to_str().expect("chemin utf-8"),
+                "--policy",
+                "safe-local@1",
+            ])
+            .assert()
+            .success()
+            .get_output()
+            .stdout,
+    )
+    .expect("Job JSON valide");
+    let job_id = created["job"]["job_id"]
+        .as_str()
+        .expect("identifiant de Job");
+    let finished: Value = serde_json::from_slice(
+        &env.command()
+            .args(["job", "wait", job_id, "--timeout-secs", "5"])
+            .assert()
+            .success()
+            .get_output()
+            .stdout,
+    )
+    .expect("Job JSON valide");
+    assert_eq!(finished["state"], "succeeded");
+    let capture_id = finished["capture_id"]
+        .as_str()
+        .expect("identifiant de Capture");
+
+    let capture: Value = serde_json::from_slice(
+        &env.command()
+            .args(["capture", "inspect", capture_id])
+            .assert()
+            .success()
+            .get_output()
+            .stdout,
+    )
+    .expect("Capture JSON valide");
+    assert_eq!(capture["manifest"]["proof"]["path"], "proofs/source");
+    assert_eq!(capture["manifest"]["proof"]["locator"]["kind"], "file");
+    assert_eq!(
+        capture["manifest"]["extractions"].as_array().map(Vec::len),
+        Some(2)
+    );
+    assert!(
+        capture["manifest"]["extractions"]
+            .as_array()
+            .is_some_and(|extractions| extractions.iter().any(|extraction| {
+                extraction["artifact_id"] == "extraction-transcription"
+                    && extraction["path"] == "extractions/transcription.txt"
+                    && extraction["locator"]["kind"] == "media-time-range"
+                    && extraction["provider"]["name"] == "whisper-cli"
+                    && extraction["provider"]["version"].as_str().is_some()
+            }))
+    );
+    assert!(
+        capture["manifest"]["extractions"]
+            .as_array()
+            .is_some_and(|extractions| extractions.iter().any(|extraction| {
+                extraction["artifact_id"] == "extraction-frame-0000"
+                    && extraction["locator"]["kind"] == "media-timestamp"
+                    && extraction["provider"]["name"] == "ffmpeg"
+                    && extraction["provider"]["version"].as_str().is_some()
+            }))
+    );
+}
+
+#[test]
+fn capture_local_media_publishes_partial_results_when_transcription_capability_fails() {
+    let env = TestEnv::new("capture-media-partial");
+    env.write_config(&env.work_dir.join("out"));
+    write_executable(&env.bin_dir, "whisper-cli", FAKE_WHISPER_CLI_FAILURE);
+    let source = env.write_media_file("interview.mp4");
+
+    let created: Value = serde_json::from_slice(
+        &env.command()
+            .args([
+                "capture",
+                source.to_str().expect("chemin utf-8"),
+                "--policy",
+                "safe-local@1",
+            ])
+            .assert()
+            .success()
+            .get_output()
+            .stdout,
+    )
+    .expect("Job JSON valide");
+    let job_id = created["job"]["job_id"]
+        .as_str()
+        .expect("identifiant de Job");
+    let finished: Value = serde_json::from_slice(
+        &env.command()
+            .args(["job", "wait", job_id, "--timeout-secs", "5"])
+            .assert()
+            .success()
+            .get_output()
+            .stdout,
+    )
+    .expect("Job JSON valide");
+    assert_eq!(finished["state"], "partial");
+    let capture_id = finished["capture_id"]
+        .as_str()
+        .expect("une Capture partielle reste inspectable");
+
+    let capture: Value = serde_json::from_slice(
+        &env.command()
+            .args(["capture", "inspect", capture_id])
+            .assert()
+            .success()
+            .get_output()
+            .stdout,
+    )
+    .expect("Capture JSON valide");
+    assert_eq!(capture["manifest"]["proof"]["path"], "proofs/source");
+    assert!(
+        capture["manifest"]["extractions"]
+            .as_array()
+            .is_some_and(|extractions| {
+                extractions
+                    .iter()
+                    .any(|extraction| extraction["artifact_id"] == "extraction-frame-0000")
+            })
+    );
+    assert!(
+        capture["manifest"]["capabilities"]
+            .as_array()
+            .is_some_and(|capabilities| capabilities.iter().any(|capability| {
+                capability["name"] == "transcription"
+                    && capability["state"] == "failed"
+                    && capability["error"]["code"] == "capability_failed"
+                    && capability["error"]["message"]
+                        .as_str()
+                        .is_some_and(|message| message.contains("fake whisper-cli failure"))
+            }))
+    );
+}
+
 /// Test end-to-end avec les **vrais** binaires (`ffmpeg`, `whisper-cli`,
 /// aucun mock) et un **vrai** modèle whisper installé à l'emplacement par
 /// défaut (`~/.local/share/scriptor/models/ggml-small.bin`, cf. spec section
