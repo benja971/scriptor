@@ -806,6 +806,7 @@ fn capture_local_media_publishes_proof_and_located_extractions() {
                     && extraction["locator"]["kind"] == "media-timestamp"
                     && extraction["provider"]["name"] == "ffmpeg"
                     && extraction["provider"]["version"].as_str().is_some()
+                    && extraction["provider"]["dependencies"][0]["name"] == "ffprobe"
             }))
     );
 }
@@ -815,7 +816,7 @@ fn capture_local_media_publishes_partial_results_when_transcription_capability_f
     let env = TestEnv::new("capture-media-partial");
     env.write_config(&env.work_dir.join("out"));
     write_executable(&env.bin_dir, "whisper-cli", FAKE_WHISPER_CLI_FAILURE);
-    let source = env.write_media_file("interview.mp4");
+    let source = env.write_media_file("interview.M4A");
 
     let created: Value = serde_json::from_slice(
         &env.command()
@@ -858,6 +859,7 @@ fn capture_local_media_publishes_partial_results_when_transcription_capability_f
     )
     .expect("Capture JSON valide");
     assert_eq!(capture["manifest"]["proof"]["path"], "proofs/source");
+    assert_eq!(capture["manifest"]["proof"]["mime"], "audio/mp4");
     assert!(
         capture["manifest"]["extractions"]
             .as_array()

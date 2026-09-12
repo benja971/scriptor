@@ -184,6 +184,13 @@ struct Provider {
     name: String,
     version: String,
     parameters: Value,
+    dependencies: Vec<ProviderDependency>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct ProviderDependency {
+    name: String,
+    version: String,
 }
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -389,7 +396,7 @@ fn publish_capture(job: &Job) -> Result<Publication> {
         capabilities: Vec::new(),
     };
     if is_media_source(source) {
-        capture_local_media(&proof_path, &staging, &mut manifest)?;
+        capture_local_media(&proof_path, &staging, &mut manifest);
     }
     write_json(&staging.join("manifest.json"), &manifest)?;
     append_json_line(
@@ -432,15 +439,28 @@ fn is_media_source(source: &Path) -> bool {
     })
 }
 
-fn capture_local_media(proof_path: &Path, staging: &Path, manifest: &mut Manifest) -> Result<()> {
-    let config = Config::load().context("loading configuration for local media Capture")?;
+fn capture_local_media(proof_path: &Path, staging: &Path, manifest: &mut Manifest) {
+    let config = match Config::load().context("loading configuration for local media Capture") {
+        Ok(config) => config,
+        Err(error) => {
+            record_media_setup_failure(manifest, &error);
+            return;
+        }
+    };
     let work_dir = staging.join("work");
-    fs::create_dir_all(&work_dir)
-        .with_context(|| format!("creating media work directory {}", work_dir.display()))?;
-    capture_transcription(proof_path, staging, manifest, &work_dir, &config)?;
-    capture_frames(proof_path, staging, manifest, &work_dir, &config)?;
-    fs::remove_dir_all(&work_dir)
-        .with_context(|| format!("removing media work directory {}", work_dir.display()))
+    if let Err(error) = fs::create_dir_all(&work_dir)
+        .with_context(|| format!("creating media work directory {}", work_dir.display()))
+    {
+        record_media_setup_failure(manifest, &error);
+        return;
+    }
+    if let Err(error) = capture_transcription(proof_path, staging, manifest, &work_dir, &config) {
+        record_capability_failure(manifest, "transcription", &error);
+    }
+    if let Err(error) = capture_frames(proof_path, staging, manifest, &work_dir, &config) {
+        record_capability_failure(manifest, "frames", &error);
+    }
+    let _ = fs::remove_dir_all(&work_dir);
 }
 
 fn capture_transcription(
@@ -457,7 +477,7 @@ fn capture_transcription(
         "channels": 1,
     });
     let transcription_parameters = transcription_parameters(config);
-    let audio_provider = match provider("ffmpeg", audio_parameters) {
+    let audio_provider = match provider("ffmpeg", audio_parameters, &[]) {
         Ok(provider) => provider,
         Err(error) => {
             manifest.capabilities.push(failed_capability(
@@ -473,18 +493,19 @@ fn capture_transcription(
             return Ok(());
         }
     };
-    let transcription_provider =
-        match transcription_parameters.and_then(|parameters| provider("whisper-cli", parameters)) {
-            Ok(provider) => provider,
-            Err(error) => {
-                manifest.capabilities.push(failed_capability(
-                    "transcription",
-                    unresolved_provider("whisper-cli"),
-                    &error,
-                ));
-                return Ok(());
-            }
-        };
+    let transcription_provider = match transcription_parameters
+        .and_then(|parameters| provider("whisper-cli", parameters, &[]))
+    {
+        Ok(provider) => provider,
+        Err(error) => {
+            manifest.capabilities.push(failed_capability(
+                "transcription",
+                unresolved_provider("whisper-cli"),
+                &error,
+            ));
+            return Ok(());
+        }
+    };
 
     match audio::extract_audio(proof_path, &audio_path) {
         Ok(()) => {
@@ -557,6 +578,7 @@ fn capture_frames(
             "scene_threshold": config.frame_scene_threshold,
             "dedup_window_secs": config.frame_dedup_window_secs,
         }),
+        &["ffprobe"],
     ) {
         Ok(provider) => provider,
         Err(error) => {
@@ -650,6 +672,26 @@ fn blocked_capability(name: &str, provider: Provider, error: &anyhow::Error) -> 
     }
 }
 
+fn record_media_setup_failure(manifest: &mut Manifest, error: &anyhow::Error) {
+    for capability in ["audio-extraction", "transcription", "frames"] {
+        record_capability_failure(manifest, capability, error);
+    }
+}
+
+fn record_capability_failure(manifest: &mut Manifest, name: &str, error: &anyhow::Error) {
+    if !manifest
+        .capabilities
+        .iter()
+        .any(|capability| capability.name == name)
+    {
+        manifest.capabilities.push(failed_capability(
+            name,
+            unresolved_provider("unknown"),
+            error,
+        ));
+    }
+}
+
 fn copy_extraction(source: &Path, destination: &Path) -> Result<()> {
     let parent = destination
         .parent()
@@ -710,7 +752,12 @@ fn media_mime(source: &Path) -> &'static str {
         .map(str::to_ascii_lowercase)
         .as_deref()
     {
+        Some("aac") => "audio/aac",
+        Some("avi") => "video/x-msvideo",
+        Some("m4a") => "audio/mp4",
+        Some("mkv") => "video/x-matroska",
         Some("mp4" | "m4v") => "video/mp4",
+        Some("mpeg" | "mpg") => "video/mpeg",
         Some("webm") => "video/webm",
         Some("mov") => "video/quicktime",
         Some("mp3") => "audio/mpeg",
@@ -734,19 +781,34 @@ fn transcription_parameters(config: &Config) -> Result<Value> {
     }))
 }
 
-fn provider(name: &str, parameters: Value) -> Result<Provider> {
-    let path = std::env::var_os("PATH")
+fn provider(name: &str, parameters: Value, dependencies: &[&str]) -> Result<Provider> {
+    let path = provider_path(name)?;
+    let dependencies = dependencies
+        .iter()
+        .map(|dependency| {
+            let path = provider_path(dependency)?;
+            Ok(ProviderDependency {
+                name: (*dependency).to_string(),
+                version: format!("sha256:{}", sha256_file(&path)?),
+            })
+        })
+        .collect::<Result<Vec<_>>>()?;
+    Ok(Provider {
+        name: name.to_string(),
+        version: format!("sha256:{}", sha256_file(&path)?),
+        parameters,
+        dependencies,
+    })
+}
+
+fn provider_path(name: &str) -> Result<PathBuf> {
+    std::env::var_os("PATH")
         .and_then(|path| {
             std::env::split_paths(&path)
                 .map(|directory| directory.join(name))
                 .find(|candidate| candidate.is_file())
         })
-        .with_context(|| format!("resolving Provider binary `{name}`"))?;
-    Ok(Provider {
-        name: name.to_string(),
-        version: format!("sha256:{}", sha256_file(&path)?),
-        parameters,
-    })
+        .with_context(|| format!("resolving Provider binary `{name}`"))
 }
 
 fn unresolved_provider(name: &str) -> Provider {
@@ -754,6 +816,7 @@ fn unresolved_provider(name: &str) -> Provider {
         name: name.to_string(),
         version: "unresolved".to_string(),
         parameters: Value::Null,
+        dependencies: Vec::new(),
     }
 }
 
