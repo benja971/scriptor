@@ -17,7 +17,13 @@ const maxDownloadBytes = Number(option("--max-download-bytes"));
 if (!Number.isSafeInteger(maxOutputBytes) || maxOutputBytes < 1 || !Number.isSafeInteger(maxDownloadBytes) || maxDownloadBytes < 1) throw new Error("invalid renderer budget");
 
 const privateV4 = (parts) => parts[0] === 10 || parts[0] === 127 || parts[0] === 0 || (parts[0] === 169 && parts[1] === 254) || (parts[0] === 172 && parts[1] >= 16 && parts[1] <= 31) || (parts[0] === 192 && parts[1] === 168) || parts[0] >= 224;
-const privateIp = (address) => { if (isIP(address) === 4) return privateV4(address.split(".").map(Number)); const value = address.toLowerCase(); return value === "::1" || value === "::" || value.startsWith("fc") || value.startsWith("fd") || value.startsWith("fe80:") || value.startsWith("ff") || value.startsWith("::ffff:127.") || value.startsWith("::ffff:10.") || value.startsWith("::ffff:192.168."); };
+const privateIp = (address) => {
+  if (isIP(address) === 4) return privateV4(address.split(".").map(Number));
+  const value = address.toLowerCase();
+  const mappedV4 = value.match(/^::ffff:(\d+\.\d+\.\d+\.\d+)$/)?.[1];
+  if (mappedV4) return privateV4(mappedV4.split(".").map(Number));
+  return value === "::1" || value === "::" || value.startsWith("fc") || value.startsWith("fd") || value.startsWith("fe80:") || value.startsWith("ff");
+};
 const resolvedTarget = async (hostname, port) => {
   if (!hostname || hostname.toLowerCase() === "localhost" || hostname.toLowerCase().endsWith(".localhost")) throw new Error("web_private_target_refused");
   const addresses = isIP(hostname) ? [{ address: hostname }] : await lookup(hostname, { all: true, verbatim: true });
@@ -37,6 +43,9 @@ const createPinnedProxy = async () => {
       const target = new URL(clientRequest.url);
       if (target.protocol !== "http:" && target.protocol !== "ws:") throw new Error("web_proxy_scheme_refused");
       if (target.username || target.password) throw new Error("web_url_credentials_refused");
+      // `ws:` is an HTTP Upgrade over an explicit proxy. Refuse it rather
+      // than accidentally forwarding an unsupported bidirectional stream.
+      if (clientRequest.headers.upgrade) throw new Error("web_websocket_refused");
       const port = Number(target.port || 80); if (port !== 80) throw new Error("web_port_refused");
       const ip = await resolvedTarget(target.hostname, port);
       const upstream = httpRequest({ host: ip, port, method: clientRequest.method, path: `${target.pathname}${target.search}`, headers: { ...clientRequest.headers, host: target.host, connection: "close" } }, (response) => {

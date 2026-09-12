@@ -218,6 +218,10 @@ fn run_job_command(command: JobCommand) -> Result<()> {
 
 fn create_capture_job(source: &Path, policy_name: &str) -> Result<()> {
     let policy = policy_for(policy_name)?;
+    if policy.snapshot.allows_remote_calls {
+        crate::binary::ensure_present("scriptor-page-renderer")
+            .context("safe-web@1 requires the Nix PageRenderer runtime")?;
+    }
     let source = if policy.snapshot.allows_remote_calls {
         let url = source.to_str().context("Web Source must be valid UTF-8")?;
         url.to_string()
@@ -435,6 +439,9 @@ fn publish_web_capture(job: &Job) -> Result<Publication> {
             job_id: job.id.clone(),
         },
     )?;
+    if directory_size(&staging)? > job.policy.snapshot.limits.disk_byte_limit {
+        bail!("Capture exceeds safe-web@1 disk budget");
+    }
     fs::rename(&staging, &final_dir).with_context(|| format!("publishing Capture {capture_id}"))?;
     Ok(Publication::Published(capture_id))
 }

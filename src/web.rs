@@ -1,11 +1,15 @@
 use std::fs;
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, ToSocketAddrs};
+use std::os::unix::process::CommandExt;
 use std::path::Path;
-use std::process::{Command, Stdio};
+use std::process::{Child, Command, Stdio};
 use std::thread;
 use std::time::{Duration, SystemTime};
 
 use anyhow::{Context, Result, bail};
+use nix::errno::Errno;
+use nix::sys::signal::{Signal, killpg};
+use nix::unistd::Pid;
 use serde::Deserialize;
 use url::Url;
 
@@ -22,7 +26,9 @@ pub fn capture(
     download_byte_limit: u64,
 ) -> Result<Provenance> {
     validate_public_url(url)?;
-    let mut child = Command::new("scriptor-page-renderer")
+    let mut command = Command::new("scriptor-page-renderer");
+    command
+        .process_group(0)
         .arg("--url")
         .arg(url)
         .arg("--output-dir")
@@ -32,21 +38,18 @@ pub fn capture(
         .arg("--max-download-bytes")
         .arg(download_byte_limit.to_string())
         .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
+        .stderr(Stdio::piped());
+    let mut child = command
         .spawn()
         .context("launching Playwright page renderer")?;
     loop {
         if SystemTime::now() >= deadline {
-            child
-                .kill()
-                .context("stopping page renderer at Policy deadline")?;
+            terminate_process_group(&child)?;
             let _ = child.wait();
             bail!("Capture exceeds safe-web@1 duration budget");
         }
         if directory_size(staging)? > disk_byte_limit {
-            child
-                .kill()
-                .context("stopping page renderer at disk budget")?;
+            terminate_process_group(&child)?;
             let _ = child.wait();
             bail!("Capture exceeds safe-web@1 disk budget");
         }
@@ -85,6 +88,14 @@ pub fn capture(
         }
     }
     Ok(provenance)
+}
+
+fn terminate_process_group(child: &Child) -> Result<()> {
+    let pid = i32::try_from(child.id()).context("converting page renderer PID")?;
+    match killpg(Pid::from_raw(pid), Signal::SIGKILL) {
+        Ok(()) | Err(Errno::ESRCH) => Ok(()),
+        Err(error) => Err(error).context("stopping page renderer process group"),
+    }
 }
 
 fn directory_size(path: &Path) -> Result<u64> {
@@ -187,6 +198,8 @@ mod tests {
             "file:///etc/passwd",
             "http://127.0.0.1/",
             "http://[::1]/",
+            "http://[::ffff:169.254.169.254]/latest/meta-data/",
+            "http://[::ffff:172.16.0.1]/",
             "http://169.254.169.254/latest/meta-data/",
             "http://user:secret@example.com/",
         ] {
