@@ -320,3 +320,30 @@ fn concurrent_index_rebuilds_publish_a_valid_projection() {
         .success()
         .stdout(predicate::str::contains("\"captures\""));
 }
+
+#[test]
+fn agent_commands_return_structured_json_for_runtime_and_clap_errors() {
+    let repository = TestRepository::new("agent-errors");
+
+    repository
+        .command()
+        .args(["capture", "inspect", "capture-invalid"])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("\"code\":\"invalid_identifier\""))
+        .stderr(predicate::str::is_empty());
+    repository
+        .command()
+        .args(["job", "get", "job-invalid"])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("\"code\":\"invalid_identifier\""))
+        .stderr(predicate::str::is_empty());
+    repository
+        .command()
+        .args(["capture", "list", "--unknown-option"])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("\"code\":\"invalid_command\""))
+        .stderr(predicate::str::is_empty());
+}

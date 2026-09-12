@@ -632,8 +632,9 @@ fn capture_requires_an_explicit_policy_and_reuses_an_identical_source() {
     env.command()
         .args(["capture", source.to_str().expect("chemin utf-8")])
         .assert()
-        .failure()
-        .stderr(predicate::str::contains("capture requires --policy"));
+        .success()
+        .stdout(predicate::str::contains("\"code\":\"policy_required\""))
+        .stderr(predicate::str::is_empty());
 
     let create_job = |env: &TestEnv| -> String {
         let output = env

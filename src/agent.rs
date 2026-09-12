@@ -290,47 +290,38 @@ pub fn is_agent_command(arguments: &[OsString]) -> bool {
 }
 
 pub fn run(arguments: Vec<OsString>) -> Result<()> {
-    let cli = AgentCli::parse_from(arguments);
-    match cli.command {
-        AgentCommand::Capture(command) => {
-            let query = is_repository_query(&command);
-            let result = run_capture_command(command);
-            if query {
-                print_repository_result(result)
-            } else {
-                result
-            }
-        }
+    let cli = match AgentCli::try_parse_from(arguments) {
+        Ok(cli) => cli,
+        Err(error) => return print_agent_error("invalid_command", error.to_string()),
+    };
+    let result = match cli.command {
+        AgentCommand::Capture(command) => run_capture_command(command),
         AgentCommand::Job(command) => run_job_command(command),
         AgentCommand::CaptureWorker { job_id } => run_worker(&job_id),
-    }
-}
-
-const fn is_repository_query(command: &CaptureCommand) -> bool {
-    matches!(
-        &command.command,
-        Some(
-            CaptureSubcommand::List { .. }
-                | CaptureSubcommand::Search { .. }
-                | CaptureSubcommand::Read { .. }
-                | CaptureSubcommand::Index(_)
-        )
-    )
-}
-
-fn print_repository_result(result: Result<()>) -> Result<()> {
+    };
     match result {
         Ok(()) => Ok(()),
         Err(error) => print_json(&AgentError {
-            error: repository_error(&error),
+            error: agent_error(&error),
         }),
     }
 }
 
-fn repository_error(error: &anyhow::Error) -> StructuredError {
+fn print_agent_error(code: &str, message: String) -> Result<()> {
+    print_json(&AgentError {
+        error: StructuredError {
+            code: code.to_string(),
+            message,
+        },
+    })
+}
+
+fn agent_error(error: &anyhow::Error) -> StructuredError {
     let message = format!("{error:#}");
     let code = if message.contains("pagination cursor") {
         "invalid_cursor"
+    } else if message.contains("requires --policy") {
+        "policy_required"
     } else if message.contains("limit must") {
         "invalid_pagination"
     } else if message.contains("length must") {
@@ -343,10 +334,16 @@ fn repository_error(error: &anyhow::Error) -> StructuredError {
         "reference_mismatch"
     } else if message.contains("invalid Reference") {
         "invalid_reference"
+    } else if message.contains("invalid capture identifier")
+        || message.contains("invalid job identifier")
+    {
+        "invalid_identifier"
     } else if message.contains("manifest.json") {
         "capture_not_found"
+    } else if message.contains(".json") && message.contains("opening") {
+        "job_not_found"
     } else {
-        "repository_query_failed"
+        "agent_command_failed"
     };
     StructuredError {
         code: code.to_string(),
