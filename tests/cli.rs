@@ -23,7 +23,7 @@ use std::os::unix::fs::{FileExt, PermissionsExt};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
-use std::time::{Duration, Instant};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use assert_cmd::Command;
 use predicates::prelude::*;
@@ -130,6 +130,11 @@ fi
 printf 'Premiere page\nDeuxieme page\n' > "$3"
 "#;
 
+const FAKE_PDFINFO_VERSION_FAILURE: &str = r"#!/bin/sh
+echo 'pdfinfo unavailable' >&2
+exit 1
+";
+
 const FAKE_TESSERACT_FAILURE: &str = r#"#!/bin/sh
 if [ "$1" = "--version" ]; then
   echo 'tesseract fake-1.0'
@@ -235,6 +240,47 @@ impl TestEnv {
 
     fn install_binary(&self, name: &str, script: &str) {
         write_executable(&self.bin_dir, name, script);
+    }
+
+    fn write_job(&self, job_id: &str, source: &Path, allowed_providers: &Value) {
+        let jobs = self.xdg_data.join("scriptor").join("v2").join("jobs");
+        fs::create_dir_all(&jobs).expect("création du répertoire des Jobs");
+        let now = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .map_or(0, |duration| duration.as_secs());
+        let job = serde_json::json!({
+            "job_id": job_id,
+            "state": "queued",
+            "source": source,
+            "policy": {
+                "id": "test-policy",
+                "version": 1,
+                "sha256": "test-policy-hash",
+                "snapshot": {
+                    "duplicate_mode": "reuse",
+                    "limits": {
+                        "max_depth": 2,
+                        "max_sources": 50,
+                        "max_download_bytes": 2_147_483_648_u64,
+                        "max_disk_bytes": 10_737_418_240_u64,
+                        "max_duration_secs": 1800,
+                        "max_concurrency": 2
+                    },
+                    "allows_remote_calls": false,
+                    "allowed_providers": allowed_providers
+                }
+            },
+            "created_at": now,
+            "updated_at": now,
+            "worker_pid": null,
+            "capture_id": null,
+            "error": null
+        });
+        fs::write(
+            jobs.join(format!("{job_id}.json")),
+            serde_json::to_vec(&job).expect("sérialisation du Job"),
+        )
+        .expect("écriture du Job");
     }
 
     fn write_config(&self, output_dir: &Path) {
@@ -798,6 +844,10 @@ fn local_pdf_keeps_an_intact_proof_and_a_traced_text_extraction() {
             .stdout,
     )
     .expect("Job JSON valide");
+    assert_eq!(
+        created["job"]["policy"]["snapshot"]["allowed_providers"],
+        serde_json::json!(["pdftotext", "pdfinfo", "tesseract"])
+    );
     let job_id = created["job"]["job_id"]
         .as_str()
         .expect("identifiant de Job");
@@ -854,11 +904,11 @@ fn local_pdf_keeps_an_intact_proof_and_a_traced_text_extraction() {
         2
     );
     assert_eq!(
-        capture["manifest"]["extractions"][0]["locator_provider"]["provider"]["id"],
+        capture["manifest"]["extractions"][0]["locator_provider"]["id"],
         "pdfinfo"
     );
     assert_eq!(
-        capture["manifest"]["extractions"][0]["locator_provider"]["provider"]["version"],
+        capture["manifest"]["extractions"][0]["locator_provider"]["version"],
         "pdfinfo version fake-1.0"
     );
     assert_eq!(
@@ -874,6 +924,122 @@ fn local_pdf_keeps_an_intact_proof_and_a_traced_text_extraction() {
         capture["manifest"]["proof"]["sha256"]
     );
     assert!(capture["manifest"]["extractions"][0]["created_at"].is_u64());
+    assert!(capture["manifest"]["proof"]["created_at"].is_u64());
+}
+
+#[test]
+fn pdfinfo_version_failure_identifies_the_unresolved_locator_provider() {
+    let env = TestEnv::new("capture-pdfinfo-version-failure");
+    env.install_binary("pdftotext", FAKE_PDFTOTEXT);
+    env.install_binary("pdfinfo", FAKE_PDFINFO_VERSION_FAILURE);
+    let source = env.work_dir.join("contract.pdf");
+    fs::write(&source, b"original pdf bytes").expect("écriture du PDF");
+
+    let created: Value = serde_json::from_slice(
+        &env.command()
+            .args([
+                "capture",
+                source.to_str().expect("chemin utf-8"),
+                "--policy",
+                "safe-local@1",
+            ])
+            .assert()
+            .success()
+            .get_output()
+            .stdout,
+    )
+    .expect("Job JSON valide");
+    let job_id = created["job"]["job_id"]
+        .as_str()
+        .expect("identifiant de Job");
+    let finished: Value = serde_json::from_slice(
+        &env.command()
+            .args(["job", "wait", job_id, "--timeout-secs", "5"])
+            .assert()
+            .success()
+            .get_output()
+            .stdout,
+    )
+    .expect("Job JSON valide");
+    assert_eq!(finished["state"], "partial");
+    let capture_id = finished["capture_id"]
+        .as_str()
+        .expect("identifiant de Capture");
+    let capture: Value = serde_json::from_slice(
+        &env.command()
+            .args(["capture", "inspect", capture_id])
+            .assert()
+            .success()
+            .get_output()
+            .stdout,
+    )
+    .expect("Capture JSON valide");
+
+    assert_eq!(
+        capture["manifest"]["extraction_errors"][0]["code"],
+        "extraction_failed"
+    );
+    assert_eq!(
+        capture["manifest"]["extraction_errors"][0]["provider"]["id"],
+        "pdfinfo"
+    );
+    assert!(capture["manifest"]["extraction_errors"][0]["provider"]["version"].is_null());
+    assert_eq!(
+        capture["manifest"]["extraction_errors"][0]["provider"]["parameters"],
+        serde_json::json!([])
+    );
+}
+
+#[test]
+fn capture_worker_refuses_a_provider_not_authorized_by_its_policy() {
+    let env = TestEnv::new("capture-provider-policy");
+    let marker = env.work_dir.join("pdftotext-invoked");
+    env.install_binary(
+        "pdftotext",
+        &format!("#!/bin/sh\nprintf invoked > '{}'\n", marker.display()),
+    );
+    let source = env.work_dir.join("contract.pdf");
+    fs::write(&source, b"original pdf bytes").expect("écriture du PDF");
+    let job_id = "job-741";
+    env.write_job(job_id, &source, &serde_json::json!([]));
+
+    env.command()
+        .args(["capture-worker", "--job-id", job_id])
+        .assert()
+        .success();
+
+    assert!(
+        !marker.exists(),
+        "un Provider refusé ne doit pas être invoqué"
+    );
+    let job: Value = serde_json::from_slice(
+        &env.command()
+            .args(["job", "get", job_id])
+            .assert()
+            .success()
+            .get_output()
+            .stdout,
+    )
+    .expect("Job JSON valide");
+    assert_eq!(job["state"], "partial");
+    let capture_id = job["capture_id"].as_str().expect("identifiant de Capture");
+    let capture: Value = serde_json::from_slice(
+        &env.command()
+            .args(["capture", "inspect", capture_id])
+            .assert()
+            .success()
+            .get_output()
+            .stdout,
+    )
+    .expect("Capture JSON valide");
+    assert_eq!(
+        capture["manifest"]["extraction_errors"][0]["code"],
+        "provider_not_allowed"
+    );
+    assert_eq!(
+        capture["manifest"]["extraction_errors"][0]["provider"]["id"],
+        "pdftotext"
+    );
 }
 
 #[test]
@@ -1052,7 +1218,7 @@ fn malformed_ocr_tsv_publishes_a_partial_capture_with_the_proof_reference() {
         "extraction_failed"
     );
     assert_eq!(
-        capture["manifest"]["extraction_errors"][0]["provider"]["provider"]["id"],
+        capture["manifest"]["extraction_errors"][0]["provider"]["id"],
         "tesseract"
     );
     assert_eq!(

@@ -151,6 +151,7 @@ struct Proof {
     mime: String,
     sha256: String,
     size_bytes: u64,
+    created_at: u64,
 }
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -176,7 +177,8 @@ struct Provider {
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 struct ProviderInvocation {
-    provider: Provider,
+    id: String,
+    version: Option<String>,
     parameters: Vec<String>,
 }
 
@@ -396,7 +398,7 @@ fn publish_capture(job: &Job) -> Result<Publication> {
         locator: None,
     };
     let extraction_outcome =
-        extract_local_document(source, &proof_path, &staging, &proof_reference);
+        extract_local_document(source, &proof_path, &staging, &proof_reference, &job.policy);
     let partial = !extraction_outcome.errors.is_empty();
     let manifest = Manifest {
         capture_id: capture_id.clone(),
@@ -412,6 +414,7 @@ fn publish_capture(job: &Job) -> Result<Publication> {
             mime: source_mime(source).to_string(),
             sha256: proof_hash,
             size_bytes: proof_size,
+            created_at: now_secs(),
         },
         extractions: extraction_outcome.extractions,
         extraction_errors: extraction_outcome.errors,
@@ -441,10 +444,11 @@ fn extract_local_document(
     proof: &Path,
     staging: &Path,
     input: &ArtifactReference,
+    policy: &Policy,
 ) -> ExtractionOutcome {
     match source_mime(source) {
-        "application/pdf" => extract_pdf(proof, staging, input),
-        mime if mime.starts_with("image/") => extract_image(proof, staging, input),
+        "application/pdf" => extract_pdf(proof, staging, input, policy),
+        mime if mime.starts_with("image/") => extract_image(proof, staging, input, policy),
         _ => ExtractionOutcome {
             extractions: Vec::new(),
             errors: Vec::new(),
@@ -452,28 +456,50 @@ fn extract_local_document(
     }
 }
 
-fn extract_pdf(proof: &Path, staging: &Path, input: &ArtifactReference) -> ExtractionOutcome {
+fn extract_pdf(
+    proof: &Path,
+    staging: &Path,
+    input: &ArtifactReference,
+    policy: &Policy,
+) -> ExtractionOutcome {
     let parameters = vec!["-layout".to_string()];
+    let attempted_provider = ProviderInvocation {
+        id: "pdftotext".to_string(),
+        version: None,
+        parameters: parameters.clone(),
+    };
+    if let Err(error) = authorize_provider(policy, &attempted_provider.id) {
+        return provider_refusal(&error, attempted_provider, input);
+    }
     let provider = match provider_version("pdftotext", "-v") {
         Ok(version) => Provider {
             id: "pdftotext".to_string(),
             version,
         },
-        Err(error) => return extraction_failure(&error, None, input),
+        Err(error) => return extraction_failure(&error, Some(attempted_provider), input),
     };
     let provider_invocation = ProviderInvocation {
-        provider: provider.clone(),
+        id: provider.id.clone(),
+        version: Some(provider.version.clone()),
         parameters: parameters.clone(),
     };
+    let attempted_locator_provider = ProviderInvocation {
+        id: "pdfinfo".to_string(),
+        version: None,
+        parameters: Vec::new(),
+    };
+    if let Err(error) = authorize_provider(policy, &attempted_locator_provider.id) {
+        return provider_refusal(&error, attempted_locator_provider, input);
+    }
     let locator_provider = match provider_version("pdfinfo", "-v") {
         Ok(version) => ProviderInvocation {
-            provider: Provider {
-                id: "pdfinfo".to_string(),
-                version,
-            },
+            id: "pdfinfo".to_string(),
+            version: Some(version),
             parameters: Vec::new(),
         },
-        Err(error) => return extraction_failure(&error, Some(provider_invocation), input),
+        Err(error) => {
+            return extraction_failure(&error, Some(attempted_locator_provider), input);
+        }
     };
     let page_count = match pdf_page_count(proof) {
         Ok(page_count) => page_count,
@@ -528,17 +554,31 @@ fn persist_pdf_extraction(
     })
 }
 
-fn extract_image(proof: &Path, staging: &Path, input: &ArtifactReference) -> ExtractionOutcome {
+fn extract_image(
+    proof: &Path,
+    staging: &Path,
+    input: &ArtifactReference,
+    policy: &Policy,
+) -> ExtractionOutcome {
     let parameters = vec!["tsv".to_string()];
+    let attempted_provider = ProviderInvocation {
+        id: "tesseract".to_string(),
+        version: None,
+        parameters: parameters.clone(),
+    };
+    if let Err(error) = authorize_provider(policy, &attempted_provider.id) {
+        return provider_refusal(&error, attempted_provider, input);
+    }
     let provider = match provider_version("tesseract", "--version") {
         Ok(version) => Provider {
             id: "tesseract".to_string(),
             version,
         },
-        Err(error) => return extraction_failure(&error, None, input),
+        Err(error) => return extraction_failure(&error, Some(attempted_provider), input),
     };
     let provider_invocation = ProviderInvocation {
-        provider: provider.clone(),
+        id: provider.id.clone(),
+        version: Some(provider.version.clone()),
         parameters: parameters.clone(),
     };
     match persist_image_extraction(proof, staging, provider, parameters, input) {
@@ -606,6 +646,37 @@ fn extraction_failure(
             input: input.clone(),
         }],
     }
+}
+
+fn provider_refusal(
+    error: &anyhow::Error,
+    provider: ProviderInvocation,
+    input: &ArtifactReference,
+) -> ExtractionOutcome {
+    ExtractionOutcome {
+        extractions: Vec::new(),
+        errors: vec![ExtractionError {
+            code: "provider_not_allowed".to_string(),
+            message: format!("{error:#}"),
+            provider: Some(provider),
+            input: input.clone(),
+        }],
+    }
+}
+
+fn authorize_provider(policy: &Policy, provider: &str) -> Result<()> {
+    if !policy
+        .snapshot
+        .allowed_providers
+        .iter()
+        .any(|allowed| allowed == provider)
+    {
+        bail!(
+            "Provider `{provider}` is not allowed by Policy {}",
+            policy.id
+        );
+    }
+    Ok(())
 }
 
 fn provider_version(binary: &str, version_argument: &str) -> Result<String> {
@@ -853,7 +924,11 @@ fn safe_local_policy(name: &str) -> Result<Policy> {
         duplicate_mode: "reuse".to_string(),
         limits,
         allows_remote_calls: false,
-        allowed_providers: Vec::new(),
+        allowed_providers: vec![
+            "pdftotext".to_string(),
+            "pdfinfo".to_string(),
+            "tesseract".to_string(),
+        ],
     };
     let canonical_snapshot =
         serde_json::to_value(&snapshot).context("normalizing Policy snapshot")?;
