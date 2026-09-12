@@ -68,8 +68,10 @@ enum CaptureSubcommand {
         limit: usize,
     },
     Read {
-        capture_id: String,
-        artifact_id: String,
+        capture_id: Option<String>,
+        artifact_id: Option<String>,
+        #[arg(long, conflicts_with_all = ["capture_id", "artifact_id"])]
+        reference: Option<String>,
         #[arg(long, default_value_t = 0)]
         offset: u64,
         #[arg(long)]
@@ -204,7 +206,7 @@ struct LedgerEvent {
     job_id: String,
 }
 
-#[derive(Clone, Serialize)]
+#[derive(Clone, Deserialize, Serialize)]
 struct Reference {
     capture_id: String,
     artifact_id: String,
@@ -267,6 +269,12 @@ struct RebuiltSearchIndex {
     captures: usize,
 }
 
+struct ReadRequest {
+    capture_id: String,
+    artifact_id: String,
+    expected_sha256: Option<String>,
+}
+
 enum Publication {
     Published(String),
     Cancelled,
@@ -284,9 +292,65 @@ pub fn is_agent_command(arguments: &[OsString]) -> bool {
 pub fn run(arguments: Vec<OsString>) -> Result<()> {
     let cli = AgentCli::parse_from(arguments);
     match cli.command {
-        AgentCommand::Capture(command) => run_capture_command(command),
+        AgentCommand::Capture(command) => {
+            let query = is_repository_query(&command);
+            let result = run_capture_command(command);
+            if query {
+                print_repository_result(result)
+            } else {
+                result
+            }
+        }
         AgentCommand::Job(command) => run_job_command(command),
         AgentCommand::CaptureWorker { job_id } => run_worker(&job_id),
+    }
+}
+
+const fn is_repository_query(command: &CaptureCommand) -> bool {
+    matches!(
+        &command.command,
+        Some(
+            CaptureSubcommand::List { .. }
+                | CaptureSubcommand::Search { .. }
+                | CaptureSubcommand::Read { .. }
+                | CaptureSubcommand::Index(_)
+        )
+    )
+}
+
+fn print_repository_result(result: Result<()>) -> Result<()> {
+    match result {
+        Ok(()) => Ok(()),
+        Err(error) => print_json(&AgentError {
+            error: repository_error(&error),
+        }),
+    }
+}
+
+fn repository_error(error: &anyhow::Error) -> StructuredError {
+    let message = format!("{error:#}");
+    let code = if message.contains("pagination cursor") {
+        "invalid_cursor"
+    } else if message.contains("limit must") {
+        "invalid_pagination"
+    } else if message.contains("length must") {
+        "invalid_range"
+    } else if message.contains("binary artifacts") {
+        "binary_artifact"
+    } else if message.contains("unknown artifact") {
+        "artifact_not_found"
+    } else if message.contains("does not match its Reference") {
+        "reference_mismatch"
+    } else if message.contains("invalid Reference") {
+        "invalid_reference"
+    } else if message.contains("manifest.json") {
+        "capture_not_found"
+    } else {
+        "repository_query_failed"
+    };
+    StructuredError {
+        code: code.to_string(),
+        message,
     }
 }
 
@@ -302,9 +366,16 @@ fn run_capture_command(command: CaptureCommand) -> Result<()> {
         Some(CaptureSubcommand::Read {
             capture_id,
             artifact_id,
+            reference,
             offset,
             length,
-        }) => read_artifact(&capture_id, &artifact_id, offset, length),
+        }) => read_artifact(
+            capture_id.as_deref(),
+            artifact_id.as_deref(),
+            reference.as_deref(),
+            offset,
+            length,
+        ),
         Some(CaptureSubcommand::Index(command)) => run_index_command(&command),
         None => create_capture_job(
             command
@@ -460,7 +531,7 @@ fn publish_capture(job: &Job) -> Result<Publication> {
         },
     )?;
     fs::rename(&staging, &final_dir).with_context(|| format!("publishing Capture {capture_id}"))?;
-    rebuild_search_index().unwrap_or(0);
+    rebuild_search_index()?;
     Ok(Publication::Published(capture_id))
 }
 
@@ -638,26 +709,32 @@ fn search_captures(query: &str, cursor: Option<&str>, limit: usize) -> Result<()
 }
 
 fn read_artifact(
-    capture_id: &str,
-    artifact_id: &str,
+    capture_id: Option<&str>,
+    artifact_id: Option<&str>,
+    reference: Option<&str>,
     offset: u64,
     requested_length: Option<usize>,
 ) -> Result<()> {
-    validate_id(capture_id, "capture")?;
+    let request = resolve_read_request(capture_id, artifact_id, reference)?;
+    validate_id(&request.capture_id, "capture")?;
     let length = requested_length.unwrap_or(DEFAULT_READ_LENGTH);
     if length > MAX_READ_LENGTH {
         bail!("length must not exceed {MAX_READ_LENGTH}");
     }
-    let directory = captures_dir()?.join(capture_id);
+    let directory = captures_dir()?.join(&request.capture_id);
     let manifest: Manifest = read_json(&directory.join("manifest.json"))?;
-    if artifact_id != manifest.proof.artifact_id {
+    if request.artifact_id != manifest.proof.artifact_id {
         bail!("unknown artifact identifier");
     }
     if !is_text_mime(&manifest.proof.mime) {
         bail!("binary artifacts cannot be read on stdout");
     }
     let path = directory.join(&manifest.proof.path);
-    if sha256_file(&path)? != manifest.proof.sha256 {
+    if sha256_file(&path)? != manifest.proof.sha256
+        || request
+            .expected_sha256
+            .is_some_and(|expected| expected != manifest.proof.sha256)
+    {
         bail!("artifact hash does not match its Reference");
     }
     let size = fs::metadata(&path)
@@ -684,6 +761,31 @@ fn read_artifact(
             text,
             truncated: u64::try_from(amount).context("converting read result length")? < remaining,
         },
+    })
+}
+
+fn resolve_read_request(
+    capture_id: Option<&str>,
+    artifact_id: Option<&str>,
+    reference: Option<&str>,
+) -> Result<ReadRequest> {
+    if let Some(reference) = reference {
+        let reference: Reference =
+            serde_json::from_str(reference).context("invalid Reference JSON")?;
+        return Ok(ReadRequest {
+            capture_id: reference.capture_id,
+            artifact_id: reference.artifact_id,
+            expected_sha256: Some(reference.sha256),
+        });
+    }
+    Ok(ReadRequest {
+        capture_id: capture_id
+            .context("invalid Reference: capture_id is required")?
+            .to_string(),
+        artifact_id: artifact_id
+            .context("invalid Reference: artifact_id is required")?
+            .to_string(),
+        expected_sha256: None,
     })
 }
 
@@ -754,6 +856,7 @@ fn list_manifests() -> Result<Vec<Manifest>> {
 }
 
 fn rebuild_search_index() -> Result<usize> {
+    let lock = lock_search_index()?;
     let captures: Vec<IndexedCapture> = list_manifests()?
         .into_iter()
         .map(|manifest| {
@@ -769,18 +872,42 @@ fn rebuild_search_index() -> Result<usize> {
         })
         .collect::<Result<_>>()?;
     let count = captures.len();
-    write_json(
-        &search_index_path()?,
-        &SearchIndex {
-            version: 1,
-            captures,
-        },
-    )?;
+    write_search_index(&SearchIndex {
+        version: 1,
+        captures,
+    })?;
+    unlock_search_index(&lock)?;
     Ok(count)
 }
 
 fn search_index_path() -> Result<PathBuf> {
     Ok(repository_dir()?.join("index.json"))
+}
+
+fn lock_search_index() -> Result<File> {
+    let path = repository_dir()?.join("index.lock");
+    let file = OpenOptions::new()
+        .create(true)
+        .truncate(false)
+        .write(true)
+        .open(&path)
+        .with_context(|| format!("opening search Index lock {}", path.display()))?;
+    file.lock_exclusive().context("locking search Index")?;
+    Ok(file)
+}
+
+fn unlock_search_index(file: &File) -> Result<()> {
+    FileExt::unlock(file).context("unlocking search Index")
+}
+
+fn write_search_index(index: &SearchIndex) -> Result<()> {
+    let path = search_index_path()?;
+    let temporary = path.with_file_name(format!(".index-{}.tmp", unique_id()));
+    let data = serde_json::to_vec_pretty(index).context("serializing search Index")?;
+    fs::write(&temporary, data)
+        .with_context(|| format!("writing search Index {}", temporary.display()))?;
+    fs::rename(&temporary, &path)
+        .with_context(|| format!("publishing search Index {}", path.display()))
 }
 
 fn search_text_for(manifest: &Manifest) -> Result<String> {
