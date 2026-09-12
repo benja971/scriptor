@@ -443,7 +443,7 @@ fn is_media_source(source: &Path) -> bool {
 
 fn capture_local_media(job: &Job, proof_path: &Path, staging: &Path, manifest: &mut Manifest) {
     if let Err(error) = ensure_media_providers_allowed(&job.policy) {
-        record_media_setup_failure(manifest, &error);
+        record_denied_media_providers(manifest, &error);
         return;
     }
     let config = match Config::load().context("loading configuration for local media Capture") {
@@ -472,7 +472,7 @@ fn capture_local_media(job: &Job, proof_path: &Path, staging: &Path, manifest: &
         cleanup_media_extraction(staging, "transcription", manifest);
         record_capability_failure(manifest, "transcription", &error);
     }
-    if !enforce_media_limits(job, staging, manifest, "transcription") {
+    if !enforce_media_limits(&budget, staging, manifest, "transcription") {
         cleanup_work_dir(&work_dir, manifest);
         return;
     }
@@ -480,7 +480,7 @@ fn capture_local_media(job: &Job, proof_path: &Path, staging: &Path, manifest: &
         cleanup_media_extraction(staging, "frames", manifest);
         record_capability_failure(manifest, "frames", &error);
     }
-    enforce_media_limits(job, staging, manifest, "frames");
+    enforce_media_limits(&budget, staging, manifest, "frames");
     cleanup_work_dir(&work_dir, manifest);
 }
 
@@ -583,7 +583,9 @@ fn capture_transcription(
             ) {
                 Ok(transcription_path) => {
                     let destination = staging.join("extractions").join("transcription.txt");
+                    budget.check()?;
                     copy_extraction(&transcription_path, &destination)?;
+                    budget.check()?;
                     manifest.extractions.push(extraction(
                         "extraction-transcription",
                         "extractions/transcription.txt",
@@ -659,6 +661,7 @@ fn capture_frames(
         Ok(frame_count) => {
             let destination = staging.join("extractions").join("frames");
             if frame_count > 0 {
+                budget.check()?;
                 fs::create_dir_all(&destination).with_context(|| {
                     format!(
                         "creating Frames Extraction directory {}",
@@ -672,11 +675,13 @@ fn capture_frames(
                     .context("reading Frame paths")?;
                 frames.sort();
                 for (index, frame) in frames.iter().enumerate() {
+                    budget.check()?;
                     let filename = frame.file_name().context("reading Frame filename")?;
                     let filename = filename.to_string_lossy();
                     let timestamp = frame_timestamp(&filename)?;
                     let extraction_path = destination.join(filename.as_ref());
                     copy_extraction(frame, &extraction_path)?;
+                    budget.check()?;
                     let artifact_id = format!("extraction-frame-{index:04}");
                     let path = format!("extractions/frames/{filename}");
                     manifest.extractions.push(extraction(
@@ -690,6 +695,7 @@ fn capture_frames(
                         }),
                         frames_provider.clone(),
                     )?);
+                    budget.check()?;
                 }
             }
             manifest.capabilities.push(Capability {
@@ -738,6 +744,32 @@ fn record_media_setup_failure(manifest: &mut Manifest, error: &anyhow::Error) {
     }
 }
 
+fn record_denied_media_providers(manifest: &mut Manifest, error: &anyhow::Error) {
+    let provider = if format!("{error:#}").contains("`ffprobe`") {
+        "ffprobe"
+    } else if format!("{error:#}").contains("`whisper-cli`") {
+        "whisper-cli"
+    } else {
+        "ffmpeg"
+    };
+    for (capability, dependency) in [
+        ("audio-extraction", "ffmpeg"),
+        ("transcription", "whisper-cli"),
+        ("frames", "ffmpeg"),
+    ] {
+        let blocked_by = if capability == "frames" && provider == "ffprobe" {
+            provider
+        } else {
+            dependency
+        };
+        manifest.capabilities.push(blocked_capability(
+            capability,
+            unresolved_provider(blocked_by),
+            error,
+        ));
+    }
+}
+
 fn ensure_media_providers_allowed(policy: &Policy) -> Result<()> {
     for provider in ["ffmpeg", "ffprobe", "whisper-cli"] {
         if !policy
@@ -773,25 +805,12 @@ fn record_capability_failure(manifest: &mut Manifest, name: &str, error: &anyhow
 }
 
 fn enforce_media_limits(
-    job: &Job,
+    budget: &CaptureBudget<'_>,
     staging: &Path,
     manifest: &mut Manifest,
     capability: &str,
 ) -> bool {
-    let result = if now_secs().saturating_sub(job.created_at)
-        > job.policy.snapshot.limits.duration_limit_secs
-    {
-        Err(anyhow::anyhow!(
-            "Capture exceeds safe-local@1 duration budget"
-        ))
-    } else {
-        directory_size(staging).and_then(|size| {
-            if size > job.policy.snapshot.limits.disk_byte_limit {
-                bail!("Capture exceeds safe-local@1 disk budget");
-            }
-            Ok(())
-        })
-    };
+    let result = budget.check();
     if let Err(error) = result {
         manifest.extractions.retain(|extraction| {
             let affected = match capability {
@@ -802,23 +821,16 @@ fn enforce_media_limits(
             !affected
         });
         cleanup_media_extraction(staging, capability, manifest);
-        record_capability_failure(manifest, capability, &error);
+        if manifest
+            .capabilities
+            .iter()
+            .all(|existing| existing.name != capability || existing.state != "not_attempted")
+        {
+            record_capability_failure(manifest, capability, &error);
+        }
         return false;
     }
     true
-}
-
-fn directory_size(path: &Path) -> Result<u64> {
-    if path.is_file() {
-        return file_size(path);
-    }
-    fs::read_dir(path)
-        .with_context(|| format!("reading Capture directory {}", path.display()))?
-        .try_fold(0_u64, |size, entry| {
-            let entry = entry.context("reading Capture entry")?;
-            size.checked_add(directory_size(&entry.path())?)
-                .context("summing Capture disk usage")
-        })
 }
 
 fn copy_extraction(source: &Path, destination: &Path) -> Result<()> {

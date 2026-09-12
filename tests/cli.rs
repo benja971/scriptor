@@ -825,6 +825,13 @@ fn capture_stops_a_running_provider_at_its_duration_budget_before_starting_frame
                         .is_some_and(|message| message.contains("duration budget"))
             }))
     );
+    assert!(
+        capture["manifest"]["capabilities"]
+            .as_array()
+            .is_some_and(|capabilities| capabilities.iter().any(|capability| {
+                capability["name"] == "transcription" && capability["state"] == "not_attempted"
+            }))
+    );
 }
 
 #[test]

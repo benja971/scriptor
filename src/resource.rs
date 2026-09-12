@@ -7,6 +7,7 @@ use std::thread;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use anyhow::{Context, Result, anyhow, bail};
+use nix::errno::Errno;
 use nix::sys::signal::{Signal, killpg};
 use nix::unistd::Pid;
 
@@ -58,7 +59,9 @@ impl<'a> CaptureBudget<'a> {
         let stderr_reader = thread::spawn(move || read_pipe(stderr));
         loop {
             if let Some(status) = child.try_wait().context("waiting for Provider")? {
-                return collect_output(status, stdout_reader, stderr_reader);
+                let output = collect_output(status, stdout_reader, stderr_reader)?;
+                self.check()?;
+                return Ok(output);
             }
             if let Err(error) = self.check() {
                 let status = terminate_process_group(&mut child)?;
@@ -72,7 +75,10 @@ impl<'a> CaptureBudget<'a> {
 
 fn terminate_process_group(child: &mut Child) -> Result<ExitStatus> {
     let pid = i32::try_from(child.id()).context("converting Provider process id")?;
-    killpg(Pid::from_raw(pid), Signal::SIGKILL).context("stopping budget-exhausted Provider")?;
+    match killpg(Pid::from_raw(pid), Signal::SIGKILL) {
+        Ok(()) | Err(Errno::ESRCH) => {}
+        Err(error) => return Err(error).context("stopping budget-exhausted Provider"),
+    }
     child.wait().context("reaping budget-exhausted Provider")
 }
 

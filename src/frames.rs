@@ -280,6 +280,7 @@ fn merge_and_write(
 
     let mut retained = Vec::with_capacity(kept.len());
     for frame in kept {
+        check_budget(budget)?;
         if !is_near_uniform_color(&frame.path, path_env, budget)? {
             retained.push(frame);
         }
@@ -289,14 +290,17 @@ fn merge_and_write(
         return Ok(0);
     }
 
+    check_budget(budget)?;
     fs::create_dir_all(frames_dir)
         .with_context(|| format!("creating Frames directory {}", frames_dir.display()))?;
 
     for (index, frame) in retained.iter().enumerate() {
+        check_budget(budget)?;
         let sequence = index.checked_add(1).context("too many Frames to number")?;
         let filename = format!("frame-{sequence:04}-{:.3}s.jpg", frame.timestamp_secs);
         fs::copy(&frame.path, frames_dir.join(filename))
             .with_context(|| format!("writing Frame to {}", frames_dir.display()))?;
+        check_budget(budget)?;
     }
 
     Ok(retained.len())
@@ -359,6 +363,13 @@ fn run_output(
         Some(budget) => budget.output(command),
         None => command.output().context("launching Provider"),
     }
+}
+
+fn check_budget(budget: Option<&CaptureBudget<'_>>) -> Result<()> {
+    if let Some(budget) = budget {
+        budget.check()?;
+    }
+    Ok(())
 }
 
 /// Extrait la valeur entière d'une clé `lavfi.signalstats.<key>=<valeur>`
