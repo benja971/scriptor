@@ -112,6 +112,37 @@ const FAKE_NOTIFY_SEND_SUCCESS: &str = r"#!/bin/sh
 exit 0
 ";
 
+const FAKE_PDFINFO: &str = r"#!/bin/sh
+echo 'Pages: 2'
+";
+
+const FAKE_PDFTOTEXT: &str = r#"#!/bin/sh
+set -eu
+if [ "$1" = "-v" ]; then
+  echo 'pdftotext version fake-1.0' >&2
+  exit 0
+fi
+printf 'Premiere page\nDeuxieme page\n' > "$3"
+"#;
+
+const FAKE_TESSERACT_FAILURE: &str = r#"#!/bin/sh
+if [ "$1" = "--version" ]; then
+  echo 'tesseract fake-1.0'
+  exit 0
+fi
+echo 'ocr indisponible' >&2
+exit 1
+"#;
+
+const FAKE_TESSERACT: &str = r#"#!/bin/sh
+if [ "$1" = "--version" ]; then
+  echo 'tesseract fake-1.0'
+  exit 0
+fi
+printf 'level\tpage_num\tblock_num\tpar_num\tline_num\tword_num\tleft\ttop\twidth\theight\tconf\ttext\n'
+printf '5\t1\t1\t1\t1\t1\t12\t24\t36\t48\t95\tBonjour\n'
+"#;
+
 const FAKE_WHISPER_CLI_FAILURE: &str = r#"#!/bin/sh
 echo "boom: fake whisper-cli failure" >&2
 exit 1
@@ -186,6 +217,10 @@ impl TestEnv {
             xdg_data,
             work_dir,
         }
+    }
+
+    fn install_binary(&self, name: &str, script: &str) {
+        write_executable(&self.bin_dir, name, script);
     }
 
     fn write_config(&self, output_dir: &Path) {
@@ -724,6 +759,209 @@ fn capture_budget_failure_is_reported_as_a_structured_job_error() {
         finished["error"]["message"]
             .as_str()
             .is_some_and(|message| message.contains("disk budget"))
+    );
+}
+
+#[test]
+fn local_pdf_keeps_an_intact_proof_and_a_traced_text_extraction() {
+    let env = TestEnv::new("capture-pdf");
+    env.install_binary("pdfinfo", FAKE_PDFINFO);
+    env.install_binary("pdftotext", FAKE_PDFTOTEXT);
+    let source = env.work_dir.join("contract.pdf");
+    fs::write(&source, b"original pdf bytes").expect("écriture du PDF");
+
+    let created: Value = serde_json::from_slice(
+        &env.command()
+            .args([
+                "capture",
+                source.to_str().expect("chemin utf-8"),
+                "--policy",
+                "safe-local@1",
+            ])
+            .assert()
+            .success()
+            .get_output()
+            .stdout,
+    )
+    .expect("Job JSON valide");
+    let job_id = created["job"]["job_id"]
+        .as_str()
+        .expect("identifiant de Job");
+    let finished: Value = serde_json::from_slice(
+        &env.command()
+            .args(["job", "wait", job_id, "--timeout-secs", "5"])
+            .assert()
+            .success()
+            .get_output()
+            .stdout,
+    )
+    .expect("Job JSON valide");
+    assert_eq!(finished["state"], "succeeded");
+    let capture_id = finished["capture_id"]
+        .as_str()
+        .expect("identifiant de Capture");
+    let capture: Value = serde_json::from_slice(
+        &env.command()
+            .args(["capture", "inspect", capture_id])
+            .assert()
+            .success()
+            .get_output()
+            .stdout,
+    )
+    .expect("Capture JSON valide");
+
+    assert_eq!(capture["manifest"]["proof"]["mime"], "application/pdf");
+    assert_eq!(
+        capture["manifest"]["proof"]["sha256"],
+        format!("{:x}", Sha256::digest(b"original pdf bytes"))
+    );
+    assert_eq!(
+        capture["manifest"]["extractions"][0]["provider"]["id"],
+        "pdftotext"
+    );
+    assert_eq!(
+        capture["manifest"]["extractions"][0]["provider"]["version"],
+        "pdftotext version fake-1.0"
+    );
+    assert_eq!(
+        capture["manifest"]["extractions"][0]["parameters"],
+        serde_json::json!(["-layout"])
+    );
+    assert_eq!(
+        capture["manifest"]["extractions"][0]["locator"]["kind"],
+        "pdf_pages"
+    );
+    assert_eq!(
+        capture["manifest"]["extractions"][0]["locator"]["first_page"],
+        1
+    );
+    assert_eq!(
+        capture["manifest"]["extractions"][0]["locator"]["last_page"],
+        2
+    );
+}
+
+#[test]
+fn local_image_publishes_a_partial_capture_when_ocr_fails() {
+    let env = TestEnv::new("capture-image-ocr-failure");
+    env.install_binary("tesseract", FAKE_TESSERACT_FAILURE);
+    let source = env.work_dir.join("receipt.png");
+    fs::write(&source, b"original image bytes").expect("écriture de l'image");
+
+    let created: Value = serde_json::from_slice(
+        &env.command()
+            .args([
+                "capture",
+                source.to_str().expect("chemin utf-8"),
+                "--policy",
+                "safe-local@1",
+            ])
+            .assert()
+            .success()
+            .get_output()
+            .stdout,
+    )
+    .expect("Job JSON valide");
+    let job_id = created["job"]["job_id"]
+        .as_str()
+        .expect("identifiant de Job");
+    let finished: Value = serde_json::from_slice(
+        &env.command()
+            .args(["job", "wait", job_id, "--timeout-secs", "5"])
+            .assert()
+            .success()
+            .get_output()
+            .stdout,
+    )
+    .expect("Job JSON valide");
+    assert_eq!(finished["state"], "partial");
+    let capture_id = finished["capture_id"]
+        .as_str()
+        .expect("identifiant de Capture");
+    let capture: Value = serde_json::from_slice(
+        &env.command()
+            .args(["capture", "inspect", capture_id])
+            .assert()
+            .success()
+            .get_output()
+            .stdout,
+    )
+    .expect("Capture JSON valide");
+
+    assert_eq!(capture["manifest"]["proof"]["mime"], "image/png");
+    assert_eq!(
+        capture["manifest"]["extraction_errors"][0]["code"],
+        "extraction_failed"
+    );
+    assert_eq!(capture["ledger"][0]["event"], "capture_published_partial");
+}
+
+#[test]
+fn local_image_ocr_records_typed_image_regions() {
+    let env = TestEnv::new("capture-image-ocr");
+    env.install_binary("tesseract", FAKE_TESSERACT);
+    let source = env.work_dir.join("receipt.png");
+    fs::write(&source, b"original image bytes").expect("écriture de l'image");
+
+    let created: Value = serde_json::from_slice(
+        &env.command()
+            .args([
+                "capture",
+                source.to_str().expect("chemin utf-8"),
+                "--policy",
+                "safe-local@1",
+            ])
+            .assert()
+            .success()
+            .get_output()
+            .stdout,
+    )
+    .expect("Job JSON valide");
+    let job_id = created["job"]["job_id"]
+        .as_str()
+        .expect("identifiant de Job");
+    let finished: Value = serde_json::from_slice(
+        &env.command()
+            .args(["job", "wait", job_id, "--timeout-secs", "5"])
+            .assert()
+            .success()
+            .get_output()
+            .stdout,
+    )
+    .expect("Job JSON valide");
+    assert_eq!(finished["state"], "succeeded");
+    let capture_id = finished["capture_id"]
+        .as_str()
+        .expect("identifiant de Capture");
+    let capture: Value = serde_json::from_slice(
+        &env.command()
+            .args(["capture", "inspect", capture_id])
+            .assert()
+            .success()
+            .get_output()
+            .stdout,
+    )
+    .expect("Capture JSON valide");
+
+    assert_eq!(
+        capture["manifest"]["extractions"][0]["provider"]["id"],
+        "tesseract"
+    );
+    assert_eq!(
+        capture["manifest"]["extractions"][0]["parameters"],
+        serde_json::json!(["tsv"])
+    );
+    assert_eq!(
+        capture["manifest"]["extractions"][0]["locator"]["kind"],
+        "image_regions"
+    );
+    assert_eq!(
+        capture["manifest"]["extractions"][0]["locator"]["regions"][0]["left"],
+        12
+    );
+    assert_eq!(
+        capture["manifest"]["extractions"][0]["locator"]["regions"][0]["height"],
+        48
     );
 }
 
