@@ -19,6 +19,7 @@
           pkgs.ffmpeg
           pkgs.whisper-cpp
           pkgs.yt-dlp
+          pkgs.libnotify
         ];
       };
     };
