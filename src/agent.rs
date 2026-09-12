@@ -844,7 +844,10 @@ fn list_manifests() -> Result<Vec<Manifest>> {
             continue;
         }
         let manifest_path = entry.path().join("manifest.json");
-        if manifest_path.exists() {
+        if manifest_path
+            .try_exists()
+            .with_context(|| format!("checking Capture manifest {}", manifest_path.display()))?
+        {
             manifests.push(read_json(&manifest_path)?);
         }
     }
