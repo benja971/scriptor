@@ -441,6 +441,10 @@ fn is_media_source(source: &Path) -> bool {
 }
 
 fn capture_local_media(job: &Job, proof_path: &Path, staging: &Path, manifest: &mut Manifest) {
+    if let Err(error) = ensure_media_providers_allowed(&job.policy) {
+        record_media_setup_failure(manifest, &error);
+        return;
+    }
     let config = match Config::load().context("loading configuration for local media Capture") {
         Ok(config) => config,
         Err(error) => {
@@ -687,6 +691,20 @@ fn record_media_setup_failure(manifest: &mut Manifest, error: &anyhow::Error) {
     for capability in ["audio-extraction", "transcription", "frames"] {
         record_capability_failure(manifest, capability, error);
     }
+}
+
+fn ensure_media_providers_allowed(policy: &Policy) -> Result<()> {
+    for provider in ["ffmpeg", "ffprobe", "whisper-cli"] {
+        if !policy
+            .snapshot
+            .allowed_providers
+            .iter()
+            .any(|allowed| allowed == provider)
+        {
+            bail!("Provider `{provider}` is not allowed by Policy");
+        }
+    }
+    Ok(())
 }
 
 fn record_capability_failure(manifest: &mut Manifest, name: &str, error: &anyhow::Error) {
@@ -1049,7 +1067,11 @@ fn safe_local_policy(name: &str) -> Result<Policy> {
         duplicate_mode: "reuse".to_string(),
         limits,
         allows_remote_calls: false,
-        allowed_providers: Vec::new(),
+        allowed_providers: vec![
+            "ffmpeg".to_string(),
+            "ffprobe".to_string(),
+            "whisper-cli".to_string(),
+        ],
     };
     let canonical_snapshot =
         serde_json::to_value(&snapshot).context("normalizing Policy snapshot")?;
