@@ -230,6 +230,56 @@ impl Drop for TestEnv {
     }
 }
 
+fn write_capture_worker_job(
+    env: &TestEnv,
+    job_id: &str,
+    source: &Path,
+    allowed_providers: &[&str],
+    duration_secs: u64,
+) -> PathBuf {
+    let created_at = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .expect("horloge système après l'époque Unix")
+        .as_secs();
+    let jobs_dir = env.xdg_data.join("scriptor/v2/jobs");
+    fs::create_dir_all(&jobs_dir).expect("création du répertoire de Jobs");
+    let job = serde_json::json!({
+        "job_id": job_id,
+        "state": "queued",
+        "source": source,
+        "policy": {
+            "id": "safe-local",
+            "version": 1,
+            "sha256": "test-policy",
+            "snapshot": {
+                "duplicate_mode": "reuse",
+                "limits": {
+                    "max_depth": 2,
+                    "max_sources": 50,
+                    "max_download_bytes": 2_147_483_648_u64,
+                    "max_disk_bytes": 10_737_418_240_u64,
+                    "max_duration_secs": duration_secs,
+                    "max_concurrency": 2
+                },
+                "allows_remote_calls": false,
+                "allowed_providers": allowed_providers
+            }
+        },
+        "created_at": created_at,
+        "updated_at": created_at,
+        "worker_pid": null,
+        "capture_id": null,
+        "error": null
+    });
+    let path = jobs_dir.join(format!("{job_id}.json"));
+    fs::write(
+        &path,
+        serde_json::to_vec(&job).expect("sérialisation du Job de test"),
+    )
+    .expect("écriture du Job de test");
+    path
+}
+
 /// Attend que `path` existe avec un contenu non vide, avec un timeout court :
 /// le Worker étant détaché, le process initial rend la main avant que le
 /// fichier n'existe.
@@ -747,46 +797,14 @@ fn capture_stops_a_running_provider_at_its_duration_budget_before_starting_frame
             audio_started.display(),
         ),
     );
-    let created_at = SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .expect("horloge système après l'époque Unix")
-        .as_secs();
     let job_id = "job-1";
-    let jobs_dir = env.xdg_data.join("scriptor/v2/jobs");
-    fs::create_dir_all(&jobs_dir).expect("création du répertoire de Jobs");
-    let job = serde_json::json!({
-        "job_id": job_id,
-        "state": "queued",
-        "source": source,
-        "policy": {
-            "id": "safe-local",
-            "version": 1,
-            "sha256": "test-policy",
-            "snapshot": {
-                "duplicate_mode": "reuse",
-                "limits": {
-                    "max_depth": 2,
-                    "max_sources": 50,
-                    "max_download_bytes": 2_147_483_648_u64,
-                    "max_disk_bytes": 10_737_418_240_u64,
-                    "max_duration_secs": 2,
-                    "max_concurrency": 2
-                },
-                "allows_remote_calls": false,
-                "allowed_providers": ["ffmpeg", "ffprobe", "whisper-cli"]
-            }
-        },
-        "created_at": created_at,
-        "updated_at": created_at,
-        "worker_pid": null,
-        "capture_id": null,
-        "error": null
-    });
-    fs::write(
-        jobs_dir.join(format!("{job_id}.json")),
-        serde_json::to_vec(&job).expect("sérialisation du Job de test"),
-    )
-    .expect("écriture du Job de test");
+    let job_path = write_capture_worker_job(
+        &env,
+        job_id,
+        &source,
+        &["ffmpeg", "ffprobe", "whisper-cli"],
+        2,
+    );
 
     let started = Instant::now();
     env.command()
@@ -794,10 +812,9 @@ fn capture_stops_a_running_provider_at_its_duration_budget_before_starting_frame
         .assert()
         .success();
 
-    let finished: Value = serde_json::from_slice(
-        &fs::read(jobs_dir.join(format!("{job_id}.json"))).expect("lecture du Job terminé"),
-    )
-    .expect("Job JSON valide");
+    let finished: Value =
+        serde_json::from_slice(&fs::read(job_path).expect("lecture du Job terminé"))
+            .expect("Job JSON valide");
     assert!(started.elapsed() < Duration::from_secs(5));
     assert_eq!(finished["state"], "partial");
     assert!(audio_started.exists());
@@ -832,6 +849,51 @@ fn capture_stops_a_running_provider_at_its_duration_budget_before_starting_frame
                 capability["name"] == "transcription" && capability["state"] == "not_attempted"
             }))
     );
+}
+
+#[test]
+fn capture_keeps_authorized_media_capabilities_when_policy_denies_only_frames() {
+    let env = TestEnv::new("capture-partial-provider-policy");
+    env.write_config(&env.work_dir.join("out"));
+    let source = env.write_media_file("interview.mp4");
+    let job_id = "job-1";
+    let job_path = write_capture_worker_job(&env, job_id, &source, &["ffmpeg", "whisper-cli"], 30);
+
+    env.command()
+        .args(["capture-worker", "--job-id", job_id])
+        .assert()
+        .success();
+
+    let finished: Value =
+        serde_json::from_slice(&fs::read(job_path).expect("lecture du Job terminé"))
+            .expect("Job JSON valide");
+    assert_eq!(finished["state"], "partial");
+    let capture_id = finished["capture_id"]
+        .as_str()
+        .expect("la Capture partielle est publiée");
+    let capture: Value = serde_json::from_slice(
+        &env.command()
+            .args(["capture", "inspect", capture_id])
+            .assert()
+            .success()
+            .get_output()
+            .stdout,
+    )
+    .expect("Capture JSON valide");
+    let capabilities = capture["manifest"]["capabilities"]
+        .as_array()
+        .expect("capabilities présentes");
+    assert!(capabilities.iter().any(|capability| {
+        capability["name"] == "audio-extraction" && capability["state"] == "succeeded"
+    }));
+    assert!(capabilities.iter().any(|capability| {
+        capability["name"] == "transcription" && capability["state"] == "succeeded"
+    }));
+    assert!(capabilities.iter().any(|capability| {
+        capability["name"] == "frames"
+            && capability["state"] == "not_attempted"
+            && capability["provider"]["name"] == "ffprobe"
+    }));
 }
 
 #[test]
