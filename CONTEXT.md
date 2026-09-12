@@ -47,3 +47,41 @@ changements de scène (détection ffmpeg), dédoublonnées entre elles, puis
 écrites dans le sous-dossier `frames/` de la Sortie. Absentes si la Source est
 un fichier audio sans flux vidéo.
 _Avoid_: image, capture, screenshot, thumbnail
+
+**Policy**:
+Le document versionné, validé et immuable qui autorise les opérations d'une
+Capture et fixe leurs Doublons, Providers, appels distants, rétention, budgets
+et comportement d'échec. Son identité, sa version et son empreinte sont
+enregistrées avec chaque Job.
+_Avoid_: configuration implicite, préférence, comportement par défaut
+
+**Job**:
+L'enregistrement persistant d'une exécution asynchrone de Capture ou de
+Dérivé. Il expose son identité, son état, sa Policy, ses erreurs structurées,
+ses liens vers les objets produits et ses événements, indépendamment des logs
+du Worker.
+_Avoid_: log, processus, tâche éphémère
+
+**Référence**:
+L'adresse vérifiable d'un élément de Capture, composée de son `capture_id`, de
+son `artifact_id`, de son `sha256` et, si nécessaire, d'un Locator. Elle est
+retournée par le Contrat agent et réutilisée par les Recettes et Dérivés.
+_Avoid_: citation libre, chemin nu, pointeur mutable
+
+**Découverte**:
+L'observation immuable d'une Source dans une Capture parente, avec son Locator,
+son ordre, son statut et son motif. Elle existe même si la Source est ignorée
+ou échoue, et un Job ultérieur peut la résoudre vers une Capture enfant.
+_Avoid_: enfant implicite, élément perdu, relance silencieuse
+
+**Contenu non fiable**:
+Toute donnée issue d'une Source, d'une Extraction ou d'un Dérivé qui peut être
+conservée, lue ou analysée, mais ne décide jamais d'une action de Scriptor. Les
+actions ne proviennent que du Contrat agent et de la Policy.
+_Avoid_: instruction exécutable, autorité, commande implicite
+
+**Contrat agent**:
+L'interface JSON stable par laquelle un Agent crée, attend, inspecte, lit et
+contrôle les Jobs, Captures et Dérivés. Elle expose des identités, états,
+Références et erreurs structurées sans exiger de parser des logs.
+_Avoid_: interface terminal humaine, protocole de logs, prompt libre
