@@ -162,7 +162,10 @@ struct Extraction {
     size_bytes: u64,
     provider: Provider,
     parameters: Vec<String>,
+    locator_provider: Option<ProviderInvocation>,
     locator: Locator,
+    input: ArtifactReference,
+    created_at: u64,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -171,22 +174,36 @@ struct Provider {
     version: String,
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct ProviderInvocation {
+    provider: Provider,
+    parameters: Vec<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct ArtifactReference {
+    capture_id: String,
+    artifact_id: String,
+    sha256: String,
+    locator: Option<Locator>,
+}
+
 #[derive(Debug, Serialize, Deserialize)]
 struct ExtractionError {
     code: String,
     message: String,
-    provider: Option<Provider>,
-    parameters: Vec<String>,
+    provider: Option<ProviderInvocation>,
+    input: ArtifactReference,
 }
 
-#[derive(Debug, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(tag = "kind", rename_all = "snake_case")]
 enum Locator {
     PdfPages { first_page: u32, last_page: u32 },
     ImageRegions { regions: Vec<ImageRegion> },
 }
 
-#[derive(Debug, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 struct ImageRegion {
     left: u32,
     top: u32,
@@ -340,19 +357,9 @@ fn publish_capture(job: &Job) -> Result<Publication> {
     if metadata.len() > job.policy.snapshot.limits.disk_byte_limit {
         bail!("local Source exceeds safe-local@1 disk budget");
     }
-    let source_hash = sha256_file(source)?;
     if now_secs().saturating_sub(job.created_at) > job.policy.snapshot.limits.duration_limit_secs {
         bail!("Capture exceeds safe-local@1 duration budget");
     }
-    if job.policy.snapshot.duplicate_mode == "reuse"
-        && let Some((capture_id, partial)) = find_capture_by_source_hash(&source_hash)?
-    {
-        return Ok(Publication::Published {
-            capture_id,
-            partial,
-        });
-    }
-
     let capture_id = format!("capture-{}", unique_id());
     let captures = captures_dir()?;
     let staging = captures.join(format!(".{capture_id}"));
@@ -362,6 +369,16 @@ fn publish_capture(job: &Job) -> Result<Publication> {
     let proof_path = staging.join("proofs").join("source");
     fs::copy(source, &proof_path)
         .with_context(|| format!("copying local Source {}", source.display()))?;
+    let proof_hash = sha256_file(&proof_path)?;
+    if job.policy.snapshot.duplicate_mode == "reuse"
+        && let Some((capture_id, partial)) = find_capture_by_source_hash(&proof_hash)?
+    {
+        fs::remove_dir_all(&staging).context("discarding duplicate Capture staging directory")?;
+        return Ok(Publication::Published {
+            capture_id,
+            partial,
+        });
+    }
     if now_secs().saturating_sub(job.created_at) > job.policy.snapshot.limits.duration_limit_secs {
         bail!("Capture exceeds safe-local@1 duration budget");
     }
@@ -372,13 +389,20 @@ fn publish_capture(job: &Job) -> Result<Publication> {
     let proof_size = fs::metadata(&proof_path)
         .context("reading copied Proof metadata")?
         .len();
-    let extraction_outcome = extract_local_document(source, &proof_path, &staging)?;
+    let proof_reference = ArtifactReference {
+        capture_id: capture_id.clone(),
+        artifact_id: "proof-source".to_string(),
+        sha256: proof_hash.clone(),
+        locator: None,
+    };
+    let extraction_outcome =
+        extract_local_document(source, &proof_path, &staging, &proof_reference);
     let partial = !extraction_outcome.errors.is_empty();
     let manifest = Manifest {
         capture_id: capture_id.clone(),
         source: SourceIdentity {
             locator: job.source.clone(),
-            sha256: source_hash,
+            sha256: proof_hash.clone(),
         },
         policy: job.policy.clone(),
         published_at: now_secs(),
@@ -386,7 +410,7 @@ fn publish_capture(job: &Job) -> Result<Publication> {
             artifact_id: "proof-source".to_string(),
             path: "proofs/source".to_string(),
             mime: source_mime(source).to_string(),
-            sha256: sha256_file(&proof_path)?,
+            sha256: proof_hash,
             size_bytes: proof_size,
         },
         extractions: extraction_outcome.extractions,
@@ -416,41 +440,77 @@ fn extract_local_document(
     source: &Path,
     proof: &Path,
     staging: &Path,
-) -> Result<ExtractionOutcome> {
+    input: &ArtifactReference,
+) -> ExtractionOutcome {
     match source_mime(source) {
-        "application/pdf" => extract_pdf(proof, staging),
-        mime if mime.starts_with("image/") => extract_image(proof, staging),
-        _ => Ok(ExtractionOutcome {
+        "application/pdf" => extract_pdf(proof, staging, input),
+        mime if mime.starts_with("image/") => extract_image(proof, staging, input),
+        _ => ExtractionOutcome {
             extractions: Vec::new(),
             errors: Vec::new(),
-        }),
+        },
     }
 }
 
-fn extract_pdf(proof: &Path, staging: &Path) -> Result<ExtractionOutcome> {
+fn extract_pdf(proof: &Path, staging: &Path, input: &ArtifactReference) -> ExtractionOutcome {
     let parameters = vec!["-layout".to_string()];
     let provider = match provider_version("pdftotext", "-v") {
         Ok(version) => Provider {
             id: "pdftotext".to_string(),
             version,
         },
-        Err(error) => return Ok(extraction_failure(&error, None, parameters)),
+        Err(error) => return extraction_failure(&error, None, input),
+    };
+    let provider_invocation = ProviderInvocation {
+        provider: provider.clone(),
+        parameters: parameters.clone(),
+    };
+    let locator_provider = match provider_version("pdfinfo", "-v") {
+        Ok(version) => ProviderInvocation {
+            provider: Provider {
+                id: "pdfinfo".to_string(),
+                version,
+            },
+            parameters: Vec::new(),
+        },
+        Err(error) => return extraction_failure(&error, Some(provider_invocation), input),
     };
     let page_count = match pdf_page_count(proof) {
         Ok(page_count) => page_count,
-        Err(error) => return Ok(extraction_failure(&error, Some(provider), parameters)),
+        Err(error) => return extraction_failure(&error, Some(locator_provider), input),
     };
+    match persist_pdf_extraction(
+        proof,
+        staging,
+        provider,
+        parameters,
+        locator_provider,
+        page_count,
+        input,
+    ) {
+        Ok(extraction) => extraction_success(extraction),
+        Err(error) => extraction_failure(&error, Some(provider_invocation), input),
+    }
+}
+
+fn persist_pdf_extraction(
+    proof: &Path,
+    staging: &Path,
+    provider: Provider,
+    parameters: Vec<String>,
+    locator_provider: ProviderInvocation,
+    page_count: u32,
+    input: &ArtifactReference,
+) -> Result<Extraction> {
     let directory = staging.join("extractions");
     fs::create_dir_all(&directory)
         .with_context(|| format!("creating Extraction directory {}", directory.display()))?;
     let output = directory.join("pdf-text.txt");
-    if let Err(error) = run_provider("pdftotext", &["-layout"], proof, &output) {
-        return Ok(extraction_failure(&error, Some(provider), parameters));
-    }
+    run_provider("pdftotext", &["-layout"], proof, &output)?;
     let size_bytes = fs::metadata(&output)
         .context("reading PDF Extraction metadata")?
         .len();
-    let extraction = Extraction {
+    Ok(Extraction {
         artifact_id: "extraction-pdf-text".to_string(),
         path: "extractions/pdf-text.txt".to_string(),
         mime: "text/plain; charset=utf-8".to_string(),
@@ -458,43 +518,49 @@ fn extract_pdf(proof: &Path, staging: &Path) -> Result<ExtractionOutcome> {
         size_bytes,
         provider,
         parameters,
+        locator_provider: Some(locator_provider),
         locator: Locator::PdfPages {
             first_page: 1,
             last_page: page_count,
         },
-    };
-    Ok(ExtractionOutcome {
-        extractions: vec![extraction],
-        errors: Vec::new(),
+        input: input.clone(),
+        created_at: now_secs(),
     })
 }
 
-fn extract_image(proof: &Path, staging: &Path) -> Result<ExtractionOutcome> {
+fn extract_image(proof: &Path, staging: &Path, input: &ArtifactReference) -> ExtractionOutcome {
     let parameters = vec!["tsv".to_string()];
     let provider = match provider_version("tesseract", "--version") {
         Ok(version) => Provider {
             id: "tesseract".to_string(),
             version,
         },
-        Err(error) => return Ok(extraction_failure(&error, None, parameters)),
+        Err(error) => return extraction_failure(&error, None, input),
     };
-    let output = match Command::new("tesseract")
+    let provider_invocation = ProviderInvocation {
+        provider: provider.clone(),
+        parameters: parameters.clone(),
+    };
+    match persist_image_extraction(proof, staging, provider, parameters, input) {
+        Ok(extraction) => extraction_success(extraction),
+        Err(error) => extraction_failure(&error, Some(provider_invocation), input),
+    }
+}
+
+fn persist_image_extraction(
+    proof: &Path,
+    staging: &Path,
+    provider: Provider,
+    parameters: Vec<String>,
+    input: &ArtifactReference,
+) -> Result<Extraction> {
+    let output = Command::new("tesseract")
         .args([proof, Path::new("stdout"), Path::new("tsv")])
         .output()
-    {
-        Ok(output) if output.status.success() => output,
-        Ok(output) => {
-            return Ok(extraction_failure(
-                &provider_command_error("tesseract", &output),
-                Some(provider),
-                parameters,
-            ));
-        }
-        Err(error) => {
-            let error = anyhow::Error::from(error);
-            return Ok(extraction_failure(&error, Some(provider), parameters));
-        }
-    };
+        .context("running tesseract")?;
+    if !output.status.success() {
+        bail!("{}", provider_command_error("tesseract", &output));
+    }
     let (text, regions) = parse_tesseract_tsv(&output.stdout)?;
     let directory = staging.join("extractions");
     fs::create_dir_all(&directory)
@@ -504,7 +570,7 @@ fn extract_image(proof: &Path, staging: &Path) -> Result<ExtractionOutcome> {
     let size_bytes = fs::metadata(&path)
         .context("reading OCR Extraction metadata")?
         .len();
-    let extraction = Extraction {
+    Ok(Extraction {
         artifact_id: "extraction-image-ocr".to_string(),
         path: "extractions/ocr.txt".to_string(),
         mime: "text/plain; charset=utf-8".to_string(),
@@ -512,18 +578,24 @@ fn extract_image(proof: &Path, staging: &Path) -> Result<ExtractionOutcome> {
         size_bytes,
         provider,
         parameters,
+        locator_provider: None,
         locator: Locator::ImageRegions { regions },
-    };
-    Ok(ExtractionOutcome {
+        input: input.clone(),
+        created_at: now_secs(),
+    })
+}
+
+fn extraction_success(extraction: Extraction) -> ExtractionOutcome {
+    ExtractionOutcome {
         extractions: vec![extraction],
         errors: Vec::new(),
-    })
+    }
 }
 
 fn extraction_failure(
     error: &anyhow::Error,
-    provider: Option<Provider>,
-    parameters: Vec<String>,
+    provider: Option<ProviderInvocation>,
+    input: &ArtifactReference,
 ) -> ExtractionOutcome {
     ExtractionOutcome {
         extractions: Vec::new(),
@@ -531,7 +603,7 @@ fn extraction_failure(
             code: "extraction_failed".to_string(),
             message: format!("{error:#}"),
             provider,
-            parameters,
+            input: input.clone(),
         }],
     }
 }

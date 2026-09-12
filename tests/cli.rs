@@ -19,9 +19,10 @@
 )]
 
 use std::fs;
-use std::os::unix::fs::PermissionsExt;
+use std::os::unix::fs::{FileExt, PermissionsExt};
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::time::{Duration, Instant};
 
 use assert_cmd::Command;
@@ -112,9 +113,13 @@ const FAKE_NOTIFY_SEND_SUCCESS: &str = r"#!/bin/sh
 exit 0
 ";
 
-const FAKE_PDFINFO: &str = r"#!/bin/sh
+const FAKE_PDFINFO: &str = r#"#!/bin/sh
+if [ "$1" = "-v" ]; then
+  echo 'pdfinfo version fake-1.0' >&2
+  exit 0
+fi
 echo 'Pages: 2'
-";
+"#;
 
 const FAKE_PDFTOTEXT: &str = r#"#!/bin/sh
 set -eu
@@ -141,6 +146,15 @@ if [ "$1" = "--version" ]; then
 fi
 printf 'level\tpage_num\tblock_num\tpar_num\tline_num\tword_num\tleft\ttop\twidth\theight\tconf\ttext\n'
 printf '5\t1\t1\t1\t1\t1\t12\t24\t36\t48\t95\tBonjour\n'
+"#;
+
+const FAKE_TESSERACT_MALFORMED: &str = r#"#!/bin/sh
+if [ "$1" = "--version" ]; then
+  echo 'tesseract fake-1.0'
+  exit 0
+fi
+printf 'level\tpage_num\tblock_num\tpar_num\tline_num\tword_num\tleft\ttop\twidth\theight\tconf\ttext\n'
+printf '5\t1\t1\t1\t1\t1\tbad\t24\t36\t48\t95\tBonjour\n'
 "#;
 
 const FAKE_WHISPER_CLI_FAILURE: &str = r#"#!/bin/sh
@@ -839,6 +853,27 @@ fn local_pdf_keeps_an_intact_proof_and_a_traced_text_extraction() {
         capture["manifest"]["extractions"][0]["locator"]["last_page"],
         2
     );
+    assert_eq!(
+        capture["manifest"]["extractions"][0]["locator_provider"]["provider"]["id"],
+        "pdfinfo"
+    );
+    assert_eq!(
+        capture["manifest"]["extractions"][0]["locator_provider"]["provider"]["version"],
+        "pdfinfo version fake-1.0"
+    );
+    assert_eq!(
+        capture["manifest"]["extractions"][0]["locator_provider"]["parameters"],
+        serde_json::json!([])
+    );
+    assert_eq!(
+        capture["manifest"]["extractions"][0]["input"]["artifact_id"],
+        "proof-source"
+    );
+    assert_eq!(
+        capture["manifest"]["extractions"][0]["input"]["sha256"],
+        capture["manifest"]["proof"]["sha256"]
+    );
+    assert!(capture["manifest"]["extractions"][0]["created_at"].is_u64());
 }
 
 #[test]
@@ -962,6 +997,146 @@ fn local_image_ocr_records_typed_image_regions() {
     assert_eq!(
         capture["manifest"]["extractions"][0]["locator"]["regions"][0]["height"],
         48
+    );
+}
+
+#[test]
+fn malformed_ocr_tsv_publishes_a_partial_capture_with_the_proof_reference() {
+    let env = TestEnv::new("capture-image-ocr-malformed");
+    env.install_binary("tesseract", FAKE_TESSERACT_MALFORMED);
+    let source = env.work_dir.join("receipt.png");
+    fs::write(&source, b"original image bytes").expect("écriture de l'image");
+
+    let created: Value = serde_json::from_slice(
+        &env.command()
+            .args([
+                "capture",
+                source.to_str().expect("chemin utf-8"),
+                "--policy",
+                "safe-local@1",
+            ])
+            .assert()
+            .success()
+            .get_output()
+            .stdout,
+    )
+    .expect("Job JSON valide");
+    let job_id = created["job"]["job_id"]
+        .as_str()
+        .expect("identifiant de Job");
+    let finished: Value = serde_json::from_slice(
+        &env.command()
+            .args(["job", "wait", job_id, "--timeout-secs", "5"])
+            .assert()
+            .success()
+            .get_output()
+            .stdout,
+    )
+    .expect("Job JSON valide");
+    assert_eq!(finished["state"], "partial");
+    let capture_id = finished["capture_id"]
+        .as_str()
+        .expect("identifiant de Capture");
+    let capture: Value = serde_json::from_slice(
+        &env.command()
+            .args(["capture", "inspect", capture_id])
+            .assert()
+            .success()
+            .get_output()
+            .stdout,
+    )
+    .expect("Capture JSON valide");
+
+    assert_eq!(
+        capture["manifest"]["extraction_errors"][0]["code"],
+        "extraction_failed"
+    );
+    assert_eq!(
+        capture["manifest"]["extraction_errors"][0]["provider"]["provider"]["id"],
+        "tesseract"
+    );
+    assert_eq!(
+        capture["manifest"]["extraction_errors"][0]["provider"]["parameters"],
+        serde_json::json!(["tsv"])
+    );
+    assert_eq!(
+        capture["manifest"]["extraction_errors"][0]["input"]["artifact_id"],
+        "proof-source"
+    );
+    assert_eq!(
+        capture["manifest"]["extraction_errors"][0]["input"]["sha256"],
+        capture["manifest"]["proof"]["sha256"]
+    );
+}
+
+#[test]
+fn source_identity_always_matches_the_staged_proof_during_a_concurrent_mutation() {
+    let env = TestEnv::new("capture-mutating-source");
+    let source = env.work_dir.join("changing.bin");
+    let first = vec![b'a'; 32 * 1024 * 1024];
+    let second = vec![b'b'; 32 * 1024 * 1024];
+    fs::write(&source, &first).expect("écriture de la Source initiale");
+    let keep_mutating = Arc::new(AtomicBool::new(true));
+    let mutation_flag = Arc::clone(&keep_mutating);
+    let mutation_path = source.clone();
+    let writer = std::thread::spawn(move || {
+        let file = fs::OpenOptions::new()
+            .write(true)
+            .open(mutation_path)
+            .expect("ouverture de la Source mutable");
+        while mutation_flag.load(Ordering::Relaxed) {
+            file.write_at(&first, 0)
+                .expect("écriture de la première version");
+            file.write_at(&second, 0)
+                .expect("écriture de la seconde version");
+        }
+    });
+
+    let created: Value = serde_json::from_slice(
+        &env.command()
+            .args([
+                "capture",
+                source.to_str().expect("chemin utf-8"),
+                "--policy",
+                "safe-local@1",
+            ])
+            .assert()
+            .success()
+            .get_output()
+            .stdout,
+    )
+    .expect("Job JSON valide");
+    let job_id = created["job"]["job_id"]
+        .as_str()
+        .expect("identifiant de Job");
+    let finished: Value = serde_json::from_slice(
+        &env.command()
+            .args(["job", "wait", job_id, "--timeout-secs", "10"])
+            .assert()
+            .success()
+            .get_output()
+            .stdout,
+    )
+    .expect("Job JSON valide");
+    keep_mutating.store(false, Ordering::Relaxed);
+    writer.join().expect("arrêt de la mutation concurrente");
+    assert_eq!(finished["state"], "succeeded");
+    let capture_id = finished["capture_id"]
+        .as_str()
+        .expect("identifiant de Capture");
+    let capture: Value = serde_json::from_slice(
+        &env.command()
+            .args(["capture", "inspect", capture_id])
+            .assert()
+            .success()
+            .get_output()
+            .stdout,
+    )
+    .expect("Capture JSON valide");
+
+    assert_eq!(
+        capture["manifest"]["source"]["sha256"],
+        capture["manifest"]["proof"]["sha256"]
     );
 }
 
