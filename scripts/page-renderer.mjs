@@ -20,13 +20,20 @@ const privateV4 = (parts) => parts[0] === 10 || parts[0] === 127 || parts[0] ===
 const privateIp = (address) => {
   if (isIP(address) === 4) return privateV4(address.split(".").map(Number));
   const value = address.toLowerCase();
-  const mappedV4 = value.match(/^::ffff:(\d+\.\d+\.\d+\.\d+)$/)?.[1];
+  const mappedV4 = value.match(/^(?:::|(?:0{1,4}:){5})ffff:(\d+\.\d+\.\d+\.\d+)$/)?.[1];
   if (mappedV4) return privateV4(mappedV4.split(".").map(Number));
+  const mappedHex = value.match(/^(?:::|(?:0{1,4}:){5})ffff:([0-9a-f]{1,4}):([0-9a-f]{1,4})$/);
+  if (mappedHex) {
+    const high = Number.parseInt(mappedHex[1], 16);
+    const low = Number.parseInt(mappedHex[2], 16);
+    return privateV4([high >> 8, high & 255, low >> 8, low & 255]);
+  }
   return value === "::1" || value === "::" || value.startsWith("fc") || value.startsWith("fd") || value.startsWith("fe80:") || value.startsWith("ff");
 };
 const resolvedTarget = async (hostname, port) => {
-  if (!hostname || hostname.toLowerCase() === "localhost" || hostname.toLowerCase().endsWith(".localhost")) throw new Error("web_private_target_refused");
-  const addresses = isIP(hostname) ? [{ address: hostname }] : await lookup(hostname, { all: true, verbatim: true });
+  const normalizedHostname = hostname.replace(/^\[|\]$/g, "");
+  if (!normalizedHostname || normalizedHostname.toLowerCase() === "localhost" || normalizedHostname.toLowerCase().endsWith(".localhost")) throw new Error("web_private_target_refused");
+  const addresses = isIP(normalizedHostname) ? [{ address: normalizedHostname }] : await lookup(normalizedHostname, { all: true, verbatim: true });
   if (!addresses.length || addresses.some(({ address }) => privateIp(address))) throw new Error("web_private_target_refused");
   if (!Number.isInteger(port) || port < 1 || port > 65535) throw new Error("web_port_refused");
   return addresses[0].address;
