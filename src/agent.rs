@@ -396,7 +396,7 @@ fn publish_capture(job: &Job) -> Result<Publication> {
         capabilities: Vec::new(),
     };
     if is_media_source(source) {
-        capture_local_media(&proof_path, &staging, &mut manifest);
+        capture_local_media(job, &proof_path, &staging, &mut manifest);
     }
     write_json(&staging.join("manifest.json"), &manifest)?;
     append_json_line(
@@ -425,6 +425,7 @@ fn is_media_source(source: &Path) -> bool {
                 | "avi"
                 | "flac"
                 | "m4a"
+                | "m4v"
                 | "mkv"
                 | "mov"
                 | "mp3"
@@ -439,7 +440,7 @@ fn is_media_source(source: &Path) -> bool {
     })
 }
 
-fn capture_local_media(proof_path: &Path, staging: &Path, manifest: &mut Manifest) {
+fn capture_local_media(job: &Job, proof_path: &Path, staging: &Path, manifest: &mut Manifest) {
     let config = match Config::load().context("loading configuration for local media Capture") {
         Ok(config) => config,
         Err(error) => {
@@ -455,11 +456,15 @@ fn capture_local_media(proof_path: &Path, staging: &Path, manifest: &mut Manifes
         return;
     }
     if let Err(error) = capture_transcription(proof_path, staging, manifest, &work_dir, &config) {
+        let _ = fs::remove_file(staging.join("extractions").join("transcription.txt"));
         record_capability_failure(manifest, "transcription", &error);
     }
+    enforce_media_limits(job, staging, manifest, "transcription");
     if let Err(error) = capture_frames(proof_path, staging, manifest, &work_dir, &config) {
+        let _ = fs::remove_dir_all(staging.join("extractions").join("frames"));
         record_capability_failure(manifest, "frames", &error);
     }
+    enforce_media_limits(job, staging, manifest, "frames");
     if let Err(error) = fs::remove_dir_all(&work_dir)
         .with_context(|| format!("removing media work directory {}", work_dir.display()))
     {
@@ -489,7 +494,7 @@ fn capture_transcription(
         Err(error) => {
             manifest.capabilities.push(failed_capability(
                 "audio-extraction",
-                unresolved_provider("ffmpeg"),
+                unresolved_provider_for(&error, "ffmpeg"),
                 &error,
             ));
             manifest.capabilities.push(blocked_capability(
@@ -669,7 +674,7 @@ fn failed_capability(name: &str, provider: Provider, error: &anyhow::Error) -> C
 fn blocked_capability(name: &str, provider: Provider, error: &anyhow::Error) -> Capability {
     Capability {
         name: name.to_string(),
-        state: "failed".to_string(),
+        state: "not_attempted".to_string(),
         provider,
         error: Some(StructuredError {
             code: "capability_blocked".to_string(),
@@ -685,17 +690,74 @@ fn record_media_setup_failure(manifest: &mut Manifest, error: &anyhow::Error) {
 }
 
 fn record_capability_failure(manifest: &mut Manifest, name: &str, error: &anyhow::Error) {
-    if !manifest
+    if let Some(capability) = manifest
         .capabilities
-        .iter()
-        .any(|capability| capability.name == name)
+        .iter_mut()
+        .find(|capability| capability.name == name)
     {
+        capability.state = "failed".to_string();
+        capability.error = Some(StructuredError {
+            code: "capability_failed".to_string(),
+            message: format!("{error:#}"),
+        });
+    } else {
         manifest.capabilities.push(failed_capability(
             name,
             unresolved_provider("unknown"),
             error,
         ));
     }
+}
+
+fn enforce_media_limits(job: &Job, staging: &Path, manifest: &mut Manifest, capability: &str) {
+    let result = if now_secs().saturating_sub(job.created_at)
+        > job.policy.snapshot.limits.duration_limit_secs
+    {
+        Err(anyhow::anyhow!(
+            "Capture exceeds safe-local@1 duration budget"
+        ))
+    } else {
+        directory_size(staging).and_then(|size| {
+            if size > job.policy.snapshot.limits.disk_byte_limit {
+                bail!("Capture exceeds safe-local@1 disk budget");
+            }
+            Ok(())
+        })
+    };
+    if let Err(error) = result {
+        manifest.extractions.retain(|extraction| {
+            let affected = match capability {
+                "transcription" => extraction.artifact_id == "extraction-transcription",
+                "frames" => extraction.artifact_id.starts_with("extraction-frame-"),
+                _ => false,
+            };
+            !affected
+        });
+        let path = if capability == "frames" {
+            staging.join("extractions").join("frames")
+        } else {
+            staging.join("extractions").join("transcription.txt")
+        };
+        let _ = if capability == "frames" {
+            fs::remove_dir_all(path)
+        } else {
+            fs::remove_file(path)
+        };
+        record_capability_failure(manifest, capability, &error);
+    }
+}
+
+fn directory_size(path: &Path) -> Result<u64> {
+    if path.is_file() {
+        return file_size(path);
+    }
+    fs::read_dir(path)
+        .with_context(|| format!("reading Capture directory {}", path.display()))?
+        .try_fold(0_u64, |size, entry| {
+            let entry = entry.context("reading Capture entry")?;
+            size.checked_add(directory_size(&entry.path())?)
+                .context("summing Capture disk usage")
+        })
 }
 
 fn copy_extraction(source: &Path, destination: &Path) -> Result<()> {
@@ -828,6 +890,15 @@ fn unresolved_provider(name: &str) -> Provider {
         parameters: Value::Null,
         dependencies: Vec::new(),
     }
+}
+
+fn unresolved_provider_for(error: &anyhow::Error, fallback: &str) -> Provider {
+    let name = if format!("{error:#}").contains("`ffprobe`") {
+        "ffprobe"
+    } else {
+        fallback
+    };
+    unresolved_provider(name)
 }
 
 fn start_job(job_id: &str) -> Result<Option<Job>> {
