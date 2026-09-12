@@ -371,6 +371,7 @@ fn publish_capture(job: &Job) -> Result<Publication> {
     let proof_path = staging.join("proofs").join("source");
     fs::copy(source, &proof_path)
         .with_context(|| format!("copying local Source {}", source.display()))?;
+    let proof_created_at = now_secs();
     let proof_hash = sha256_file(&proof_path)?;
     if job.policy.snapshot.duplicate_mode == "reuse"
         && let Some((capture_id, partial)) = find_capture_by_source_hash(&proof_hash)?
@@ -414,7 +415,7 @@ fn publish_capture(job: &Job) -> Result<Publication> {
             mime: source_mime(source).to_string(),
             sha256: proof_hash,
             size_bytes: proof_size,
-            created_at: now_secs(),
+            created_at: proof_created_at,
         },
         extractions: extraction_outcome.extractions,
         extraction_errors: extraction_outcome.errors,

@@ -130,6 +130,19 @@ fi
 printf 'Premiere page\nDeuxieme page\n' > "$3"
 "#;
 
+const FAKE_PDFTOTEXT_SLOW: &str = r#"#!/bin/sh
+set -eu
+if [ "$1" = "-v" ]; then
+  echo 'pdftotext version fake-1.0' >&2
+  exit 0
+fi
+i=0
+while [ "$i" -lt 1000000 ]; do
+  i=$((i + 1))
+done
+printf 'Premiere page\nDeuxieme page\n' > "$3"
+"#;
+
 const FAKE_PDFINFO_VERSION_FAILURE: &str = r"#!/bin/sh
 echo 'pdfinfo unavailable' >&2
 exit 1
@@ -336,6 +349,19 @@ fn wait_for_file(path: &Path, timeout: Duration) -> bool {
         std::thread::sleep(Duration::from_millis(50));
     }
     has_content(path)
+}
+
+fn assert_proof_precedes_extraction(capture: &Value) {
+    let proof_created_at = capture["manifest"]["proof"]["created_at"]
+        .as_u64()
+        .expect("horodatage de preuve");
+    let extraction_created_at = capture["manifest"]["extractions"][0]["created_at"]
+        .as_u64()
+        .expect("horodatage d'extraction");
+    assert!(
+        proof_created_at < extraction_created_at,
+        "la preuve doit être horodatée lors de sa copie, avant l'extraction"
+    );
 }
 
 #[test]
@@ -826,7 +852,7 @@ fn capture_budget_failure_is_reported_as_a_structured_job_error() {
 fn local_pdf_keeps_an_intact_proof_and_a_traced_text_extraction() {
     let env = TestEnv::new("capture-pdf");
     env.install_binary("pdfinfo", FAKE_PDFINFO);
-    env.install_binary("pdftotext", FAKE_PDFTOTEXT);
+    env.install_binary("pdftotext", FAKE_PDFTOTEXT_SLOW);
     let source = env.work_dir.join("contract.pdf");
     fs::write(&source, b"original pdf bytes").expect("écriture du PDF");
 
@@ -925,6 +951,7 @@ fn local_pdf_keeps_an_intact_proof_and_a_traced_text_extraction() {
     );
     assert!(capture["manifest"]["extractions"][0]["created_at"].is_u64());
     assert!(capture["manifest"]["proof"]["created_at"].is_u64());
+    assert_proof_precedes_extraction(&capture);
 }
 
 #[test]
