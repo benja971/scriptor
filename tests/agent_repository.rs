@@ -244,6 +244,32 @@ fn search_uses_its_projection_and_reports_when_it_is_unavailable() {
 }
 
 #[test]
+fn rebuilding_skips_invalid_utf8_text_and_keeps_other_captures_searchable() {
+    let repository = TestRepository::new("invalid-utf8-index");
+    repository.capture("invalid.txt", b"invalid\xfftext");
+    let valid = repository.capture("valid.txt", b"searchable meeting notes");
+    let valid_capture = valid["capture_id"]
+        .as_str()
+        .expect("identifiant de Capture valide");
+
+    repository
+        .command()
+        .args(["capture", "index", "rebuild"])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("\"captures\":2"))
+        .stderr(predicate::str::is_empty());
+
+    repository
+        .command()
+        .args(["capture", "search", "meeting"])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains(valid_capture))
+        .stderr(predicate::str::is_empty());
+}
+
+#[test]
 fn read_returns_a_bounded_text_excerpt_and_never_writes_binary_content() {
     let repository = TestRepository::new("read");
     let text = repository.capture("notes.txt", b"abcdefghij");

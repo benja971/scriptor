@@ -1058,11 +1058,11 @@ fn search_text_for(manifest: &Manifest) -> Result<String> {
         .join(&manifest.proof.path);
     let file =
         File::open(&path).with_context(|| format!("opening text artifact {}", path.display()))?;
-    let mut text = String::new();
+    let mut bytes = Vec::new();
     file.take(u64::try_from(MAX_READ_LENGTH).context("converting Index text limit")?)
-        .read_to_string(&mut text)
+        .read_to_end(&mut bytes)
         .with_context(|| format!("reading text artifact {}", path.display()))?;
-    Ok(text)
+    Ok(String::from_utf8(bytes).unwrap_or_default())
 }
 
 fn summary_for(manifest: &Manifest) -> CaptureSummary {
