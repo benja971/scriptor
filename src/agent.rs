@@ -10,6 +10,7 @@ use anyhow::{Context, Result, bail};
 use clap::{Args, Parser, Subcommand};
 use fs2::FileExt;
 use serde::{Deserialize, Serialize};
+use serde_json::{Value, json};
 use sha2::{Digest, Sha256};
 
 use crate::config::Config;
@@ -165,7 +166,7 @@ struct Extraction {
     mime: String,
     sha256: String,
     size_bytes: u64,
-    locator: Locator,
+    locator: Option<Locator>,
     provider: Provider,
     proof_artifact_id: String,
 }
@@ -182,6 +183,7 @@ struct Capability {
 struct Provider {
     name: String,
     version: String,
+    parameters: Value,
 }
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -449,8 +451,40 @@ fn capture_transcription(
     config: &Config,
 ) -> Result<()> {
     let audio_path = work_dir.join("audio.wav");
-    let audio_provider = provider("ffmpeg");
-    let transcription_provider = provider("whisper-cli");
+    let audio_parameters = json!({
+        "format": "pcm_s16le",
+        "sample_rate_hz": 16_000,
+        "channels": 1,
+    });
+    let transcription_parameters = transcription_parameters(config);
+    let audio_provider = match provider("ffmpeg", audio_parameters) {
+        Ok(provider) => provider,
+        Err(error) => {
+            manifest.capabilities.push(failed_capability(
+                "audio-extraction",
+                unresolved_provider("ffmpeg"),
+                &error,
+            ));
+            manifest.capabilities.push(blocked_capability(
+                "transcription",
+                unresolved_provider("whisper-cli"),
+                &error,
+            ));
+            return Ok(());
+        }
+    };
+    let transcription_provider =
+        match transcription_parameters.and_then(|parameters| provider("whisper-cli", parameters)) {
+            Ok(provider) => provider,
+            Err(error) => {
+                manifest.capabilities.push(failed_capability(
+                    "transcription",
+                    unresolved_provider("whisper-cli"),
+                    &error,
+                ));
+                return Ok(());
+            }
+        };
 
     match audio::extract_audio(proof_path, &audio_path) {
         Ok(()) => {
@@ -475,10 +509,7 @@ fn capture_transcription(
                         "extractions/transcription.txt",
                         "text/plain",
                         &destination,
-                        Locator {
-                            kind: "media-time-range".to_string(),
-                            timestamps_secs: None,
-                        },
+                        None,
                         transcription_provider.clone(),
                     )?);
                     manifest.capabilities.push(Capability {
@@ -519,7 +550,24 @@ fn capture_frames(
     config: &Config,
 ) -> Result<()> {
     let frames_dir = work_dir.join("frames");
-    let frames_provider = provider("ffmpeg");
+    let frames_provider = match provider(
+        "ffmpeg",
+        json!({
+            "interval_secs": config.frame_interval_secs,
+            "scene_threshold": config.frame_scene_threshold,
+            "dedup_window_secs": config.frame_dedup_window_secs,
+        }),
+    ) {
+        Ok(provider) => provider,
+        Err(error) => {
+            manifest.capabilities.push(failed_capability(
+                "frames",
+                unresolved_provider("ffmpeg"),
+                &error,
+            ));
+            return Ok(());
+        }
+    };
     let frame_params = frames::FrameExtractionParams {
         interval_secs: config.frame_interval_secs,
         scene_threshold: config.frame_scene_threshold,
@@ -554,10 +602,10 @@ fn capture_frames(
                         &path,
                         "image/jpeg",
                         &extraction_path,
-                        Locator {
+                        Some(Locator {
                             kind: "media-timestamp".to_string(),
                             timestamps_secs: Some(vec![timestamp]),
-                        },
+                        }),
                         frames_provider.clone(),
                     )?);
                 }
@@ -623,7 +671,7 @@ fn extraction(
     path: &str,
     mime: &str,
     file: &Path,
-    locator: Locator,
+    locator: Option<Locator>,
     provider: Provider,
 ) -> Result<Extraction> {
     Ok(Extraction {
@@ -656,7 +704,12 @@ fn frame_timestamp(filename: &str) -> Result<f64> {
 }
 
 fn media_mime(source: &Path) -> &'static str {
-    match source.extension().and_then(|extension| extension.to_str()) {
+    match source
+        .extension()
+        .and_then(|extension| extension.to_str())
+        .map(str::to_ascii_lowercase)
+        .as_deref()
+    {
         Some("mp4" | "m4v") => "video/mp4",
         Some("webm") => "video/webm",
         Some("mov") => "video/quicktime",
@@ -669,21 +722,38 @@ fn media_mime(source: &Path) -> &'static str {
     }
 }
 
-fn provider(name: &str) -> Provider {
-    let version = std::env::var_os("PATH")
+fn transcription_parameters(config: &Config) -> Result<Value> {
+    let model_path = config.model_path();
+    Ok(json!({
+        "language": config.language,
+        "threads": config.threads,
+        "model": {
+            "path": model_path,
+            "sha256": sha256_file(&model_path)?,
+        },
+    }))
+}
+
+fn provider(name: &str, parameters: Value) -> Result<Provider> {
+    let path = std::env::var_os("PATH")
         .and_then(|path| {
             std::env::split_paths(&path)
                 .map(|directory| directory.join(name))
                 .find(|candidate| candidate.is_file())
         })
-        .and_then(|path| sha256_file(&path).ok())
-        .map_or_else(
-            || "unavailable".to_string(),
-            |hash| format!("sha256:{hash}"),
-        );
+        .with_context(|| format!("resolving Provider binary `{name}`"))?;
+    Ok(Provider {
+        name: name.to_string(),
+        version: format!("sha256:{}", sha256_file(&path)?),
+        parameters,
+    })
+}
+
+fn unresolved_provider(name: &str) -> Provider {
     Provider {
         name: name.to_string(),
-        version,
+        version: "unresolved".to_string(),
+        parameters: Value::Null,
     }
 }
 

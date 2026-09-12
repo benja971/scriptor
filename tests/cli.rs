@@ -197,6 +197,10 @@ impl TestEnv {
             self.work_dir.join("models").display(),
         );
         fs::write(config_dir.join("config.toml"), config).expect("écriture du config.toml de test");
+        let models_dir = self.work_dir.join("models");
+        fs::create_dir_all(&models_dir).expect("création du répertoire des Modèles de test");
+        fs::write(models_dir.join("ggml-small.bin"), b"fake whisper model")
+            .expect("écriture du Modèle de test");
     }
 
     fn command(&self) -> Command {
@@ -731,7 +735,7 @@ fn capture_budget_failure_is_reported_as_a_structured_job_error() {
 fn capture_local_media_publishes_proof_and_located_extractions() {
     let env = TestEnv::new("capture-local-media");
     env.write_config(&env.work_dir.join("out"));
-    let source = env.write_media_file("interview.mp4");
+    let source = env.write_media_file("interview.MP4");
 
     let created: Value = serde_json::from_slice(
         &env.command()
@@ -775,6 +779,7 @@ fn capture_local_media_publishes_proof_and_located_extractions() {
     .expect("Capture JSON valide");
     assert_eq!(capture["manifest"]["proof"]["path"], "proofs/source");
     assert_eq!(capture["manifest"]["proof"]["locator"]["kind"], "file");
+    assert_eq!(capture["manifest"]["proof"]["mime"], "video/mp4");
     assert_eq!(
         capture["manifest"]["extractions"].as_array().map(Vec::len),
         Some(2)
@@ -785,9 +790,12 @@ fn capture_local_media_publishes_proof_and_located_extractions() {
             .is_some_and(|extractions| extractions.iter().any(|extraction| {
                 extraction["artifact_id"] == "extraction-transcription"
                     && extraction["path"] == "extractions/transcription.txt"
-                    && extraction["locator"]["kind"] == "media-time-range"
+                    && extraction["locator"].is_null()
                     && extraction["provider"]["name"] == "whisper-cli"
                     && extraction["provider"]["version"].as_str().is_some()
+                    && extraction["provider"]["parameters"]["model"]["sha256"]
+                        .as_str()
+                        .is_some()
             }))
     );
     assert!(
