@@ -139,6 +139,14 @@ fn list_has_stable_pages_and_verifiable_references() {
         second_captures[0]["capture_id"]
     );
 
+    repository.capture("delta.txt", b"delta");
+    repository
+        .command()
+        .args(["capture", "list", "--cursor", cursor])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("\"code\":\"invalid_cursor\""));
+
     repository
         .command()
         .args(["capture", "list", "--limit", "101"])
@@ -175,6 +183,32 @@ fn search_uses_its_projection_and_reports_when_it_is_unavailable() {
         .success()
         .stdout(predicate::str::contains("\"code\":\"invalid_cursor\""))
         .stderr(predicate::str::is_empty());
+
+    repository.capture("other.txt", b"other");
+    let list_cursor: Value = serde_json::from_slice(
+        &repository
+            .command()
+            .args(["capture", "list", "--limit", "1"])
+            .assert()
+            .success()
+            .get_output()
+            .stdout,
+    )
+    .expect("liste JSON valide");
+    repository
+        .command()
+        .args([
+            "capture",
+            "search",
+            "meeting",
+            "--cursor",
+            list_cursor["next_cursor"]
+                .as_str()
+                .expect("curseur de liste"),
+        ])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("\"code\":\"invalid_cursor\""));
 
     fs::remove_file(repository.repository_path().join("index.json"))
         .expect("suppression de la projection de recherche");
@@ -270,6 +304,24 @@ fn read_returns_a_bounded_text_excerpt_and_never_writes_binary_content() {
         .stdout(predicate::str::contains("\"code\":\"binary_artifact\""))
         .stderr(predicate::str::is_empty());
 
+    let unicode = repository.capture("unicode.txt", "éé".as_bytes());
+    let unicode_capture = unicode["capture_id"]
+        .as_str()
+        .expect("identifiant de Capture");
+    repository
+        .command()
+        .args([
+            "capture",
+            "read",
+            unicode_capture,
+            "proof-source",
+            "--offset",
+            "1",
+        ])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("\"code\":\"invalid_range\""));
+
     repository
         .command()
         .args([
@@ -346,4 +398,34 @@ fn agent_commands_return_structured_json_for_runtime_and_clap_errors() {
         .success()
         .stdout(predicate::str::contains("\"code\":\"invalid_command\""))
         .stderr(predicate::str::is_empty());
+    repository
+        .command()
+        .args(["capture", "index", "rebuild"])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("\"captures\":0"));
+}
+
+#[test]
+fn index_failure_after_publication_does_not_fail_the_capture_job() {
+    let repository = TestRepository::new("index-degradation");
+    fs::create_dir_all(repository.repository_path().join("index.json"))
+        .expect("création d'une cible d'Index invalide");
+
+    let finished = repository.capture("published.txt", b"published despite Index failure");
+    assert_eq!(finished["state"], "succeeded");
+    let capture_id = finished["capture_id"]
+        .as_str()
+        .expect("identifiant de Capture");
+    repository
+        .command()
+        .args(["capture", "inspect", capture_id])
+        .assert()
+        .success();
+    repository
+        .command()
+        .args(["capture", "search", "published"])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("\"code\":\"index_degraded\""));
 }

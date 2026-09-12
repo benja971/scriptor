@@ -244,7 +244,7 @@ struct IndexedCapture {
     search_text: String,
 }
 
-#[derive(Serialize)]
+#[derive(Deserialize, Serialize)]
 struct AgentError {
     error: StructuredError,
 }
@@ -259,9 +259,27 @@ struct ReadArtifact {
 #[derive(Serialize)]
 struct ReadContent {
     offset: u64,
+    offset_unit: &'static str,
     length: usize,
     text: String,
     truncated: bool,
+}
+
+#[derive(Deserialize, Serialize)]
+struct Cursor {
+    version: u8,
+    operation: String,
+    query: Option<String>,
+    snapshot: String,
+    index_version: Option<u8>,
+    capture_id: String,
+}
+
+struct CursorBinding {
+    operation: &'static str,
+    query: Option<String>,
+    snapshot: String,
+    index_version: Option<u8>,
 }
 
 #[derive(Serialize)]
@@ -324,7 +342,7 @@ fn agent_error(error: &anyhow::Error) -> StructuredError {
         "policy_required"
     } else if message.contains("limit must") {
         "invalid_pagination"
-    } else if message.contains("length must") {
+    } else if message.contains("length must") || message.contains("UTF-8 character boundary") {
         "invalid_range"
     } else if message.contains("binary artifacts") {
         "binary_artifact"
@@ -528,7 +546,9 @@ fn publish_capture(job: &Job) -> Result<Publication> {
         },
     )?;
     fs::rename(&staging, &final_dir).with_context(|| format!("publishing Capture {capture_id}"))?;
-    rebuild_search_index()?;
+    if let Err(error) = rebuild_search_index() {
+        record_index_degradation(&error);
+    }
     Ok(Publication::Published(capture_id))
 }
 
@@ -655,11 +675,20 @@ fn run_index_command(command: &IndexCommand) -> Result<()> {
 
 fn list_captures(cursor: Option<&str>, limit: usize) -> Result<()> {
     let manifests = list_manifests()?;
-    print_json(&capture_page(manifests, cursor, limit)?)
+    let binding = CursorBinding {
+        operation: "list",
+        query: None,
+        snapshot: snapshot_for(&manifests)?,
+        index_version: None,
+    };
+    print_json(&capture_page(manifests, cursor, limit, &binding)?)
 }
 
 fn search_captures(query: &str, cursor: Option<&str>, limit: usize) -> Result<()> {
     validate_page_limit(limit)?;
+    if let Some(error) = read_index_degradation()? {
+        return print_json(&AgentError { error });
+    }
     let index: SearchIndex = match read_json(&search_index_path()?) {
         Ok(index) => index,
         Err(error) => {
@@ -680,6 +709,14 @@ fn search_captures(query: &str, cursor: Option<&str>, limit: usize) -> Result<()
         });
     }
     let normalized_query = query.to_lowercase();
+    let binding = CursorBinding {
+        operation: "search",
+        query: Some(normalized_query.clone()),
+        snapshot: sha256_bytes(
+            &serde_json::to_vec(&index).context("serializing search Index snapshot")?,
+        ),
+        index_version: Some(index.version),
+    };
     let manifests = index
         .captures
         .into_iter()
@@ -702,7 +739,7 @@ fn search_captures(query: &str, cursor: Option<&str>, limit: usize) -> Result<()
             proof: capture.proof,
         })
         .collect();
-    print_json(&capture_page(manifests, cursor, limit)?)
+    print_json(&capture_page(manifests, cursor, limit, &binding)?)
 }
 
 fn read_artifact(
@@ -743,20 +780,47 @@ fn read_artifact(
             .context("converting bounded artifact length")?;
     let mut file =
         File::open(&path).with_context(|| format!("opening artifact {}", path.display()))?;
+    if offset < size {
+        file.seek(SeekFrom::Start(offset))
+            .with_context(|| format!("checking artifact offset {}", path.display()))?;
+        let mut current = [0_u8; 1];
+        file.read_exact(&mut current)
+            .with_context(|| format!("checking artifact offset {}", path.display()))?;
+        if current.first().context("reading artifact offset byte")? & 0b1100_0000 == 0b1000_0000 {
+            bail!("offset must align to a UTF-8 character boundary");
+        }
+    }
     file.seek(SeekFrom::Start(offset))
         .with_context(|| format!("seeking artifact {}", path.display()))?;
     let mut bytes = vec![0; amount];
     file.read_exact(&mut bytes)
         .with_context(|| format!("reading artifact {}", path.display()))?;
-    let text = String::from_utf8(bytes).context("artifact text is not valid UTF-8")?;
+    let text = match String::from_utf8(bytes) {
+        Ok(text) => text,
+        Err(error) if error.utf8_error().error_len().is_none() => {
+            let valid = error.utf8_error().valid_up_to();
+            let bytes = error.into_bytes();
+            String::from_utf8(
+                bytes
+                    .get(..valid)
+                    .context("trimming bounded artifact text")?
+                    .to_vec(),
+            )
+            .context("trimming bounded artifact text")?
+        }
+        Err(error) => return Err(error).context("artifact text is not valid UTF-8"),
+    };
+    let text_length = text.len();
     print_json(&ReadArtifact {
         artifact: manifest.proof.clone(),
         reference: reference_for(&manifest),
         content: ReadContent {
             offset,
-            length: amount,
+            offset_unit: "bytes",
+            length: text_length,
             text,
-            truncated: u64::try_from(amount).context("converting read result length")? < remaining,
+            truncated: u64::try_from(text_length).context("converting read result length")?
+                < remaining,
         },
     })
 }
@@ -790,10 +854,21 @@ fn capture_page(
     manifests: Vec<Manifest>,
     cursor: Option<&str>,
     limit: usize,
+    binding: &CursorBinding,
 ) -> Result<CapturePage> {
     validate_page_limit(limit)?;
     let after = cursor.map(decode_cursor).transpose()?;
-    let start = after.as_deref().map_or(0, |capture_id| {
+    if let Some(cursor) = &after
+        && (cursor.version != 1
+            || cursor.operation != binding.operation
+            || cursor.query != binding.query
+            || cursor.snapshot != binding.snapshot
+            || cursor.index_version != binding.index_version)
+    {
+        bail!("pagination cursor does not match this operation or snapshot");
+    }
+    let start = after.as_ref().map_or(0, |cursor| {
+        let capture_id = cursor.capture_id.as_str();
         manifests.partition_point(|manifest| manifest.capture_id.as_str() <= capture_id)
     });
     let mut captures = manifests
@@ -808,7 +883,16 @@ fn capture_page(
     let next_cursor = if has_next {
         captures
             .last()
-            .map(|manifest| encode_cursor(&manifest.capture_id))
+            .map(|manifest| {
+                encode_cursor(&Cursor {
+                    version: 1,
+                    operation: binding.operation.to_string(),
+                    query: binding.query.clone(),
+                    snapshot: binding.snapshot.clone(),
+                    index_version: binding.index_version,
+                    capture_id: manifest.capture_id.clone(),
+                })
+            })
             .transpose()?
     } else {
         None
@@ -876,6 +960,7 @@ fn rebuild_search_index() -> Result<usize> {
         version: 1,
         captures,
     })?;
+    clear_index_degradation()?;
     unlock_search_index(&lock)?;
     Ok(count)
 }
@@ -885,7 +970,10 @@ fn search_index_path() -> Result<PathBuf> {
 }
 
 fn lock_search_index() -> Result<File> {
-    let path = repository_dir()?.join("index.lock");
+    let directory = repository_dir()?;
+    fs::create_dir_all(&directory)
+        .with_context(|| format!("creating search Index directory {}", directory.display()))?;
+    let path = directory.join("index.lock");
     let file = OpenOptions::new()
         .create(true)
         .truncate(false)
@@ -908,6 +996,57 @@ fn write_search_index(index: &SearchIndex) -> Result<()> {
         .with_context(|| format!("writing search Index {}", temporary.display()))?;
     fs::rename(&temporary, &path)
         .with_context(|| format!("publishing search Index {}", path.display()))
+}
+
+fn record_index_degradation(error: &anyhow::Error) {
+    let result = (|| -> Result<()> {
+        let directory = repository_dir()?;
+        fs::create_dir_all(&directory)
+            .with_context(|| format!("creating Index status directory {}", directory.display()))?;
+        write_json(
+            &index_status_path()?,
+            &AgentError {
+                error: StructuredError {
+                    code: "index_degraded".to_string(),
+                    message: format!("{error:#}"),
+                },
+            },
+        )
+    })();
+    drop(result);
+}
+
+fn clear_index_degradation() -> Result<()> {
+    let path = index_status_path()?;
+    if path
+        .try_exists()
+        .with_context(|| format!("checking Index status {}", path.display()))?
+    {
+        fs::remove_file(&path)
+            .with_context(|| format!("clearing Index status {}", path.display()))?;
+    }
+    Ok(())
+}
+
+fn read_index_degradation() -> Result<Option<StructuredError>> {
+    let path = index_status_path()?;
+    if !path
+        .try_exists()
+        .with_context(|| format!("checking Index status {}", path.display()))?
+    {
+        return Ok(None);
+    }
+    let status: AgentError = read_json(&path)?;
+    Ok(Some(status.error))
+}
+
+fn index_status_path() -> Result<PathBuf> {
+    Ok(repository_dir()?.join("index-status.json"))
+}
+
+fn snapshot_for(manifests: &[Manifest]) -> Result<String> {
+    let data = serde_json::to_vec(manifests).context("serializing Capture snapshot")?;
+    Ok(sha256_bytes(&data))
 }
 
 fn search_text_for(manifest: &Manifest) -> Result<String> {
@@ -944,16 +1083,17 @@ fn reference_for(manifest: &Manifest) -> Reference {
     }
 }
 
-fn encode_cursor(capture_id: &str) -> Result<String> {
-    let mut hex = String::with_capacity(capture_id.len().saturating_mul(2));
-    for byte in capture_id.bytes() {
+fn encode_cursor(cursor: &Cursor) -> Result<String> {
+    let encoded = serde_json::to_vec(cursor).context("serializing pagination cursor")?;
+    let mut hex = String::with_capacity(encoded.len().saturating_mul(2));
+    for byte in encoded {
         FmtWrite::write_fmt(&mut hex, format_args!("{byte:02x}"))
             .context("encoding pagination cursor")?;
     }
     Ok(format!("v1-{hex}"))
 }
 
-fn decode_cursor(cursor: &str) -> Result<String> {
+fn decode_cursor(cursor: &str) -> Result<Cursor> {
     let encoded = cursor
         .strip_prefix("v1-")
         .context("invalid pagination cursor")?;
@@ -969,7 +1109,7 @@ fn decode_cursor(cursor: &str) -> Result<String> {
                 .and_then(|hex| u8::from_str_radix(hex, 16).context("invalid pagination cursor"))
         })
         .collect::<Result<Vec<_>>>()?;
-    String::from_utf8(bytes).context("invalid pagination cursor")
+    serde_json::from_slice(&bytes).context("invalid pagination cursor")
 }
 
 fn is_text_mime(mime: &str) -> bool {
