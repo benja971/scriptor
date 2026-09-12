@@ -11,7 +11,12 @@
 //! tests ne font pas de `.wait()` sur le process ; ils "pollent" (avec
 //! timeout court) l'apparition du fichier de Sortie ou de log.
 
-#![allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
+#![allow(
+    clippy::expect_used,
+    clippy::indexing_slicing,
+    clippy::panic,
+    clippy::unwrap_used
+)]
 
 use std::fs;
 use std::os::unix::fs::PermissionsExt;
@@ -21,6 +26,8 @@ use std::time::{Duration, Instant};
 
 use assert_cmd::Command;
 use predicates::prelude::*;
+use serde_json::Value;
+use sha2::{Digest, Sha256};
 
 static COUNTER: AtomicU64 = AtomicU64::new(0);
 
@@ -545,6 +552,178 @@ fn failure_notification_reports_source_and_log_which_contains_the_error() {
     assert!(
         !env.work_dir.join("interview").exists(),
         "aucun dossier de Sortie orphelin ne doit rester si le Pipeline échoue"
+    );
+}
+
+#[test]
+fn capture_returns_a_persistent_job_then_publishes_an_inspectable_capture() {
+    let env = TestEnv::new("capture-contract");
+    let source = env.write_media_file("notes.txt");
+
+    let output = env
+        .command()
+        .args([
+            "capture",
+            source.to_str().expect("chemin utf-8"),
+            "--policy",
+            "safe-local@1",
+        ])
+        .assert()
+        .success()
+        .get_output()
+        .stdout
+        .clone();
+    let created: Value = serde_json::from_slice(&output).expect("Job JSON valide");
+    let job_id = created["job"]["job_id"]
+        .as_str()
+        .expect("identifiant de Job")
+        .to_string();
+    assert_eq!(created["job"]["policy"]["id"], "safe-local");
+    assert_eq!(created["job"]["policy"]["version"], 1);
+    assert_eq!(
+        created["job"]["policy"]["snapshot"]["duplicate_mode"],
+        "reuse"
+    );
+    let policy_snapshot = serde_json::to_vec(&created["job"]["policy"]["snapshot"])
+        .expect("snapshot de Policy sérialisable");
+    assert_eq!(
+        created["job"]["policy"]["sha256"],
+        format!("{:x}", Sha256::digest(policy_snapshot))
+    );
+
+    let output = env
+        .command()
+        .args(["job", "wait", &job_id, "--timeout-secs", "5"])
+        .assert()
+        .success()
+        .get_output()
+        .stdout
+        .clone();
+    let finished: Value = serde_json::from_slice(&output).expect("Job JSON valide");
+    assert_eq!(finished["state"], "succeeded");
+    let capture_id = finished["capture_id"]
+        .as_str()
+        .expect("identifiant de Capture");
+
+    let output = env
+        .command()
+        .args(["capture", "inspect", capture_id])
+        .assert()
+        .success()
+        .get_output()
+        .stdout
+        .clone();
+    let capture: Value = serde_json::from_slice(&output).expect("Capture JSON valide");
+    assert_eq!(capture["manifest"]["capture_id"], capture_id);
+    assert_eq!(
+        capture["manifest"]["proof"]["sha256"]
+            .as_str()
+            .map(str::len),
+        Some(64)
+    );
+    assert_eq!(capture["ledger"][0]["event"], "capture_published");
+}
+
+#[test]
+fn capture_requires_an_explicit_policy_and_reuses_an_identical_source() {
+    let env = TestEnv::new("capture-policy-duplicate");
+    let source = env.write_media_file("notes.txt");
+
+    env.command()
+        .args(["capture", source.to_str().expect("chemin utf-8")])
+        .assert()
+        .failure()
+        .stderr(predicate::str::contains("capture requires --policy"));
+
+    let create_job = |env: &TestEnv| -> String {
+        let output = env
+            .command()
+            .args([
+                "capture",
+                source.to_str().expect("chemin utf-8"),
+                "--policy",
+                "safe-local@1",
+            ])
+            .assert()
+            .success()
+            .get_output()
+            .stdout
+            .clone();
+        serde_json::from_slice::<Value>(&output).expect("Job JSON valide")["job"]["job_id"]
+            .as_str()
+            .expect("identifiant de Job")
+            .to_string()
+    };
+
+    let first_job = create_job(&env);
+    let first: Value = serde_json::from_slice(
+        &env.command()
+            .args(["job", "wait", &first_job, "--timeout-secs", "5"])
+            .assert()
+            .success()
+            .get_output()
+            .stdout,
+    )
+    .expect("Job JSON valide");
+    let second_job = create_job(&env);
+    let second: Value = serde_json::from_slice(
+        &env.command()
+            .args(["job", "wait", &second_job, "--timeout-secs", "5"])
+            .assert()
+            .success()
+            .get_output()
+            .stdout,
+    )
+    .expect("Job JSON valide");
+
+    assert_eq!(first["state"], "succeeded");
+    assert_eq!(second["state"], "succeeded");
+    assert_eq!(first["capture_id"], second["capture_id"]);
+}
+
+#[test]
+fn capture_budget_failure_is_reported_as_a_structured_job_error() {
+    let env = TestEnv::new("capture-budget");
+    let source = env.work_dir.join("too-large.bin");
+    fs::File::create(&source)
+        .expect("création de la Source")
+        .set_len(10 * 1024 * 1024 * 1024 + 1)
+        .expect("création d'une Source sparse hors budget");
+
+    let output = env
+        .command()
+        .args([
+            "capture",
+            source.to_str().expect("chemin utf-8"),
+            "--policy",
+            "safe-local@1",
+        ])
+        .assert()
+        .success()
+        .get_output()
+        .stdout
+        .clone();
+    let job_id =
+        serde_json::from_slice::<Value>(&output).expect("Job JSON valide")["job"]["job_id"]
+            .as_str()
+            .expect("identifiant de Job")
+            .to_string();
+
+    let finished: Value = serde_json::from_slice(
+        &env.command()
+            .args(["job", "wait", &job_id, "--timeout-secs", "5"])
+            .assert()
+            .success()
+            .get_output()
+            .stdout,
+    )
+    .expect("Job JSON valide");
+    assert_eq!(finished["state"], "failed");
+    assert_eq!(finished["error"]["code"], "capture_failed");
+    assert!(
+        finished["error"]["message"]
+            .as_str()
+            .is_some_and(|message| message.contains("disk budget"))
     );
 }
 
