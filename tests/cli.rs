@@ -22,7 +22,7 @@ use std::fs;
 use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::time::{Duration, Instant};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use assert_cmd::Command;
 use predicates::prelude::*;
@@ -728,6 +728,102 @@ fn capture_budget_failure_is_reported_as_a_structured_job_error() {
         finished["error"]["message"]
             .as_str()
             .is_some_and(|message| message.contains("disk budget"))
+    );
+}
+
+#[test]
+fn capture_stops_a_running_provider_at_its_duration_budget_before_starting_frames() {
+    let env = TestEnv::new("capture-provider-duration-budget");
+    env.write_config(&env.work_dir.join("out"));
+    let source = env.write_media_file("interview.mp4");
+    let audio_started = env.work_dir.join("audio-started");
+    let frames_started = env.work_dir.join("frames-started");
+    write_executable(
+        &env.bin_dir,
+        "ffmpeg",
+        &format!(
+            "#!/bin/sh\nset -eu\nfor arg in \"$@\"; do\n  if [ \"$arg\" = \"-map\" ]; then\n    : > \"{}\"\n    exit 0\n  fi\ndone\n: > \"{}\"\nwhile :; do :; done\n",
+            frames_started.display(),
+            audio_started.display(),
+        ),
+    );
+    let created_at = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .expect("horloge système après l'époque Unix")
+        .as_secs();
+    let job_id = "job-1";
+    let jobs_dir = env.xdg_data.join("scriptor/v2/jobs");
+    fs::create_dir_all(&jobs_dir).expect("création du répertoire de Jobs");
+    let job = serde_json::json!({
+        "job_id": job_id,
+        "state": "queued",
+        "source": source,
+        "policy": {
+            "id": "safe-local",
+            "version": 1,
+            "sha256": "test-policy",
+            "snapshot": {
+                "duplicate_mode": "reuse",
+                "limits": {
+                    "max_depth": 2,
+                    "max_sources": 50,
+                    "max_download_bytes": 2_147_483_648_u64,
+                    "max_disk_bytes": 10_737_418_240_u64,
+                    "max_duration_secs": 2,
+                    "max_concurrency": 2
+                },
+                "allows_remote_calls": false,
+                "allowed_providers": ["ffmpeg", "ffprobe", "whisper-cli"]
+            }
+        },
+        "created_at": created_at,
+        "updated_at": created_at,
+        "worker_pid": null,
+        "capture_id": null,
+        "error": null
+    });
+    fs::write(
+        jobs_dir.join(format!("{job_id}.json")),
+        serde_json::to_vec(&job).expect("sérialisation du Job de test"),
+    )
+    .expect("écriture du Job de test");
+
+    let started = Instant::now();
+    env.command()
+        .args(["capture-worker", "--job-id", job_id])
+        .assert()
+        .success();
+
+    let finished: Value = serde_json::from_slice(
+        &fs::read(jobs_dir.join(format!("{job_id}.json"))).expect("lecture du Job terminé"),
+    )
+    .expect("Job JSON valide");
+    assert!(started.elapsed() < Duration::from_secs(5));
+    assert_eq!(finished["state"], "partial");
+    assert!(audio_started.exists());
+    assert!(!frames_started.exists());
+    let capture_id = finished["capture_id"]
+        .as_str()
+        .expect("la Capture partielle est publiée");
+    let capture: Value = serde_json::from_slice(
+        &env.command()
+            .args(["capture", "inspect", capture_id])
+            .assert()
+            .success()
+            .get_output()
+            .stdout,
+    )
+    .expect("Capture JSON valide");
+    assert!(
+        capture["manifest"]["capabilities"]
+            .as_array()
+            .is_some_and(|capabilities| capabilities.iter().any(|capability| {
+                capability["name"] == "audio-extraction"
+                    && capability["state"] == "failed"
+                    && capability["error"]["message"]
+                        .as_str()
+                        .is_some_and(|message| message.contains("duration budget"))
+            }))
     );
 }
 

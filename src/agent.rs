@@ -14,6 +14,7 @@ use serde_json::{Value, json};
 use sha2::{Digest, Sha256};
 
 use crate::config::Config;
+use crate::resource::CaptureBudget;
 use crate::unique_id::unique_id;
 use crate::{audio, frames, transcribe};
 
@@ -459,17 +460,32 @@ fn capture_local_media(job: &Job, proof_path: &Path, staging: &Path, manifest: &
         record_media_setup_failure(manifest, &error);
         return;
     }
-    if let Err(error) = capture_transcription(proof_path, staging, manifest, &work_dir, &config) {
-        let _ = fs::remove_file(staging.join("extractions").join("transcription.txt"));
+    let budget = CaptureBudget::new(
+        staging,
+        job.created_at,
+        job.policy.snapshot.limits.duration_limit_secs,
+        job.policy.snapshot.limits.disk_byte_limit,
+    );
+    if let Err(error) =
+        capture_transcription(proof_path, staging, manifest, &work_dir, &config, &budget)
+    {
+        cleanup_media_extraction(staging, "transcription", manifest);
         record_capability_failure(manifest, "transcription", &error);
     }
-    enforce_media_limits(job, staging, manifest, "transcription");
-    if let Err(error) = capture_frames(proof_path, staging, manifest, &work_dir, &config) {
-        let _ = fs::remove_dir_all(staging.join("extractions").join("frames"));
+    if !enforce_media_limits(job, staging, manifest, "transcription") {
+        cleanup_work_dir(&work_dir, manifest);
+        return;
+    }
+    if let Err(error) = capture_frames(proof_path, staging, manifest, &work_dir, &config, &budget) {
+        cleanup_media_extraction(staging, "frames", manifest);
         record_capability_failure(manifest, "frames", &error);
     }
     enforce_media_limits(job, staging, manifest, "frames");
-    if let Err(error) = fs::remove_dir_all(&work_dir)
+    cleanup_work_dir(&work_dir, manifest);
+}
+
+fn cleanup_work_dir(work_dir: &Path, manifest: &mut Manifest) {
+    if let Err(error) = fs::remove_dir_all(work_dir)
         .with_context(|| format!("removing media work directory {}", work_dir.display()))
     {
         manifest.capabilities.push(failed_capability(
@@ -480,12 +496,39 @@ fn capture_local_media(job: &Job, proof_path: &Path, staging: &Path, manifest: &
     }
 }
 
+fn cleanup_media_extraction(staging: &Path, capability: &str, manifest: &mut Manifest) {
+    let path = if capability == "frames" {
+        staging.join("extractions").join("frames")
+    } else {
+        staging.join("extractions").join("transcription.txt")
+    };
+    let result = if capability == "frames" {
+        fs::remove_dir_all(&path)
+    } else {
+        fs::remove_file(&path)
+    };
+    match result {
+        Ok(()) => {}
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+        Err(error) => {
+            let error = anyhow::Error::from(error)
+                .context(format!("discarding invalid {capability} Extraction"));
+            manifest.capabilities.push(failed_capability(
+                &format!("{capability}-cleanup"),
+                unresolved_provider("filesystem"),
+                &error,
+            ));
+        }
+    }
+}
+
 fn capture_transcription(
     proof_path: &Path,
     staging: &Path,
     manifest: &mut Manifest,
     work_dir: &Path,
     config: &Config,
+    budget: &CaptureBudget<'_>,
 ) -> Result<()> {
     let audio_path = work_dir.join("audio.wav");
     let audio_parameters = json!({
@@ -509,7 +552,7 @@ fn capture_transcription(
             return Ok(());
         }
     };
-    match audio::extract_audio(proof_path, &audio_path) {
+    match audio::extract_audio_limited(proof_path, &audio_path, budget) {
         Ok(()) => {
             manifest.capabilities.push(Capability {
                 name: "audio-extraction".to_string(),
@@ -530,12 +573,13 @@ fn capture_transcription(
                     return Ok(());
                 }
             };
-            match transcribe::transcribe(
+            match transcribe::transcribe_limited(
                 &config.model_path(),
                 &audio_path,
                 &config.language,
                 u32::try_from(config.threads).context("converting transcription thread count")?,
                 &work_dir.join("transcription"),
+                budget,
             ) {
                 Ok(transcription_path) => {
                     let destination = staging.join("extractions").join("transcription.txt");
@@ -584,6 +628,7 @@ fn capture_frames(
     manifest: &mut Manifest,
     work_dir: &Path,
     config: &Config,
+    budget: &CaptureBudget<'_>,
 ) -> Result<()> {
     let frames_dir = work_dir.join("frames");
     let frames_provider = match provider(
@@ -610,7 +655,7 @@ fn capture_frames(
         scene_threshold: config.frame_scene_threshold,
         dedup_window_secs: config.frame_dedup_window_secs,
     };
-    match frames::extract_frames(proof_path, work_dir, &frames_dir, frame_params) {
+    match frames::extract_frames_limited(proof_path, work_dir, &frames_dir, frame_params, budget) {
         Ok(frame_count) => {
             let destination = staging.join("extractions").join("frames");
             if frame_count > 0 {
@@ -727,7 +772,12 @@ fn record_capability_failure(manifest: &mut Manifest, name: &str, error: &anyhow
     }
 }
 
-fn enforce_media_limits(job: &Job, staging: &Path, manifest: &mut Manifest, capability: &str) {
+fn enforce_media_limits(
+    job: &Job,
+    staging: &Path,
+    manifest: &mut Manifest,
+    capability: &str,
+) -> bool {
     let result = if now_secs().saturating_sub(job.created_at)
         > job.policy.snapshot.limits.duration_limit_secs
     {
@@ -751,18 +801,11 @@ fn enforce_media_limits(job: &Job, staging: &Path, manifest: &mut Manifest, capa
             };
             !affected
         });
-        let path = if capability == "frames" {
-            staging.join("extractions").join("frames")
-        } else {
-            staging.join("extractions").join("transcription.txt")
-        };
-        let _ = if capability == "frames" {
-            fs::remove_dir_all(path)
-        } else {
-            fs::remove_file(path)
-        };
+        cleanup_media_extraction(staging, capability, manifest);
         record_capability_failure(manifest, capability, &error);
+        return false;
     }
+    true
 }
 
 fn directory_size(path: &Path) -> Result<u64> {

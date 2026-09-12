@@ -15,6 +15,7 @@ use std::process::Command;
 use anyhow::{Context, Result, bail};
 
 use crate::binary::ensure_present_in;
+use crate::resource::CaptureBudget;
 
 /// Paramètres pilotant l'extraction de Frames, résolus depuis la configuration.
 #[derive(Debug, Clone, Copy)]
@@ -59,6 +60,17 @@ pub fn extract_frames(
     extract_frames_with_path(input, tmp_dir, frames_dir, params, &path_env)
 }
 
+pub fn extract_frames_limited(
+    input: &Path,
+    tmp_dir: &Path,
+    frames_dir: &Path,
+    params: FrameExtractionParams,
+    budget: &CaptureBudget<'_>,
+) -> Result<usize> {
+    let path_env = env::var_os("PATH").unwrap_or_default();
+    extract_frames_with_budget(input, tmp_dir, frames_dir, params, &path_env, Some(budget))
+}
+
 fn extract_frames_with_path(
     input: &Path,
     tmp_dir: &Path,
@@ -66,10 +78,21 @@ fn extract_frames_with_path(
     params: FrameExtractionParams,
     path_env: &OsStr,
 ) -> Result<usize> {
+    extract_frames_with_budget(input, tmp_dir, frames_dir, params, path_env, None)
+}
+
+fn extract_frames_with_budget(
+    input: &Path,
+    tmp_dir: &Path,
+    frames_dir: &Path,
+    params: FrameExtractionParams,
+    path_env: &OsStr,
+    budget: Option<&CaptureBudget<'_>>,
+) -> Result<usize> {
     ensure_present_in("ffmpeg", path_env)?;
     ensure_present_in("ffprobe", path_env)?;
 
-    if !has_video_stream(input, path_env)? {
+    if !has_video_stream(input, path_env, budget)? {
         return Ok(0);
     }
 
@@ -79,6 +102,7 @@ fn extract_frames_with_path(
         &tmp_dir.join("frames-interval"),
         &interval_filter,
         path_env,
+        budget,
     )
     .context("failed to extract fixed-interval Frames")?;
 
@@ -88,6 +112,7 @@ fn extract_frames_with_path(
         &tmp_dir.join("frames-scene"),
         &scene_filter,
         path_env,
+        budget,
     )
     .context("failed to extract scene-change Frames")?;
 
@@ -97,18 +122,23 @@ fn extract_frames_with_path(
         frames_dir,
         params.dedup_window_secs,
         path_env,
+        budget,
     )
 }
 
 /// Indique si `input` contient au moins un flux vidéo, via `ffprobe`.
-fn has_video_stream(input: &Path, path_env: &OsStr) -> Result<bool> {
-    let output = Command::new("ffprobe")
+fn has_video_stream(
+    input: &Path,
+    path_env: &OsStr,
+    budget: Option<&CaptureBudget<'_>>,
+) -> Result<bool> {
+    let mut command = Command::new("ffprobe");
+    command
         .env("PATH", path_env)
         .args(["-v", "error", "-select_streams", "v"])
         .args(["-show_entries", "stream=index", "-of", "csv=p=0"])
-        .arg(input)
-        .output()
-        .context("failed to launch `ffprobe`")?;
+        .arg(input);
+    let output = run_output(&mut command, budget).context("failed to launch `ffprobe`")?;
 
     if !output.status.success() {
         bail!(
@@ -130,12 +160,14 @@ fn run_extraction_pass(
     dest_dir: &Path,
     filter: &str,
     path_env: &OsStr,
+    budget: Option<&CaptureBudget<'_>>,
 ) -> Result<Vec<ExtractedFrame>> {
     fs::create_dir_all(dest_dir)
         .with_context(|| format!("creating temporary directory {}", dest_dir.display()))?;
 
     let pattern = dest_dir.join("frame-%06d.jpg");
-    let output = Command::new("ffmpeg")
+    let mut command = Command::new("ffmpeg");
+    command
         .env("PATH", path_env)
         .arg("-y")
         .arg("-i")
@@ -152,9 +184,8 @@ fn run_extraction_pass(
         // full-range) rend la négociation indépendante du contenu de la
         // Source.
         .args(["-pix_fmt", "yuvj420p"])
-        .arg(&pattern)
-        .output()
-        .context("failed to launch `ffmpeg`")?;
+        .arg(&pattern);
+    let output = run_output(&mut command, budget).context("failed to launch `ffmpeg`")?;
 
     if !output.status.success() {
         bail!(
@@ -232,6 +263,7 @@ fn merge_and_write(
     frames_dir: &Path,
     dedup_window_secs: u32,
     path_env: &OsStr,
+    budget: Option<&CaptureBudget<'_>>,
 ) -> Result<usize> {
     let dedup_window = f64::from(dedup_window_secs);
 
@@ -248,7 +280,7 @@ fn merge_and_write(
 
     let mut retained = Vec::with_capacity(kept.len());
     for frame in kept {
-        if !is_near_uniform_color(&frame.path, path_env)? {
+        if !is_near_uniform_color(&frame.path, path_env, budget)? {
             retained.push(frame);
         }
     }
@@ -281,16 +313,20 @@ const UNIFORM_LUMA_RANGE_MAX: i32 = 120;
 /// Indique si la Frame à `path` est de couleur quasi unie, via le filtre
 /// `signalstats` de `ffmpeg` (écart de luminance de l'image entière contre
 /// [`UNIFORM_LUMA_RANGE_MAX`]).
-fn is_near_uniform_color(path: &Path, path_env: &OsStr) -> Result<bool> {
-    let output = Command::new("ffmpeg")
+fn is_near_uniform_color(
+    path: &Path,
+    path_env: &OsStr,
+    budget: Option<&CaptureBudget<'_>>,
+) -> Result<bool> {
+    let mut command = Command::new("ffmpeg");
+    command
         .env("PATH", path_env)
         .arg("-i")
         .arg(path)
         .args(["-vf", "signalstats,metadata=print"])
         .args(["-f", "null"])
-        .arg("-")
-        .output()
-        .context("failed to launch `ffmpeg`")?;
+        .arg("-");
+    let output = run_output(&mut command, budget).context("failed to launch `ffmpeg`")?;
 
     if !output.status.success() {
         bail!(
@@ -313,6 +349,16 @@ fn is_near_uniform_color(path: &Path, path_env: &OsStr) -> Result<bool> {
     };
 
     Ok(ymax.saturating_sub(ymin) < UNIFORM_LUMA_RANGE_MAX)
+}
+
+fn run_output(
+    command: &mut Command,
+    budget: Option<&CaptureBudget<'_>>,
+) -> Result<std::process::Output> {
+    match budget {
+        Some(budget) => budget.output(command),
+        None => command.output().context("launching Provider"),
+    }
 }
 
 /// Extrait la valeur entière d'une clé `lavfi.signalstats.<key>=<valeur>`
@@ -640,10 +686,12 @@ exit 1
         // `frame-000002` déclenche la branche "uniforme" (YMIN=4, YMAX=50,
         // écart 46) du fake ; tout autre chemin déclenche la branche
         // "normale" (écart 255). Calibré sur une vraie Frame de fondu.
-        let uniform = is_near_uniform_color(Path::new("frame-000002.jpg"), bin_dir.as_os_str())
-            .expect("checking uniformity should succeed");
-        let normal = is_near_uniform_color(Path::new("frame-000001.jpg"), bin_dir.as_os_str())
-            .expect("checking uniformity should succeed");
+        let uniform =
+            is_near_uniform_color(Path::new("frame-000002.jpg"), bin_dir.as_os_str(), None)
+                .expect("checking uniformity should succeed");
+        let normal =
+            is_near_uniform_color(Path::new("frame-000001.jpg"), bin_dir.as_os_str(), None)
+                .expect("checking uniformity should succeed");
 
         assert!(uniform, "narrow luma range should be flagged as uniform");
         assert!(!normal, "wide luma range should not be flagged as uniform");

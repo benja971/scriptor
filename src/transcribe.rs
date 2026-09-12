@@ -6,6 +6,7 @@ use std::process::Command;
 use anyhow::{Context, Result, bail};
 
 use crate::binary::ensure_present_in;
+use crate::resource::CaptureBudget;
 
 /// Transcrit `audio_wav` avec `whisper-cli`, en utilisant le modèle situé à
 /// `model_path`, la langue `language` et `threads` threads. Écrit le
@@ -33,6 +34,45 @@ pub fn transcribe(
         output_basename,
         &path_env,
     )
+}
+
+pub fn transcribe_limited(
+    model_path: &Path,
+    audio_wav: &Path,
+    language: &str,
+    threads: u32,
+    output_basename: &Path,
+    budget: &CaptureBudget<'_>,
+) -> Result<PathBuf> {
+    let path_env = env::var_os("PATH").unwrap_or_default();
+    ensure_present_in("whisper-cli", &path_env)?;
+    let mut command = Command::new("whisper-cli");
+    command
+        .env("PATH", path_env)
+        .arg("-m")
+        .arg(model_path)
+        .arg("-f")
+        .arg(audio_wav)
+        .arg("-t")
+        .arg(threads.to_string())
+        .arg("-l")
+        .arg(language)
+        .arg("-otxt")
+        .arg("-of")
+        .arg(output_basename)
+        .args(["-np", "-nt"]);
+    let output = budget
+        .output(&mut command)
+        .context("failed to launch `whisper-cli`")?;
+    if !output.status.success() {
+        bail!(
+            "`whisper-cli` failed (exit code {:?})\nstdout:\n{}\nstderr:\n{}",
+            output.status.code(),
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr),
+        );
+    }
+    Ok(output_basename.with_extension("txt"))
 }
 
 fn transcribe_with_path(
