@@ -8,7 +8,7 @@
 use std::env;
 use std::ffi::OsStr;
 use std::fs;
-use std::io;
+use std::io::{self, Read, Write};
 use std::path::{Path, PathBuf};
 use std::process::Command;
 
@@ -298,12 +298,69 @@ fn merge_and_write(
         check_budget(budget)?;
         let sequence = index.checked_add(1).context("too many Frames to number")?;
         let filename = format!("frame-{sequence:04}-{:.3}s.jpg", frame.timestamp_secs);
-        fs::copy(&frame.path, frames_dir.join(filename))
+        copy_frame_limited(&frame.path, &frames_dir.join(filename), budget)
             .with_context(|| format!("writing Frame to {}", frames_dir.display()))?;
         check_budget(budget)?;
     }
 
     Ok(retained.len())
+}
+
+fn copy_frame_limited(
+    source: &Path,
+    destination: &Path,
+    budget: Option<&CaptureBudget<'_>>,
+) -> Result<()> {
+    let mut input =
+        fs::File::open(source).with_context(|| format!("opening {}", source.display()))?;
+    if input
+        .metadata()
+        .with_context(|| format!("reading {} metadata", source.display()))?
+        .len()
+        == 0
+    {
+        if let Some(budget) = budget {
+            budget.check_disk_capacity(0)?;
+        }
+        fs::File::create(destination)
+            .with_context(|| format!("creating {}", destination.display()))?;
+        return check_budget(budget);
+    }
+    let mut output = None;
+    let mut buffer = [0_u8; 8192];
+
+    loop {
+        check_budget(budget)?;
+        let read = input
+            .read(&mut buffer)
+            .with_context(|| format!("reading {}", source.display()))?;
+        if read == 0 {
+            break;
+        }
+        if let Some(budget) = budget {
+            budget
+                .check_disk_capacity(u64::try_from(read).context("converting Frame copy size")?)?;
+        }
+        let output = if let Some(output) = output.as_mut() {
+            output
+        } else {
+            output = Some(
+                fs::File::create(destination)
+                    .with_context(|| format!("creating {}", destination.display()))?,
+            );
+            output.as_mut().context("opening Frame destination")?
+        };
+        output
+            .write_all(buffer.get(..read).context("reading Frame copy buffer")?)
+            .with_context(|| format!("writing {}", destination.display()))?;
+    }
+
+    if let Some(output) = output {
+        output
+            .sync_all()
+            .with_context(|| format!("syncing {}", destination.display()))?;
+    }
+    check_budget(budget)
 }
 
 /// Écart de luminance (`YMAX - YMIN`, sur une échelle 0-255) en-deçà duquel
@@ -396,11 +453,13 @@ mod tests {
     use std::os::unix::fs::PermissionsExt;
     use std::path::{Path, PathBuf};
     use std::sync::atomic::{AtomicU64, Ordering};
+    use std::time::{SystemTime, UNIX_EPOCH};
 
     use super::{
-        FrameExtractionParams, extract_frames_with_path, is_near_uniform_color,
-        parse_showinfo_timestamps, parse_signalstat,
+        ExtractedFrame, FrameExtractionParams, extract_frames_with_path, is_near_uniform_color,
+        merge_and_write, parse_showinfo_timestamps, parse_signalstat,
     };
+    use crate::resource::CaptureBudget;
 
     static COUNTER: AtomicU64 = AtomicU64::new(0);
 
@@ -744,6 +803,51 @@ exit 1
                 .contains("0.000s"),
             "only the non-uniform Frame at 0.0s should survive"
         );
+
+        let _ = fs::remove_dir_all(&bin_dir);
+        let _ = fs::remove_dir_all(&work_dir);
+    }
+
+    #[test]
+    fn frame_copy_does_not_exceed_disk_budget() {
+        let bin_dir = unique_temp_dir("bin-frame-copy-budget");
+        write_script(&bin_dir, "ffmpeg", FAKE_FFMPEG_UNIFORM_CHECK);
+
+        let work_dir = unique_temp_dir("work-frame-copy-budget");
+        let source = work_dir.join("retained-frame.jpg");
+        fs::write(&source, vec![0_u8; 8193]).expect("writing retained Frame");
+        let disk_limit = fs::metadata(&source)
+            .expect("reading retained Frame metadata")
+            .len();
+        let created_at = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .expect("reading current time")
+            .as_secs();
+        let budget = CaptureBudget::new(&work_dir, created_at, 60, disk_limit);
+        let frames_dir = work_dir.join("frames");
+        let interval = [ExtractedFrame {
+            path: source,
+            timestamp_secs: 0.0,
+        }];
+
+        let err = merge_and_write(
+            &interval,
+            &[],
+            &frames_dir,
+            3,
+            bin_dir.as_os_str(),
+            Some(&budget),
+        )
+        .expect_err("copying a retained Frame must respect the disk budget");
+
+        assert!(format!("{err:#}").contains("disk budget"));
+        assert!(
+            !frames_dir.join("frame-0001-0.000s.jpg").exists(),
+            "the over-budget Frame must not be created"
+        );
+        budget
+            .check()
+            .expect("the failed copy must leave Capture within its disk budget");
 
         let _ = fs::remove_dir_all(&bin_dir);
         let _ = fs::remove_dir_all(&work_dir);

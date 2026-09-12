@@ -46,6 +46,18 @@ impl<'a> CaptureBudget<'a> {
         Ok(())
     }
 
+    pub fn check_disk_capacity(&self, additional_bytes: u64) -> Result<()> {
+        self.check()?;
+        let used_bytes = directory_size(self.root)?;
+        let total_bytes = used_bytes
+            .checked_add(additional_bytes)
+            .context("summing Capture disk usage")?;
+        if total_bytes > self.disk_byte_limit {
+            bail!("Capture exceeds safe-local@1 disk budget");
+        }
+        Ok(())
+    }
+
     pub fn output(&self, command: &mut Command) -> Result<Output> {
         self.check()?;
         command
