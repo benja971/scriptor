@@ -460,7 +460,15 @@ fn capture_local_media(proof_path: &Path, staging: &Path, manifest: &mut Manifes
     if let Err(error) = capture_frames(proof_path, staging, manifest, &work_dir, &config) {
         record_capability_failure(manifest, "frames", &error);
     }
-    let _ = fs::remove_dir_all(&work_dir);
+    if let Err(error) = fs::remove_dir_all(&work_dir)
+        .with_context(|| format!("removing media work directory {}", work_dir.display()))
+    {
+        manifest.capabilities.push(failed_capability(
+            "media-work-cleanup",
+            unresolved_provider("filesystem"),
+            &error,
+        ));
+    }
 }
 
 fn capture_transcription(
@@ -476,7 +484,6 @@ fn capture_transcription(
         "sample_rate_hz": 16_000,
         "channels": 1,
     });
-    let transcription_parameters = transcription_parameters(config);
     let audio_provider = match provider("ffmpeg", audio_parameters, &[]) {
         Ok(provider) => provider,
         Err(error) => {
@@ -493,28 +500,27 @@ fn capture_transcription(
             return Ok(());
         }
     };
-    let transcription_provider = match transcription_parameters
-        .and_then(|parameters| provider("whisper-cli", parameters, &[]))
-    {
-        Ok(provider) => provider,
-        Err(error) => {
-            manifest.capabilities.push(failed_capability(
-                "transcription",
-                unresolved_provider("whisper-cli"),
-                &error,
-            ));
-            return Ok(());
-        }
-    };
-
     match audio::extract_audio(proof_path, &audio_path) {
         Ok(()) => {
             manifest.capabilities.push(Capability {
                 name: "audio-extraction".to_string(),
                 state: "succeeded".to_string(),
-                provider: audio_provider,
+                provider: audio_provider.clone(),
                 error: None,
             });
+            let transcription_provider = match transcription_parameters(config, &audio_provider)
+                .and_then(|parameters| provider("whisper-cli", parameters, &[]))
+            {
+                Ok(provider) => provider,
+                Err(error) => {
+                    manifest.capabilities.push(failed_capability(
+                        "transcription",
+                        unresolved_provider("whisper-cli"),
+                        &error,
+                    ));
+                    return Ok(());
+                }
+            };
             match transcribe::transcribe(
                 &config.model_path(),
                 &audio_path,
@@ -555,7 +561,7 @@ fn capture_transcription(
             ));
             manifest.capabilities.push(blocked_capability(
                 "transcription",
-                transcription_provider,
+                unresolved_provider("whisper-cli"),
                 &error,
             ));
         }
@@ -769,7 +775,7 @@ fn media_mime(source: &Path) -> &'static str {
     }
 }
 
-fn transcription_parameters(config: &Config) -> Result<Value> {
+fn transcription_parameters(config: &Config, audio_provider: &Provider) -> Result<Value> {
     let model_path = config.model_path();
     Ok(json!({
         "language": config.language,
@@ -777,6 +783,10 @@ fn transcription_parameters(config: &Config) -> Result<Value> {
         "model": {
             "path": model_path,
             "sha256": sha256_file(&model_path)?,
+        },
+        "input": {
+            "proof_artifact_id": "proof-source",
+            "audio_extraction_provider": audio_provider,
         },
     }))
 }
