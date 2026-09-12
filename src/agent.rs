@@ -377,9 +377,21 @@ fn publish_web_capture(job: &Job) -> Result<Publication> {
         .with_context(|| format!("creating Capture staging directory {}", staging.display()))?;
     fs::create_dir_all(staging.join("proofs")).context("creating Web Proof directory")?;
     fs::create_dir_all(staging.join("extractions")).context("creating Web Extraction directory")?;
-    let provenance = crate::web::capture(&job.source, &staging)?;
-    if now_secs().saturating_sub(job.created_at) > job.policy.snapshot.limits.duration_limit_secs {
-        bail!("Capture exceeds safe-web@1 duration budget");
+    let deadline = UNIX_EPOCH
+        .checked_add(Duration::from_secs(
+            job.created_at
+                .saturating_add(job.policy.snapshot.limits.duration_limit_secs),
+        ))
+        .context("calculating safe-web Policy deadline")?;
+    let provenance = crate::web::capture(
+        &job.source,
+        &staging,
+        deadline,
+        job.policy.snapshot.limits.disk_byte_limit,
+        job.policy.snapshot.limits.download_byte_limit,
+    )?;
+    if directory_size(&staging)? > job.policy.snapshot.limits.disk_byte_limit {
+        bail!("Capture exceeds safe-web@1 disk budget");
     }
     if read_job(&job.id)?.state == "cancelled" {
         fs::remove_dir_all(&staging).context("discarding cancelled Capture staging directory")?;
@@ -425,6 +437,26 @@ fn publish_web_capture(job: &Job) -> Result<Publication> {
     )?;
     fs::rename(&staging, &final_dir).with_context(|| format!("publishing Capture {capture_id}"))?;
     Ok(Publication::Published(capture_id))
+}
+
+fn directory_size(path: &Path) -> Result<u64> {
+    let mut total = 0_u64;
+    for entry in fs::read_dir(path)
+        .with_context(|| format!("reading Capture directory {}", path.display()))?
+    {
+        let entry = entry.context("reading Capture entry")?;
+        let metadata = entry.metadata().context("reading Capture entry metadata")?;
+        if metadata.is_dir() {
+            total = total
+                .checked_add(directory_size(&entry.path())?)
+                .context("summing Capture directory size")?;
+        } else if metadata.is_file() {
+            total = total
+                .checked_add(metadata.len())
+                .context("summing Capture file size")?;
+        }
+    }
+    Ok(total)
 }
 
 fn proof_for(staging: &Path, artifact_id: &str, path: &str, mime: &str) -> Result<Proof> {

@@ -1,7 +1,9 @@
 use std::fs;
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, ToSocketAddrs};
 use std::path::Path;
-use std::process::Command;
+use std::process::{Command, Stdio};
+use std::thread;
+use std::time::{Duration, SystemTime};
 
 use anyhow::{Context, Result, bail};
 use serde::Deserialize;
@@ -12,15 +14,54 @@ pub struct Provenance {
     pub final_url: String,
 }
 
-pub fn capture(url: &str, staging: &Path) -> Result<Provenance> {
+pub fn capture(
+    url: &str,
+    staging: &Path,
+    deadline: SystemTime,
+    disk_byte_limit: u64,
+    download_byte_limit: u64,
+) -> Result<Provenance> {
     validate_public_url(url)?;
-    let output = Command::new("scriptor-page-renderer")
+    let mut child = Command::new("scriptor-page-renderer")
         .arg("--url")
         .arg(url)
         .arg("--output-dir")
         .arg(staging)
-        .output()
+        .arg("--max-output-bytes")
+        .arg(disk_byte_limit.to_string())
+        .arg("--max-download-bytes")
+        .arg(download_byte_limit.to_string())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
         .context("launching Playwright page renderer")?;
+    loop {
+        if SystemTime::now() >= deadline {
+            child
+                .kill()
+                .context("stopping page renderer at Policy deadline")?;
+            let _ = child.wait();
+            bail!("Capture exceeds safe-web@1 duration budget");
+        }
+        if directory_size(staging)? > disk_byte_limit {
+            child
+                .kill()
+                .context("stopping page renderer at disk budget")?;
+            let _ = child.wait();
+            bail!("Capture exceeds safe-web@1 disk budget");
+        }
+        if child
+            .try_wait()
+            .context("checking page renderer status")?
+            .is_some()
+        {
+            break;
+        }
+        thread::sleep(Duration::from_millis(20));
+    }
+    let output = child
+        .wait_with_output()
+        .context("collecting page renderer output")?;
     if !output.status.success() {
         bail!(
             "page renderer failed (exit code {:?}): {}",
@@ -44,6 +85,26 @@ pub fn capture(url: &str, staging: &Path) -> Result<Provenance> {
         }
     }
     Ok(provenance)
+}
+
+fn directory_size(path: &Path) -> Result<u64> {
+    let mut total = 0_u64;
+    for entry in fs::read_dir(path)
+        .with_context(|| format!("reading staging directory {}", path.display()))?
+    {
+        let entry = entry.context("reading staging entry")?;
+        let metadata = entry.metadata().context("reading staging entry metadata")?;
+        if metadata.is_dir() {
+            total = total
+                .checked_add(directory_size(&entry.path())?)
+                .context("summing staging directory size")?;
+        } else if metadata.is_file() {
+            total = total
+                .checked_add(metadata.len())
+                .context("summing staging file size")?;
+        }
+    }
+    Ok(total)
 }
 
 pub fn validate_public_url(value: &str) -> Result<()> {
