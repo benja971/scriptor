@@ -16,7 +16,7 @@ use sha2::{Digest, Sha256};
 use url::Url;
 
 use crate::config::Config;
-use crate::resource::CaptureBudget;
+use crate::resource::ResourceBudget;
 use crate::unique_id::unique_id;
 use crate::{audio, frames, transcribe};
 
@@ -1523,7 +1523,10 @@ impl Acquisition for RemoteBinaryAcquisition<'_> {
 }
 
 impl LocalAcquisition<'_> {
-    fn cancelled<T>(budget: &CaptureBudget<'_>, result: Result<T>) -> Result<AcquisitionResult<T>> {
+    fn cancelled<T>(
+        budget: &ResourceBudget<'_>,
+        result: Result<T>,
+    ) -> Result<AcquisitionResult<T>> {
         match result {
             Ok(value) => Ok(AcquisitionResult::Ready(value)),
             Err(_error) if budget.is_cancelled()? => Ok(AcquisitionResult::Cancelled),
@@ -1543,7 +1546,7 @@ impl Acquisition for LocalAcquisition<'_> {
             bail!("local Source exceeds safe-local@1 disk budget");
         }
         let is_cancelled = || Ok(read_job(&self.job.id)?.state == "cancelled");
-        let budget = CaptureBudget::new(
+        let budget = ResourceBudget::new(
             staging,
             self.job.created_at,
             self.job.policy.snapshot.limits.duration_limit_secs,
@@ -1565,7 +1568,7 @@ impl Acquisition for LocalAcquisition<'_> {
             )
         })?;
         let is_cancelled = || Ok(read_job(&self.job.id)?.state == "cancelled");
-        let budget = CaptureBudget::new(
+        let budget = ResourceBudget::new(
             capture.staging(),
             self.job.created_at,
             self.job.policy.snapshot.limits.duration_limit_secs,
@@ -1676,7 +1679,7 @@ fn capture_local_document(
     proof_path: &Path,
     staging: &Path,
     manifest: &mut Manifest,
-    budget: &CaptureBudget<'_>,
+    budget: &ResourceBudget<'_>,
 ) {
     let result = match mime_for_source(Path::new(&job.source)) {
         "application/pdf" => extract_pdf_document(job, proof_path, staging, manifest, budget),
@@ -1721,7 +1724,7 @@ fn extract_pdf_document(
     proof_path: &Path,
     staging: &Path,
     manifest: &mut Manifest,
-    budget: &CaptureBudget<'_>,
+    budget: &ResourceBudget<'_>,
 ) -> std::result::Result<(), DocumentFailure> {
     const CAPABILITY: &str = "pdf-text-extraction";
     if !policy_allows(&job.policy, "pdftotext") {
@@ -1830,7 +1833,7 @@ fn extract_image_document(
     proof_path: &Path,
     staging: &Path,
     manifest: &mut Manifest,
-    budget: &CaptureBudget<'_>,
+    budget: &ResourceBudget<'_>,
 ) -> std::result::Result<(), DocumentFailure> {
     const CAPABILITY: &str = "image-ocr";
     if !policy_allows(&job.policy, "tesseract") {
@@ -1907,12 +1910,12 @@ fn extract_image_document(
 fn document_provider(
     name: &str,
     parameters: Value,
-    budget: &CaptureBudget<'_>,
+    budget: &ResourceBudget<'_>,
 ) -> Result<Provider> {
     provider(name, parameters, &[], budget)
 }
 
-fn pdf_page_count(proof_path: &Path, budget: &CaptureBudget<'_>) -> Result<u32> {
+fn pdf_page_count(proof_path: &Path, budget: &ResourceBudget<'_>) -> Result<u32> {
     let mut command = Command::new("pdfinfo");
     command.arg(proof_path);
     let output = budget.output(&mut command)?;
@@ -1966,7 +1969,7 @@ fn document_extraction(
     locator: Locator,
     locator_provider: Option<Provider>,
     provider: Provider,
-    budget: &CaptureBudget<'_>,
+    budget: &ResourceBudget<'_>,
 ) -> Result<Extraction> {
     Ok(Extraction {
         artifact_id: artifact_id.to_string(),
@@ -2005,7 +2008,7 @@ fn capture_local_media(
     proof_path: &Path,
     staging: &Path,
     manifest: &mut Manifest,
-    budget: &CaptureBudget<'_>,
+    budget: &ResourceBudget<'_>,
 ) {
     let config = match Config::load().context("loading configuration for local media Capture") {
         Ok(config) => config,
@@ -2114,7 +2117,7 @@ fn capture_transcription(
     manifest: &mut Manifest,
     work_dir: &Path,
     config: &Config,
-    budget: &CaptureBudget<'_>,
+    budget: &ResourceBudget<'_>,
     transcription_allowed: bool,
 ) -> Result<()> {
     let audio_path = work_dir.join("audio.wav");
@@ -2188,7 +2191,7 @@ fn capture_transcription_text(
     audio_path: &Path,
     work_dir: &Path,
     config: &Config,
-    budget: &CaptureBudget<'_>,
+    budget: &ResourceBudget<'_>,
     audio_provider: &Provider,
 ) -> Result<()> {
     let transcription_provider = match transcription_parameters(config, audio_provider, budget)
@@ -2246,7 +2249,7 @@ fn capture_frames(
     manifest: &mut Manifest,
     work_dir: &Path,
     config: &Config,
-    budget: &CaptureBudget<'_>,
+    budget: &ResourceBudget<'_>,
 ) -> Result<()> {
     let frames_dir = work_dir.join("frames");
     let frames_provider = match provider(
@@ -2404,7 +2407,7 @@ fn record_capability_failure(manifest: &mut Manifest, name: &str, error: &anyhow
 }
 
 fn enforce_media_limits(
-    budget: &CaptureBudget<'_>,
+    budget: &ResourceBudget<'_>,
     staging: &Path,
     manifest: &mut Manifest,
     capability: &str,
@@ -2432,7 +2435,7 @@ fn enforce_media_limits(
     true
 }
 
-fn copy_extraction(source: &Path, destination: &Path, budget: &CaptureBudget<'_>) -> Result<()> {
+fn copy_extraction(source: &Path, destination: &Path, budget: &ResourceBudget<'_>) -> Result<()> {
     let parent = destination
         .parent()
         .context("resolving Extraction directory")?;
@@ -2454,7 +2457,7 @@ fn extraction(
     file: &Path,
     locator: Option<Locator>,
     provider: Provider,
-    budget: &CaptureBudget<'_>,
+    budget: &ResourceBudget<'_>,
 ) -> Result<Extraction> {
     Ok(Extraction {
         artifact_id: artifact_id.to_string(),
@@ -2514,7 +2517,7 @@ fn media_mime(source: &Path) -> &'static str {
 fn transcription_parameters(
     config: &Config,
     audio_provider: &Provider,
-    budget: &CaptureBudget<'_>,
+    budget: &ResourceBudget<'_>,
 ) -> Result<Value> {
     let model_path = config.model_path();
     Ok(json!({
@@ -2535,7 +2538,7 @@ fn provider(
     name: &str,
     parameters: Value,
     dependencies: &[&str],
-    budget: &CaptureBudget<'_>,
+    budget: &ResourceBudget<'_>,
 ) -> Result<Provider> {
     let path = provider_path(name)?;
     let dependencies = dependencies
@@ -3588,7 +3591,7 @@ fn sha256_file(path: &Path) -> Result<String> {
     Ok(format!("{:x}", hash.finalize()))
 }
 
-fn sha256_file_limited(path: &Path, budget: &CaptureBudget<'_>) -> Result<String> {
+fn sha256_file_limited(path: &Path, budget: &ResourceBudget<'_>) -> Result<String> {
     let mut file = File::open(path).with_context(|| format!("opening {}", path.display()))?;
     let mut hash = Sha256::new();
     let mut buffer = [0_u8; 8192];
@@ -3606,7 +3609,7 @@ fn sha256_file_limited(path: &Path, budget: &CaptureBudget<'_>) -> Result<String
     Ok(format!("{:x}", hash.finalize()))
 }
 
-fn copy_file_limited(source: &Path, destination: &Path, budget: &CaptureBudget<'_>) -> Result<()> {
+fn copy_file_limited(source: &Path, destination: &Path, budget: &ResourceBudget<'_>) -> Result<()> {
     let mut input = File::open(source).with_context(|| format!("opening {}", source.display()))?;
     let mut output =
         File::create(destination).with_context(|| format!("creating {}", destination.display()))?;

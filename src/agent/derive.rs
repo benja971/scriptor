@@ -14,7 +14,7 @@ use super::{
     now_secs, provider_path, read_job, read_json, reference_for_artifact, sha256_file, unique_id,
     unlock_job, write_job, write_json,
 };
-use crate::resource::CaptureBudget as JobBudget;
+use crate::resource::ResourceBudget;
 
 #[derive(Debug, Deserialize, Serialize)]
 pub(super) struct Derivative {
@@ -331,7 +331,7 @@ fn invoke_provider(
     staging: &Path,
 ) -> Result<ProviderResponse> {
     let is_cancelled = || Ok(read_job(&job.id)?.state == "cancelled");
-    let budget = JobBudget::new(
+    let budget = ResourceBudget::new(
         staging,
         job.created_at,
         job.policy.snapshot.limits.duration_limit_secs,

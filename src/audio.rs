@@ -6,7 +6,7 @@ use std::process::Command;
 use anyhow::{Context, Result, bail};
 
 use crate::binary::ensure_present_in;
-use crate::resource::CaptureBudget;
+use crate::resource::ResourceBudget;
 
 /// Extrait la piste audio de `input` vers `output_wav`, au format PCM16 mono
 /// 16 kHz, via `ffmpeg`.
@@ -25,7 +25,7 @@ pub fn extract_audio(input: &Path, output_wav: &Path) -> Result<()> {
 pub fn extract_audio_limited(
     input: &Path,
     output_wav: &Path,
-    budget: &CaptureBudget<'_>,
+    budget: &ResourceBudget<'_>,
 ) -> Result<()> {
     let path_env = env::var_os("PATH").unwrap_or_default();
     ensure_present_in("ffmpeg", &path_env)?;

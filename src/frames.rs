@@ -15,7 +15,7 @@ use std::process::Command;
 use anyhow::{Context, Result, bail};
 
 use crate::binary::ensure_present_in;
-use crate::resource::CaptureBudget;
+use crate::resource::ResourceBudget;
 
 /// Paramètres pilotant l'extraction de Frames, résolus depuis la configuration.
 #[derive(Debug, Clone, Copy)]
@@ -65,7 +65,7 @@ pub fn extract_frames_limited(
     tmp_dir: &Path,
     frames_dir: &Path,
     params: FrameExtractionParams,
-    budget: &CaptureBudget<'_>,
+    budget: &ResourceBudget<'_>,
 ) -> Result<usize> {
     let path_env = env::var_os("PATH").unwrap_or_default();
     extract_frames_with_budget(input, tmp_dir, frames_dir, params, &path_env, Some(budget))
@@ -87,7 +87,7 @@ fn extract_frames_with_budget(
     frames_dir: &Path,
     params: FrameExtractionParams,
     path_env: &OsStr,
-    budget: Option<&CaptureBudget<'_>>,
+    budget: Option<&ResourceBudget<'_>>,
 ) -> Result<usize> {
     ensure_present_in("ffmpeg", path_env)?;
     ensure_present_in("ffprobe", path_env)?;
@@ -130,7 +130,7 @@ fn extract_frames_with_budget(
 fn has_video_stream(
     input: &Path,
     path_env: &OsStr,
-    budget: Option<&CaptureBudget<'_>>,
+    budget: Option<&ResourceBudget<'_>>,
 ) -> Result<bool> {
     let mut command = Command::new("ffprobe");
     command
@@ -160,7 +160,7 @@ fn run_extraction_pass(
     dest_dir: &Path,
     filter: &str,
     path_env: &OsStr,
-    budget: Option<&CaptureBudget<'_>>,
+    budget: Option<&ResourceBudget<'_>>,
 ) -> Result<Vec<ExtractedFrame>> {
     fs::create_dir_all(dest_dir)
         .with_context(|| format!("creating temporary directory {}", dest_dir.display()))?;
@@ -263,7 +263,7 @@ fn merge_and_write(
     frames_dir: &Path,
     dedup_window_secs: u32,
     path_env: &OsStr,
-    budget: Option<&CaptureBudget<'_>>,
+    budget: Option<&ResourceBudget<'_>>,
 ) -> Result<usize> {
     let dedup_window = f64::from(dedup_window_secs);
 
@@ -309,7 +309,7 @@ fn merge_and_write(
 fn copy_frame_limited(
     source: &Path,
     destination: &Path,
-    budget: Option<&CaptureBudget<'_>>,
+    budget: Option<&ResourceBudget<'_>>,
 ) -> Result<()> {
     let mut input =
         fs::File::open(source).with_context(|| format!("opening {}", source.display()))?;
@@ -377,7 +377,7 @@ const UNIFORM_LUMA_RANGE_MAX: i32 = 120;
 fn is_near_uniform_color(
     path: &Path,
     path_env: &OsStr,
-    budget: Option<&CaptureBudget<'_>>,
+    budget: Option<&ResourceBudget<'_>>,
 ) -> Result<bool> {
     let mut command = Command::new("ffmpeg");
     command
@@ -414,7 +414,7 @@ fn is_near_uniform_color(
 
 fn run_output(
     command: &mut Command,
-    budget: Option<&CaptureBudget<'_>>,
+    budget: Option<&ResourceBudget<'_>>,
 ) -> Result<std::process::Output> {
     match budget {
         Some(budget) => budget.output(command),
@@ -422,7 +422,7 @@ fn run_output(
     }
 }
 
-fn check_budget(budget: Option<&CaptureBudget<'_>>) -> Result<()> {
+fn check_budget(budget: Option<&ResourceBudget<'_>>) -> Result<()> {
     if let Some(budget) = budget {
         budget.check()?;
     }
@@ -459,7 +459,7 @@ mod tests {
         ExtractedFrame, FrameExtractionParams, extract_frames_with_path, is_near_uniform_color,
         merge_and_write, parse_showinfo_timestamps, parse_signalstat,
     };
-    use crate::resource::CaptureBudget;
+    use crate::resource::ResourceBudget;
 
     static COUNTER: AtomicU64 = AtomicU64::new(0);
 
@@ -823,7 +823,7 @@ exit 1
             .duration_since(UNIX_EPOCH)
             .expect("reading current time")
             .as_secs();
-        let budget = CaptureBudget::new(&work_dir, created_at, 60, disk_limit);
+        let budget = ResourceBudget::new(&work_dir, created_at, 60, disk_limit);
         let frames_dir = work_dir.join("frames");
         let interval = [ExtractedFrame {
             path: source,
