@@ -13,6 +13,8 @@ use nix::unistd::Pid;
 use serde::Deserialize;
 use url::Url;
 
+use crate::resource::directory_size;
+
 #[derive(Debug, Deserialize)]
 pub struct Provenance {
     pub final_url: String,
@@ -80,10 +82,14 @@ where
         .wait_with_output()
         .context("collecting page renderer output")?;
     if !output.status.success() {
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        if let Some(code) = renderer_error_code(&stderr) {
+            return Err(crate::agent::coded_error(code, stderr.trim()));
+        }
         bail!(
             "page renderer failed (exit code {:?}): {}",
             output.status.code(),
-            String::from_utf8_lossy(&output.stderr).trim()
+            stderr.trim()
         );
     }
     let provenance: Provenance = serde_json::from_slice(
@@ -104,32 +110,28 @@ where
     Ok(Capture::Completed(provenance))
 }
 
+fn renderer_error_code(stderr: &str) -> Option<&'static str> {
+    [
+        "web_download_budget_exceeded",
+        "web_disk_budget_exceeded",
+        "web_port_refused",
+        "web_private_target_refused",
+        "web_renderer_firefox_unavailable",
+        "web_renderer_unknown",
+        "web_url_credentials_refused",
+        "web_url_scheme_refused",
+        "web_websocket_refused",
+    ]
+    .into_iter()
+    .find(|code| stderr.lines().any(|line| line.starts_with(code)))
+}
+
 fn terminate_process_group(child: &Child) -> Result<()> {
     let pid = i32::try_from(child.id()).context("converting page renderer PID")?;
     match killpg(Pid::from_raw(pid), Signal::SIGKILL) {
         Ok(()) | Err(Errno::ESRCH) => Ok(()),
         Err(error) => Err(error).context("stopping page renderer process group"),
     }
-}
-
-fn directory_size(path: &Path) -> Result<u64> {
-    let mut total = 0_u64;
-    for entry in fs::read_dir(path)
-        .with_context(|| format!("reading staging directory {}", path.display()))?
-    {
-        let entry = entry.context("reading staging entry")?;
-        let metadata = entry.metadata().context("reading staging entry metadata")?;
-        if metadata.is_dir() {
-            total = total
-                .checked_add(directory_size(&entry.path())?)
-                .context("summing staging directory size")?;
-        } else if metadata.is_file() {
-            total = total
-                .checked_add(metadata.len())
-                .context("summing staging file size")?;
-        }
-    }
-    Ok(total)
 }
 
 pub fn validate_public_url(value: &str) -> Result<()> {
@@ -211,21 +213,30 @@ fn is_private_ip(ip: IpAddr) -> bool {
                 || ip.is_unique_local()
                 || ip.is_unicast_link_local()
                 || ip.segments().get(..2) == Some(&[0x2001, 0x0db8])
-                || ipv6_mapped_private(ip)
+                || ipv6_embedded_private(ip)
         }
     }
 }
 
-fn ipv6_mapped_private(ip: Ipv6Addr) -> bool {
-    ip.to_ipv4_mapped()
-        .is_some_and(|mapped| is_private_ip(IpAddr::V4(mapped)))
+fn ipv6_embedded_private(ip: Ipv6Addr) -> bool {
+    let segments = ip.segments();
+    let compatible = segments.get(..6) == Some(&[0; 6]);
+    let embedded = if compatible {
+        let [high, low] = [segments[6], segments[7]];
+        let [first, second] = high.to_be_bytes();
+        let [third, fourth] = low.to_be_bytes();
+        Some(Ipv4Addr::new(first, second, third, fourth))
+    } else {
+        ip.to_ipv4_mapped()
+    };
+    embedded.is_some_and(|address| is_private_ip(IpAddr::V4(address)))
 }
 
 #[cfg(test)]
 mod tests {
     #![allow(clippy::expect_used)]
 
-    use super::validate_public_url;
+    use super::{renderer_error_code, validate_public_url};
 
     #[test]
     fn refuses_non_http_private_and_credentialed_urls_before_renderer() {
@@ -233,6 +244,8 @@ mod tests {
             "file:///etc/passwd",
             "http://127.0.0.1/",
             "http://[::1]/",
+            "http://[::127.0.0.1]/",
+            "http://[::7f00:1]/",
             "http://[::ffff:169.254.169.254]/latest/meta-data/",
             "http://[::ffff:172.16.0.1]/",
             "http://169.254.169.254/latest/meta-data/",
@@ -242,5 +255,13 @@ mod tests {
         ] {
             assert!(validate_public_url(url).is_err(), "{url} must be refused");
         }
+    }
+
+    #[test]
+    fn preserves_machine_readable_renderer_refusals() {
+        assert_eq!(
+            renderer_error_code("web_private_target_refused\n"),
+            Some("web_private_target_refused")
+        );
     }
 }

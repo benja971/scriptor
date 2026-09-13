@@ -16,9 +16,11 @@ use serde_json::{Value, json};
 use sha2::{Digest, Sha256};
 
 use crate::config::Config;
-use crate::resource::CaptureBudget;
+use crate::resource::{CaptureBudget, directory_size};
 use crate::unique_id::unique_id;
 use crate::{audio, frames, transcribe};
+
+mod web_capture;
 
 const POLICY_NAME: &str = "safe-local@1";
 const DEFAULT_PAGE_LIMIT: usize = 20;
@@ -209,6 +211,8 @@ struct Manifest {
     capabilities: Vec<Capability>,
     #[serde(default)]
     artifacts: Vec<Proof>,
+    #[serde(default)]
+    discoveries: Vec<Discovery>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -273,6 +277,7 @@ enum Locator {
     MediaTimestamp { timestamps_secs: Vec<f64> },
     PdfPages { first_page: u32, last_page: u32 },
     ImageRegions { regions: Vec<ImageRegion> },
+    CssSelector { value: String },
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -296,12 +301,32 @@ struct LedgerEvent {
     job_id: String,
 }
 
-#[derive(Clone, Deserialize, Serialize)]
+#[derive(Debug, Clone, Deserialize, Serialize)]
 struct Reference {
     capture_id: String,
     artifact_id: String,
     sha256: String,
     locator: Option<Locator>,
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+struct Discovery {
+    source: String,
+    parent: Reference,
+    locator: Locator,
+    order: u32,
+    status: String,
+    reason: String,
+}
+
+#[derive(Deserialize)]
+struct RenderedDiscovery {
+    url: String,
+    parent_locator: Locator,
+    locator: Locator,
+    order: u32,
+    status: String,
+    reason: String,
 }
 
 #[derive(Serialize)]
@@ -401,6 +426,32 @@ struct ReadRequest {
 enum Publication {
     Published { capture_id: String, partial: bool },
     Cancelled,
+}
+
+struct StagingGuard {
+    path: PathBuf,
+    published: bool,
+}
+
+impl StagingGuard {
+    const fn new(path: PathBuf) -> Self {
+        Self {
+            path,
+            published: false,
+        }
+    }
+
+    const fn publish(&mut self) {
+        self.published = true;
+    }
+}
+
+impl Drop for StagingGuard {
+    fn drop(&mut self) {
+        if !self.published {
+            let _ = fs::remove_dir_all(&self.path);
+        }
+    }
 }
 
 pub fn is_agent_command(arguments: &[OsString]) -> bool {
@@ -595,18 +646,10 @@ fn run_worker(job_id: &str) -> Result<()> {
 
 fn publish_capture(job: &Job) -> Result<Publication> {
     if job.policy.snapshot.allows_remote_calls {
-        return publish_web_capture(job);
+        return web_capture::publish(job);
     }
     let source = Path::new(&job.source);
-    let source_count = 1_u8;
-    let depth = 0_u8;
-    let downloaded_bytes = 0_u64;
-    if source_count > job.policy.snapshot.limits.source_limit
-        || depth > job.policy.snapshot.limits.depth_limit
-        || downloaded_bytes > job.policy.snapshot.limits.download_byte_limit
-    {
-        bail!("local Source exceeds safe-local@1 acquisition budget");
-    }
+    validate_local_acquisition(job)?;
     let metadata = fs::metadata(source)
         .with_context(|| format!("reading local Source metadata {}", source.display()))?;
     if metadata.len() > job.policy.snapshot.limits.disk_byte_limit {
@@ -618,13 +661,17 @@ fn publish_capture(job: &Job) -> Result<Publication> {
     let final_dir = captures.join(&capture_id);
     fs::create_dir_all(staging.join("proofs"))
         .with_context(|| format!("creating Capture staging directory {}", staging.display()))?;
+    let mut staging_guard = StagingGuard::new(staging.clone());
+    let is_cancelled = || Ok(read_job(&job.id)?.state == "cancelled");
     let budget = CaptureBudget::new(
         &staging,
         job.created_at,
         job.policy.snapshot.limits.duration_limit_secs,
         job.policy.snapshot.limits.disk_byte_limit,
-    );
+    )
+    .with_cancellation(&is_cancelled);
     let source_hash = sha256_file_limited(source, &budget)?;
+    let _capture_lock = lock_capture_key(&source_hash)?;
     if job.policy.snapshot.duplicate_mode == "reuse"
         && let Some(capture_id) = find_capture_by_source_hash(&source_hash)?
     {
@@ -665,11 +712,15 @@ fn publish_capture(job: &Job) -> Result<Publication> {
         extractions: Vec::new(),
         capabilities: Vec::new(),
         artifacts: Vec::new(),
+        discoveries: Vec::new(),
     };
     if is_media_source(source) {
         capture_local_media(job, &proof_path, &staging, &mut manifest, &budget);
     } else if is_document_source(source) {
         capture_local_document(job, &proof_path, &staging, &mut manifest, &budget);
+    }
+    if budget.is_cancelled()? {
+        return Ok(Publication::Cancelled);
     }
     let ledger_event = LedgerEvent {
         event: "capture_published".to_string(),
@@ -678,6 +729,7 @@ fn publish_capture(job: &Job) -> Result<Publication> {
     };
     write_capture_metadata(&staging, &manifest, &ledger_event, &budget)?;
     fs::rename(&staging, &final_dir).with_context(|| format!("publishing Capture {capture_id}"))?;
+    staging_guard.publish();
     if let Err(error) = rebuild_search_index() {
         record_index_degradation(&error);
     }
@@ -688,6 +740,14 @@ fn publish_capture(job: &Job) -> Result<Publication> {
             .iter()
             .any(|capability| capability.state != "succeeded"),
     })
+}
+
+fn validate_local_acquisition(job: &Job) -> Result<()> {
+    let limits = &job.policy.snapshot.limits;
+    if 1 > limits.source_limit {
+        bail!("local Source exceeds safe-local@1 acquisition budget");
+    }
+    Ok(())
 }
 
 fn is_media_source(source: &Path) -> bool {
@@ -1629,155 +1689,6 @@ fn unresolved_provider_for(error: &anyhow::Error, fallback: &str) -> Provider {
     unresolved_provider(name)
 }
 
-fn publish_web_capture(job: &Job) -> Result<Publication> {
-    if job
-        .policy
-        .snapshot
-        .allowed_providers
-        .iter()
-        .any(|provider| !provider.is_empty())
-    {
-        bail!("safe-web@1 does not permit remote Providers");
-    }
-    let capture_id = format!("capture-{}", unique_id());
-    let captures = captures_dir()?;
-    let staging = captures.join(format!(".{capture_id}"));
-    let final_dir = captures.join(&capture_id);
-    fs::create_dir_all(&staging)
-        .with_context(|| format!("creating Capture staging directory {}", staging.display()))?;
-    fs::create_dir_all(staging.join("proofs")).context("creating Web Proof directory")?;
-    fs::create_dir_all(staging.join("extractions")).context("creating Web Extraction directory")?;
-    let deadline = UNIX_EPOCH
-        .checked_add(Duration::from_secs(
-            job.created_at
-                .saturating_add(job.policy.snapshot.limits.duration_limit_secs),
-        ))
-        .context("calculating safe-web Policy deadline")?;
-    let renderer_capture = crate::web::capture(
-        &job.source,
-        &staging,
-        deadline,
-        job.policy.snapshot.limits.disk_byte_limit,
-        job.policy.snapshot.limits.download_byte_limit,
-        || Ok(read_job(&job.id)?.state == "cancelled"),
-    )?;
-    let provenance = match renderer_capture {
-        crate::web::Capture::Completed(provenance) => provenance,
-        crate::web::Capture::Cancelled => {
-            fs::remove_dir_all(&staging)
-                .context("discarding cancelled Capture staging directory")?;
-            return Ok(Publication::Cancelled);
-        }
-    };
-    if directory_size(&staging)? > job.policy.snapshot.limits.disk_byte_limit {
-        bail!("Capture exceeds safe-web@1 disk budget");
-    }
-    if read_job(&job.id)?.state == "cancelled" {
-        fs::remove_dir_all(&staging).context("discarding cancelled Capture staging directory")?;
-        return Ok(Publication::Cancelled);
-    }
-    let artifacts = [
-        ("proof-screenshot", "proofs/screenshot.png", "image/png"),
-        ("discoveries", "discoveries.json", "application/json"),
-        ("provenance", "provenance.json", "application/json"),
-    ]
-    .into_iter()
-    .map(|(artifact_id, path, mime)| proof_for(&staging, artifact_id, path, mime))
-    .collect::<Result<Vec<_>>>()?;
-    let proof = proof_for(&staging, "proof-dom", "proofs/dom.html", "text/html")?;
-    let extraction = web_markdown_extraction(&staging, &proof, &provenance.final_url)?;
-    let manifest = Manifest {
-        capture_id: capture_id.clone(),
-        source: SourceIdentity {
-            locator: provenance.final_url,
-            sha256: sha256_bytes(job.source.as_bytes()),
-        },
-        policy: job.policy.clone(),
-        published_at: now_secs(),
-        proof,
-        extractions: vec![extraction],
-        capabilities: Vec::new(),
-        artifacts,
-    };
-    write_json(&staging.join("manifest.json"), &manifest)?;
-    append_json_line(
-        &staging.join("ledger.jsonl"),
-        &LedgerEvent {
-            event: "capture_published".to_string(),
-            at: now_secs(),
-            job_id: job.id.clone(),
-        },
-    )?;
-    if directory_size(&staging)? > job.policy.snapshot.limits.disk_byte_limit {
-        bail!("Capture exceeds safe-web@1 disk budget");
-    }
-    fs::rename(&staging, &final_dir).with_context(|| format!("publishing Capture {capture_id}"))?;
-    Ok(Publication::Published {
-        capture_id,
-        partial: false,
-    })
-}
-
-fn web_markdown_extraction(staging: &Path, proof: &Proof, final_url: &str) -> Result<Extraction> {
-    let path = staging.join("extractions/page.md");
-    Ok(Extraction {
-        artifact_id: "extraction-markdown".to_string(),
-        path: "extractions/page.md".to_string(),
-        mime: "text/markdown".to_string(),
-        sha256: sha256_file(&path)?,
-        size_bytes: fs::metadata(&path)
-            .context("reading Markdown Extraction metadata")?
-            .len(),
-        locator: Some(Locator::Url {
-            value: final_url.to_string(),
-        }),
-        locator_provider: None,
-        provider: Provider {
-            name: "page-renderer".to_string(),
-            version: "1".to_string(),
-            parameters: json!({ "browser": "firefox" }),
-            dependencies: Vec::new(),
-        },
-        proof_artifact_id: proof.artifact_id.clone(),
-        created_at: now_secs(),
-    })
-}
-
-fn directory_size(path: &Path) -> Result<u64> {
-    let mut total = 0_u64;
-    for entry in fs::read_dir(path)
-        .with_context(|| format!("reading Capture directory {}", path.display()))?
-    {
-        let entry = entry.context("reading Capture entry")?;
-        let metadata = entry.metadata().context("reading Capture entry metadata")?;
-        if metadata.is_dir() {
-            total = total
-                .checked_add(directory_size(&entry.path())?)
-                .context("summing Capture directory size")?;
-        } else if metadata.is_file() {
-            total = total
-                .checked_add(metadata.len())
-                .context("summing Capture file size")?;
-        }
-    }
-    Ok(total)
-}
-
-fn proof_for(staging: &Path, artifact_id: &str, path: &str, mime: &str) -> Result<Proof> {
-    let file = staging.join(path);
-    Ok(Proof {
-        artifact_id: artifact_id.to_string(),
-        path: path.to_string(),
-        mime: mime.to_string(),
-        sha256: sha256_file(&file)?,
-        size_bytes: fs::metadata(&file)
-            .with_context(|| format!("reading Proof metadata {}", file.display()))?
-            .len(),
-        locator: Locator::File,
-        created_at: now_secs(),
-    })
-}
-
 fn start_job(job_id: &str) -> Result<Option<Job>> {
     let repository_lock = lock_jobs()?;
     let lock = lock_job(job_id)?;
@@ -1985,6 +1896,7 @@ fn search_captures(query: &str, cursor: Option<&str>, limit: usize) -> Result<()
             extractions: Vec::new(),
             capabilities: Vec::new(),
             artifacts: Vec::new(),
+            discoveries: Vec::new(),
         })
         .collect();
     print_json(&capture_page(manifests, cursor, limit, &binding)?)
@@ -2630,6 +2542,22 @@ fn find_capture_by_source_hash(source_hash: &str) -> Result<Option<String>> {
         }
     }
     Ok(None)
+}
+
+fn lock_capture_key(source_hash: &str) -> Result<File> {
+    let directory = repository_dir()?.join("capture-keys");
+    fs::create_dir_all(&directory)
+        .with_context(|| format!("creating Capture key directory {}", directory.display()))?;
+    let path = directory.join(source_hash);
+    let file = OpenOptions::new()
+        .create(true)
+        .truncate(false)
+        .write(true)
+        .open(&path)
+        .with_context(|| format!("opening Capture key lock {}", path.display()))?;
+    file.lock_exclusive()
+        .with_context(|| format!("locking Capture key {}", path.display()))?;
+    Ok(file)
 }
 
 fn write_json<T: Serialize>(path: &Path, value: &T) -> Result<()> {

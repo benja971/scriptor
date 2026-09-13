@@ -22,6 +22,7 @@ pub struct CaptureBudget<'a> {
     root: &'a Path,
     deadline_secs: u64,
     disk_byte_limit: u64,
+    is_cancelled: Option<&'a dyn Fn() -> Result<bool>>,
 }
 
 impl<'a> CaptureBudget<'a> {
@@ -35,10 +36,23 @@ impl<'a> CaptureBudget<'a> {
             root,
             deadline_secs: created_at.saturating_add(duration_limit_secs),
             disk_byte_limit,
+            is_cancelled: None,
         }
     }
 
+    pub fn with_cancellation(mut self, is_cancelled: &'a dyn Fn() -> Result<bool>) -> Self {
+        self.is_cancelled = Some(is_cancelled);
+        self
+    }
+
+    pub fn is_cancelled(&self) -> Result<bool> {
+        self.is_cancelled.map_or(Ok(false), |probe| probe())
+    }
+
     pub fn check(&self) -> Result<()> {
+        if self.is_cancelled()? {
+            bail!("Capture cancelled");
+        }
         if now_secs() >= self.deadline_secs {
             bail!("Capture exceeds safe-local@1 duration budget");
         }
@@ -132,7 +146,7 @@ fn collect_output(
     })
 }
 
-fn directory_size(path: &Path) -> Result<u64> {
+pub fn directory_size(path: &Path) -> Result<u64> {
     if path.is_file() {
         return Ok(fs::metadata(path)
             .with_context(|| format!("reading Capture artifact metadata {}", path.display()))?

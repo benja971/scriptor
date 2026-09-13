@@ -140,9 +140,12 @@ done
 printf '<main>preuve</main>' > "$out/proofs/dom.html"
 printf 'preuve' > "$out/proofs/screenshot.png"
 printf '# contenu\n' > "$out/extractions/page.md"
-printf '[]' > "$out/discoveries.json"
+printf '[{"url":"https://93.184.216.34/document.pdf","parent_locator":{"kind":"url","value":"https://93.184.216.34/"},"locator":{"kind":"css-selector","value":"html > body:nth-of-type(1) > a:nth-of-type(1)"},"order":0,"status":"inventoried","reason":"linked_document"}]' > "$out/discoveries.json"
 printf '{"final_url":"https://93.184.216.34/"}' > "$out/provenance.json"
 "#;
+
+const FAKE_PAGE_RENDERER_PRIVATE_TARGET: &str =
+    "#!/bin/sh\necho web_private_target_refused >&2\nexit 1\n";
 
 /// Faux `yt-dlp` reproduisant exactement les arguments passés par
 /// `download.rs` (`--paths`, `--output`, `--print-to-file after_move:filepath
@@ -859,6 +862,15 @@ fn capture_budget_failure_is_reported_as_a_structured_job_error() {
             .as_str()
             .is_some_and(|message| message.contains("disk budget"))
     );
+    let captures = env.xdg_data.join("scriptor/v2/captures");
+    assert!(
+        !captures.exists()
+            || fs::read_dir(captures)
+                .expect("lecture des Captures")
+                .next()
+                .is_none(),
+        "un staging en échec ne doit pas rester sur disque"
+    );
 }
 
 #[test]
@@ -890,6 +902,13 @@ fn capture_rejects_a_proof_that_leaves_no_disk_budget_for_its_metadata() {
         finished["error"]["message"]
             .as_str()
             .is_some_and(|message| message.contains("disk budget"))
+    );
+    assert!(
+        fs::read_dir(env.xdg_data.join("scriptor/v2/captures"))
+            .expect("lecture des Captures")
+            .next()
+            .is_none(),
+        "un staging en échec ne doit pas rester sur disque"
     );
 }
 
@@ -939,6 +958,74 @@ fn safe_web_publishes_a_portable_capture() {
         capture["manifest"]["extractions"][0]["artifact_id"],
         "extraction-markdown"
     );
+    assert_eq!(
+        capture["manifest"]["discoveries"][0]["parent"]["artifact_id"],
+        "proof-dom"
+    );
+    assert_eq!(capture["manifest"]["discoveries"][0]["order"], 0);
+    env.command()
+        .args(["capture", "search", "preuve"])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains(capture_id));
+    let duplicate: Value = serde_json::from_slice(
+        &env.command()
+            .args([
+                "capture",
+                "https://93.184.216.34/",
+                "--policy",
+                "safe-web@1",
+            ])
+            .assert()
+            .success()
+            .get_output()
+            .stdout,
+    )
+    .expect("Job de Doublon JSON valide");
+    let duplicate_job = duplicate["job"]["job_id"]
+        .as_str()
+        .expect("identifiant du Job de Doublon");
+    let reused: Value = serde_json::from_slice(
+        &env.command()
+            .args(["job", "wait", duplicate_job, "--timeout-secs", "5"])
+            .assert()
+            .success()
+            .get_output()
+            .stdout,
+    )
+    .expect("Job de Doublon terminé JSON valide");
+    assert_eq!(reused["state"], "succeeded");
+    assert_eq!(reused["capture_id"], capture_id);
+}
+
+#[test]
+fn safe_web_preserves_a_renderer_refusal_code_in_the_job_contract() {
+    let env = TestEnv::new("safe-web-refusal");
+    env.install_binary("scriptor-page-renderer", FAKE_PAGE_RENDERER_PRIVATE_TARGET);
+    let created: Value = serde_json::from_slice(
+        &env.command()
+            .args([
+                "capture",
+                "https://93.184.216.34/",
+                "--policy",
+                "safe-web@1",
+            ])
+            .assert()
+            .success()
+            .get_output()
+            .stdout,
+    )
+    .expect("Job JSON valide");
+    let job_id = created["job"]["job_id"]
+        .as_str()
+        .expect("identifiant de Job");
+    env.command()
+        .args(["job", "wait", job_id, "--timeout-secs", "5"])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains(
+            "\"code\":\"web_private_target_refused\"",
+        ));
 }
 
 #[test]
@@ -1074,6 +1161,61 @@ fn capture_stops_a_running_provider_at_its_duration_budget_before_starting_frame
             .is_some_and(|capabilities| capabilities.iter().any(|capability| {
                 capability["name"] == "transcription" && capability["state"] == "not_attempted"
             }))
+    );
+}
+
+#[test]
+fn cancelling_a_running_local_capture_stops_the_provider_without_publishing() {
+    let env = TestEnv::new("capture-cancellation");
+    env.write_config(&env.work_dir.join("out"));
+    let source = env.write_media_file("interview.mp4");
+    let provider_started = env.work_dir.join("provider-started");
+    write_executable(
+        &env.bin_dir,
+        "ffmpeg",
+        &format!(
+            "#!/bin/sh\n: > \"{}\"\nwhile :; do :; done\n",
+            provider_started.display()
+        ),
+    );
+    let job_id = "job-64";
+    let job_path = write_capture_worker_job(&env, job_id, &source, &["ffmpeg"], 30);
+    let mut worker = std::process::Command::new(env!("CARGO_BIN_EXE_scriptor"))
+        .env("PATH", &env.bin_dir)
+        .env("XDG_CONFIG_HOME", &env.xdg_config)
+        .env("XDG_CACHE_HOME", &env.xdg_cache)
+        .env("XDG_DATA_HOME", &env.xdg_data)
+        .args(["capture-worker", "--job-id", job_id])
+        .spawn()
+        .expect("lancement du Worker");
+    let deadline = Instant::now() + Duration::from_secs(1);
+    while !provider_started.exists() && Instant::now() < deadline {
+        std::thread::sleep(Duration::from_millis(10));
+    }
+    assert!(
+        provider_started.exists(),
+        "le Provider a démarré: {}",
+        fs::read_to_string(&job_path).expect("lecture du Job en cours")
+    );
+
+    env.command()
+        .args(["job", "cancel", job_id])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("\"state\":\"cancelled\""));
+    worker.wait().expect("arrêt du Worker annulé");
+
+    let job: Value = serde_json::from_slice(&fs::read(job_path).expect("lecture du Job"))
+        .expect("Job JSON valide");
+    assert_eq!(job["state"], "cancelled");
+    assert!(job["capture_id"].is_null());
+    let captures = env.xdg_data.join("scriptor").join("v2").join("captures");
+    assert!(
+        fs::read_dir(captures)
+            .expect("lecture des Captures")
+            .next()
+            .is_none(),
+        "aucune Capture, même staging, ne doit survivre à l annulation"
     );
 }
 
