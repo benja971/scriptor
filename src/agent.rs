@@ -3458,4 +3458,13 @@ mod continuation_tests {
             vec!["first", "second", "deep"]
         );
     }
+
+    #[test]
+    fn source_budget_leaves_every_discovery_after_the_fiftieth_unattempted() {
+        let discoveries = (0..51).collect::<Vec<_>>();
+        let attempted = discoveries.iter().take(50).count();
+        let skipped = discoveries.iter().skip(50).count();
+        assert_eq!(attempted, 50);
+        assert_eq!(skipped, 1);
+    }
 }
