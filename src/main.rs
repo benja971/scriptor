@@ -16,6 +16,7 @@ mod output;
 mod resource;
 mod transcribe;
 mod unique_id;
+mod web;
 mod worker;
 
 use std::fs::{self, File};

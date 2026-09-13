@@ -184,6 +184,8 @@ struct Manifest {
     extractions: Vec<Extraction>,
     #[serde(default)]
     capabilities: Vec<Capability>,
+    #[serde(default)]
+    artifacts: Vec<Proof>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -481,19 +483,29 @@ fn run_job_command(command: JobCommand) -> Result<()> {
 }
 
 fn create_capture_job(source: &Path, policy_name: &str) -> Result<()> {
-    let policy = safe_local_policy(policy_name)?;
-    let source = source
-        .canonicalize()
-        .with_context(|| format!("resolving local Source {}", source.display()))?;
-    if !source.is_file() {
-        bail!("local Source must be a regular file: {}", source.display());
+    let policy = policy_for(policy_name)?;
+    if policy.snapshot.allows_remote_calls {
+        crate::binary::ensure_present("scriptor-page-renderer")
+            .context("safe-web@1 requires the Nix PageRenderer runtime")?;
     }
+    let source = if policy.snapshot.allows_remote_calls {
+        let url = source.to_str().context("Web Source must be valid UTF-8")?;
+        url.to_string()
+    } else {
+        let source = source
+            .canonicalize()
+            .with_context(|| format!("resolving local Source {}", source.display()))?;
+        if !source.is_file() {
+            bail!("local Source must be a regular file: {}", source.display());
+        }
+        source.to_string_lossy().into_owned()
+    };
 
     let now = now_secs();
     let job = Job {
         id: format!("job-{}", unique_id()),
         state: "queued".to_string(),
-        source: source.to_string_lossy().into_owned(),
+        source,
         policy,
         created_at: now,
         updated_at: now,
@@ -543,6 +555,9 @@ fn run_worker(job_id: &str) -> Result<()> {
 }
 
 fn publish_capture(job: &Job) -> Result<Publication> {
+    if job.policy.snapshot.allows_remote_calls {
+        return publish_web_capture(job);
+    }
     let source = Path::new(&job.source);
     let source_count = 1_u8;
     let depth = 0_u8;
@@ -610,6 +625,7 @@ fn publish_capture(job: &Job) -> Result<Publication> {
         },
         extractions: Vec::new(),
         capabilities: Vec::new(),
+        artifacts: Vec::new(),
     };
     if is_media_source(source) {
         capture_local_media(job, &proof_path, &staging, &mut manifest, &budget);
@@ -1574,6 +1590,131 @@ fn unresolved_provider_for(error: &anyhow::Error, fallback: &str) -> Provider {
     unresolved_provider(name)
 }
 
+fn publish_web_capture(job: &Job) -> Result<Publication> {
+    if job
+        .policy
+        .snapshot
+        .allowed_providers
+        .iter()
+        .any(|provider| !provider.is_empty())
+    {
+        bail!("safe-web@1 does not permit remote Providers");
+    }
+    let capture_id = format!("capture-{}", unique_id());
+    let captures = captures_dir()?;
+    let staging = captures.join(format!(".{capture_id}"));
+    let final_dir = captures.join(&capture_id);
+    fs::create_dir_all(&staging)
+        .with_context(|| format!("creating Capture staging directory {}", staging.display()))?;
+    fs::create_dir_all(staging.join("proofs")).context("creating Web Proof directory")?;
+    fs::create_dir_all(staging.join("extractions")).context("creating Web Extraction directory")?;
+    let deadline = UNIX_EPOCH
+        .checked_add(Duration::from_secs(
+            job.created_at
+                .saturating_add(job.policy.snapshot.limits.duration_limit_secs),
+        ))
+        .context("calculating safe-web Policy deadline")?;
+    let renderer_capture = crate::web::capture(
+        &job.source,
+        &staging,
+        deadline,
+        job.policy.snapshot.limits.disk_byte_limit,
+        job.policy.snapshot.limits.download_byte_limit,
+        || Ok(read_job(&job.id)?.state == "cancelled"),
+    )?;
+    let provenance = match renderer_capture {
+        crate::web::Capture::Completed(provenance) => provenance,
+        crate::web::Capture::Cancelled => {
+            fs::remove_dir_all(&staging)
+                .context("discarding cancelled Capture staging directory")?;
+            return Ok(Publication::Cancelled);
+        }
+    };
+    if directory_size(&staging)? > job.policy.snapshot.limits.disk_byte_limit {
+        bail!("Capture exceeds safe-web@1 disk budget");
+    }
+    if read_job(&job.id)?.state == "cancelled" {
+        fs::remove_dir_all(&staging).context("discarding cancelled Capture staging directory")?;
+        return Ok(Publication::Cancelled);
+    }
+    let artifacts = [
+        ("proof-dom", "proofs/dom.html", "text/html"),
+        ("proof-screenshot", "proofs/screenshot.png", "image/png"),
+        (
+            "extraction-markdown",
+            "extractions/page.md",
+            "text/markdown",
+        ),
+        ("discoveries", "discoveries.json", "application/json"),
+        ("provenance", "provenance.json", "application/json"),
+    ]
+    .into_iter()
+    .map(|(artifact_id, path, mime)| proof_for(&staging, artifact_id, path, mime))
+    .collect::<Result<Vec<_>>>()?;
+    let proof = artifacts
+        .first()
+        .cloned()
+        .context("page renderer produced no DOM Proof")?;
+    let manifest = Manifest {
+        capture_id: capture_id.clone(),
+        source: SourceIdentity {
+            locator: provenance.final_url,
+            sha256: sha256_bytes(job.source.as_bytes()),
+        },
+        policy: job.policy.clone(),
+        published_at: now_secs(),
+        proof,
+        artifacts,
+    };
+    write_json(&staging.join("manifest.json"), &manifest)?;
+    append_json_line(
+        &staging.join("ledger.jsonl"),
+        &LedgerEvent {
+            event: "capture_published".to_string(),
+            at: now_secs(),
+            job_id: job.id.clone(),
+        },
+    )?;
+    if directory_size(&staging)? > job.policy.snapshot.limits.disk_byte_limit {
+        bail!("Capture exceeds safe-web@1 disk budget");
+    }
+    fs::rename(&staging, &final_dir).with_context(|| format!("publishing Capture {capture_id}"))?;
+    Ok(Publication::Published(capture_id))
+}
+
+fn directory_size(path: &Path) -> Result<u64> {
+    let mut total = 0_u64;
+    for entry in fs::read_dir(path)
+        .with_context(|| format!("reading Capture directory {}", path.display()))?
+    {
+        let entry = entry.context("reading Capture entry")?;
+        let metadata = entry.metadata().context("reading Capture entry metadata")?;
+        if metadata.is_dir() {
+            total = total
+                .checked_add(directory_size(&entry.path())?)
+                .context("summing Capture directory size")?;
+        } else if metadata.is_file() {
+            total = total
+                .checked_add(metadata.len())
+                .context("summing Capture file size")?;
+        }
+    }
+    Ok(total)
+}
+
+fn proof_for(staging: &Path, artifact_id: &str, path: &str, mime: &str) -> Result<Proof> {
+    let file = staging.join(path);
+    Ok(Proof {
+        artifact_id: artifact_id.to_string(),
+        path: path.to_string(),
+        mime: mime.to_string(),
+        sha256: sha256_file(&file)?,
+        size_bytes: fs::metadata(&file)
+            .with_context(|| format!("reading Proof metadata {}", file.display()))?
+            .len(),
+    })
+}
+
 fn start_job(job_id: &str) -> Result<Option<Job>> {
     let lock = lock_job(job_id)?;
     let mut job = read_job(job_id)?;
@@ -1586,7 +1727,10 @@ fn start_job(job_id: &str) -> Result<Option<Job>> {
         job.updated_at = now_secs();
         job.error = Some(StructuredError {
             code: "concurrency_limit_exceeded".to_string(),
-            message: "safe-local@1 concurrency budget exceeded".to_string(),
+            message: format!(
+                "{}@{} concurrency budget exceeded",
+                job.policy.id, job.policy.version
+            ),
         });
         write_job(&job)?;
         append_job_event(job_id, "failed")?;
@@ -1641,12 +1785,34 @@ fn fail_job(job_id: &str, error: &anyhow::Error) -> Result<()> {
     job.updated_at = now_secs();
     job.worker_pid = None;
     job.error = Some(StructuredError {
-        code: "capture_failed".to_string(),
+        code: error_code(error),
         message: format!("{error:#}"),
     });
     write_job(&job)?;
     append_job_event(&job.id, "failed")?;
     unlock_job(&lock)
+}
+
+fn error_code(error: &anyhow::Error) -> String {
+    let message = format!("{error:#}");
+    [
+        "web_url_scheme_refused",
+        "web_url_credentials_refused",
+        "web_url_host_refused",
+        "web_private_target_refused",
+        "web_dns_resolution_failed",
+        "web_port_refused",
+        "web_websocket_refused",
+        "web_download_budget_exceeded",
+        "web_disk_budget_exceeded",
+        "web_renderer_firefox_unavailable",
+        "web_renderer_chromium_unavailable",
+        "web_renderer_unknown",
+    ]
+    .into_iter()
+    .find(|code| message.contains(code))
+    .unwrap_or("capture_failed")
+    .to_string()
 }
 
 fn print_job(job_id: &str) -> Result<()> {
@@ -2180,9 +2346,9 @@ fn reconcile_interrupted(mut job: Job) -> Result<Job> {
     Ok(job)
 }
 
-fn safe_local_policy(name: &str) -> Result<Policy> {
-    if name != POLICY_NAME {
-        bail!("unsupported Policy `{name}`; expected `{POLICY_NAME}`");
+fn policy_for(name: &str) -> Result<Policy> {
+    if name != POLICY_NAME && name != "safe-web@1" {
+        bail!("unsupported Policy `{name}`; expected `{POLICY_NAME}` or `safe-web@1`");
     }
     let limits = Limits {
         depth_limit: 2,
@@ -2195,7 +2361,7 @@ fn safe_local_policy(name: &str) -> Result<Policy> {
     let snapshot = PolicySnapshot {
         duplicate_mode: "reuse".to_string(),
         limits,
-        allows_remote_calls: false,
+        allows_remote_calls: name == "safe-web@1",
         allowed_providers: vec![
             "ffmpeg".to_string(),
             "ffprobe".to_string(),
@@ -2210,7 +2376,12 @@ fn safe_local_policy(name: &str) -> Result<Policy> {
     let snapshot_bytes =
         serde_json::to_vec(&canonical_snapshot).context("serializing Policy snapshot")?;
     Ok(Policy {
-        id: "safe-local".to_string(),
+        id: if name == POLICY_NAME {
+            "safe-local"
+        } else {
+            "safe-web"
+        }
+        .to_string(),
         version: 1,
         sha256: sha256_bytes(&snapshot_bytes),
         snapshot,
