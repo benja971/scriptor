@@ -131,6 +131,19 @@ printf '5\t1\t1\t1\t1\t1\t12\t24\t36\t48\t95\tBonjour\n'
 
 const FAKE_TESSERACT_FAILURE: &str = "#!/bin/sh\necho 'ocr indisponible' >&2\nexit 1\n";
 
+const FAKE_PAGE_RENDERER: &str = r#"#!/bin/sh
+set -eu
+while [ "$#" -gt 0 ]; do
+  if [ "$1" = "--output-dir" ]; then out="$2"; break; fi
+  shift
+done
+printf '<main>preuve</main>' > "$out/proofs/dom.html"
+printf 'preuve' > "$out/proofs/screenshot.png"
+printf '# contenu\n' > "$out/extractions/page.md"
+printf '[]' > "$out/discoveries.json"
+printf '{"final_url":"https://93.184.216.34/"}' > "$out/provenance.json"
+"#;
+
 /// Faux `yt-dlp` reproduisant exactement les arguments passés par
 /// `download.rs` (`--paths`, `--output`, `--print-to-file after_move:filepath
 /// <marker>`) : écrit un faux fichier vidéo (non vide - `wait_for_file` exige
@@ -877,6 +890,54 @@ fn capture_rejects_a_proof_that_leaves_no_disk_budget_for_its_metadata() {
         finished["error"]["message"]
             .as_str()
             .is_some_and(|message| message.contains("disk budget"))
+    );
+}
+
+#[test]
+fn safe_web_publishes_a_portable_capture() {
+    let env = TestEnv::new("safe-web");
+    env.install_binary("scriptor-page-renderer", FAKE_PAGE_RENDERER);
+    let created: Value = serde_json::from_slice(
+        &env.command()
+            .args([
+                "capture",
+                "https://93.184.216.34/",
+                "--policy",
+                "safe-web@1",
+            ])
+            .assert()
+            .success()
+            .get_output()
+            .stdout,
+    )
+    .expect("Job JSON valide");
+    let job_id = created["job"]["job_id"]
+        .as_str()
+        .expect("identifiant de Job");
+    let job: Value = serde_json::from_slice(
+        &env.command()
+            .args(["job", "wait", job_id, "--timeout-secs", "5"])
+            .assert()
+            .success()
+            .get_output()
+            .stdout,
+    )
+    .expect("Job JSON valide");
+    assert_eq!(job["state"], "succeeded", "{job}");
+    let capture_id = job["capture_id"].as_str().expect("identifiant de Capture");
+    let capture: Value = serde_json::from_slice(
+        &env.command()
+            .args(["capture", "inspect", capture_id])
+            .assert()
+            .success()
+            .get_output()
+            .stdout,
+    )
+    .expect("Capture JSON valide");
+    assert_eq!(capture["manifest"]["proof"]["artifact_id"], "proof-dom");
+    assert_eq!(
+        capture["manifest"]["extractions"][0]["artifact_id"],
+        "extraction-markdown"
     );
 }
 
