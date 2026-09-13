@@ -567,6 +567,13 @@ fn error_code(error: &anyhow::Error) -> String {
         "web_url_host_refused",
         "web_private_target_refused",
         "web_dns_resolution_failed",
+        "web_port_refused",
+        "web_websocket_refused",
+        "web_download_budget_exceeded",
+        "web_disk_budget_exceeded",
+        "web_renderer_firefox_unavailable",
+        "web_renderer_chromium_unavailable",
+        "web_renderer_unknown",
     ]
     .into_iter()
     .find(|code| message.contains(code))

@@ -6,9 +6,17 @@ routed resource request, and again after navigation: unsupported schemes,
 credentials, localhost, private, link-local, loopback, multicast and DNS
 answers containing non-public addresses are refused.
 
-The renderer disables service workers and tries Firefox first, then Chromium.
-This is an application-layer guard, not a network sandbox. DNS rebinding can
-still change an accepted hostname between validation and the browser's own
-connection. Deployments which require SSRF guarantees must enforce an egress
-firewall or isolated network namespace that blocks private and link-local
-address ranges for the renderer process.
+The renderer disables service workers and runs Firefox by default. It never
+silently switches browser engines: an unavailable Firefox produces the
+structured `web_renderer_firefox_unavailable` Job error. Chromium remains an
+explicit renderer mode and applies its own WebRTC network restrictions.
+
+WebRTC cannot escape the boundary: Firefox disables PeerConnection with launch
+preferences, while Chromium is launched with its non-proxied UDP policy and no
+media permissions. Page JavaScript sees no WebRTC API as defense in depth.
+
+This is still an application-layer SSRF guard. DNS rebinding can change an
+accepted hostname between validation and the browser's own connection.
+Deployments requiring a kernel-level guarantee must enforce an egress firewall
+or isolated network namespace that blocks private and link-local ranges for the
+renderer process.

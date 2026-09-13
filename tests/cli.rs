@@ -138,6 +138,11 @@ printf '%s' "$!" > "$XDG_DATA_HOME/scriptor-renderer-child.pid"
 while :; do :; done
 "#;
 
+const PRIVATE_REDIRECT_PAGE_RENDERER: &str = r"#!/bin/sh
+echo 'web_private_target_refused: redirect target is private' >&2
+exit 1
+";
+
 const FAKE_WHISPER_CLI_FAILURE: &str = r#"#!/bin/sh
 echo "boom: fake whisper-cli failure" >&2
 exit 1
@@ -842,6 +847,44 @@ fn web_capture_requires_safe_web_policy_and_publishes_renderer_artifacts() {
         capture["manifest"]["artifacts"].as_array().map(Vec::len),
         Some(5)
     );
+}
+
+#[test]
+fn web_capture_preserves_renderer_route_rejection_code() {
+    let env = TestEnv::new("safe-web-route-rejection");
+    write_executable(
+        &env.bin_dir,
+        "scriptor-page-renderer",
+        PRIVATE_REDIRECT_PAGE_RENDERER,
+    );
+    let created: Value = serde_json::from_slice(
+        &env.command()
+            .args([
+                "capture",
+                "https://93.184.216.34/",
+                "--policy",
+                "safe-web@1",
+            ])
+            .assert()
+            .success()
+            .get_output()
+            .stdout,
+    )
+    .expect("Job JSON valide");
+    let job_id = created["job"]["job_id"]
+        .as_str()
+        .expect("identifiant de Job");
+    let job: Value = serde_json::from_slice(
+        &env.command()
+            .args(["job", "wait", job_id, "--timeout-secs", "5"])
+            .assert()
+            .success()
+            .get_output()
+            .stdout,
+    )
+    .expect("Job JSON valide");
+    assert_eq!(job["state"], "failed");
+    assert_eq!(job["error"]["code"], "web_private_target_refused");
 }
 
 #[test]
