@@ -1,5 +1,4 @@
 use std::ffi::OsString;
-use std::fmt::Write as FmtWrite;
 use std::fs::{self, File, OpenOptions};
 use std::io::{BufReader, Read, Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
@@ -2272,32 +2271,30 @@ fn reference_for_artifact(capture_id: &str, artifact: &ArtifactMetadata) -> Refe
 }
 
 fn encode_cursor(cursor: &Cursor) -> Result<String> {
-    let encoded = serde_json::to_vec(cursor).context("serializing pagination cursor")?;
-    let mut hex = String::with_capacity(encoded.len().saturating_mul(2));
-    for byte in encoded {
-        FmtWrite::write_fmt(&mut hex, format_args!("{byte:02x}"))
-            .context("encoding pagination cursor")?;
-    }
-    Ok(format!("v1-{hex}"))
+    let id = unique_id();
+    write_json(&cursor_path(&id)?, cursor)?;
+    Ok(format!("v1-{id}"))
 }
 
 fn decode_cursor(cursor: &str) -> Result<Cursor> {
-    let encoded = cursor
+    let id = cursor
         .strip_prefix("v1-")
         .context("invalid pagination cursor")?;
-    if encoded.is_empty() || encoded.len() % 2 != 0 {
+    if id.is_empty()
+        || !id
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || byte == b'-')
+    {
         bail!("invalid pagination cursor");
     }
-    let bytes = encoded
-        .as_bytes()
-        .chunks_exact(2)
-        .map(|pair| {
-            std::str::from_utf8(pair)
-                .context("invalid pagination cursor")
-                .and_then(|hex| u8::from_str_radix(hex, 16).context("invalid pagination cursor"))
-        })
-        .collect::<Result<Vec<_>>>()?;
-    serde_json::from_slice(&bytes).context("invalid pagination cursor")
+    read_json(&cursor_path(id)?).context("invalid pagination cursor")
+}
+
+fn cursor_path(id: &str) -> Result<PathBuf> {
+    let directory = repository_dir()?.join("cursors");
+    fs::create_dir_all(&directory)
+        .with_context(|| format!("creating cursor directory {}", directory.display()))?;
+    Ok(directory.join(format!("{id}.json")))
 }
 
 fn is_text_mime(mime: &str) -> bool {

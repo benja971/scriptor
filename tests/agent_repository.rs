@@ -111,6 +111,8 @@ fn list_has_stable_pages_and_verifiable_references() {
     let first_captures = first["captures"].as_array().expect("première page");
     assert_eq!(first_captures.len(), 2);
     assert!(first["next_cursor"].is_string());
+    let cursor = first["next_cursor"].as_str().expect("curseur opaque");
+    assert!(cursor.len() < 80, "le curseur ne divulgue pas son état");
     for capture in first_captures {
         assert_eq!(capture["reference"]["capture_id"], capture["capture_id"]);
         assert_eq!(capture["reference"]["artifact_id"], "proof-source");
@@ -121,7 +123,6 @@ fn list_has_stable_pages_and_verifiable_references() {
         );
     }
 
-    let cursor = first["next_cursor"].as_str().expect("curseur opaque");
     let second: Value = serde_json::from_slice(
         &repository
             .command()
@@ -155,6 +156,14 @@ fn list_has_stable_pages_and_verifiable_references() {
         .success()
         .stdout(predicate::str::contains("\"code\":\"invalid_pagination\""))
         .stderr(predicate::str::is_empty());
+
+    let forged_cursor = format!("{cursor}forged");
+    repository
+        .command()
+        .args(["capture", "list", "--cursor", &forged_cursor])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("\"code\":\"invalid_cursor\""));
 }
 
 #[test]
