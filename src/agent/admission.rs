@@ -40,12 +40,12 @@ fn admit_local(source: &Path) -> Result<Source> {
 }
 
 fn admit_web(source: &Path, policy: &Policy) -> Result<Source> {
-    if policy
-        .snapshot
-        .allowed_providers
-        .iter()
-        .any(|provider| !provider.is_empty())
-    {
+    if policy.snapshot.allowed_providers.iter().any(|provider| {
+        !matches!(
+            provider.as_str(),
+            "ffmpeg" | "ffprobe" | "whisper-cli" | "pdftotext" | "pdfinfo" | "tesseract"
+        )
+    }) {
         bail!("safe-web@1 does not permit remote Providers");
     }
     crate::binary::ensure_present("scriptor-page-renderer")

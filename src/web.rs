@@ -1,7 +1,8 @@
 use std::fs;
+use std::io::Read;
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, ToSocketAddrs};
 use std::os::unix::process::CommandExt;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
 use std::thread;
 use std::time::{Duration, SystemTime};
@@ -11,6 +12,7 @@ use nix::errno::Errno;
 use nix::sys::signal::{Signal, killpg};
 use nix::unistd::Pid;
 use serde::Deserialize;
+use sha2::{Digest, Sha256};
 use url::Url;
 
 use crate::agent::AgentErrorCode;
@@ -18,12 +20,129 @@ use crate::resource::directory_size;
 
 #[derive(Debug, Deserialize)]
 pub struct Provenance {
+    #[serde(default)]
+    pub initial_url: String,
     pub final_url: String,
+    #[serde(default)]
+    pub redirect_chain: Vec<String>,
 }
 
 pub enum Capture {
     Completed(Provenance),
     Cancelled,
+}
+
+#[derive(Debug, Deserialize)]
+pub struct BinaryAcquisition {
+    pub requested_url: String,
+    pub final_url: String,
+    pub mime: String,
+    pub sha256: String,
+    pub size_bytes: u64,
+    #[serde(default)]
+    pub redirect_chain: Vec<String>,
+    #[serde(skip)]
+    pub path: PathBuf,
+}
+
+pub fn acquire_binary<F>(
+    url: &str,
+    staging: &Path,
+    deadline: SystemTime,
+    disk_byte_limit: u64,
+    download_byte_limit: u64,
+    is_cancelled: F,
+) -> Result<BinaryAcquisition>
+where
+    F: Fn() -> Result<bool>,
+{
+    validate_public_url(url)?;
+    let output_dir = staging.join("binary-acquisition");
+    fs::create_dir_all(&output_dir).with_context(|| {
+        format!(
+            "creating binary acquisition staging directory {}",
+            output_dir.display()
+        )
+    })?;
+    let mut command = Command::new("scriptor-binary-acquirer");
+    command
+        .process_group(0)
+        .args(["--url", url, "--output-dir"])
+        .arg(&output_dir)
+        .args(["--max-download-bytes", &download_byte_limit.to_string()])
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped());
+    let mut child = command.spawn().context("launching binary acquirer")?;
+    loop {
+        if is_cancelled()? {
+            terminate_process_group(&child)?;
+            child.wait().context("reaping cancelled binary acquirer")?;
+            bail!("binary acquisition cancelled");
+        }
+        if SystemTime::now() >= deadline {
+            terminate_process_group(&child)?;
+            child.wait().context("reaping timed out binary acquirer")?;
+            bail!("Capture exceeds safe-web@1 duration budget");
+        }
+        if directory_size(staging)? > disk_byte_limit {
+            terminate_process_group(&child)?;
+            child
+                .wait()
+                .context("reaping disk-limited binary acquirer")?;
+            bail!("Capture exceeds safe-web@1 disk budget");
+        }
+        if child
+            .try_wait()
+            .context("checking binary acquirer status")?
+            .is_some()
+        {
+            break;
+        }
+        thread::sleep(Duration::from_millis(20));
+    }
+    let output = child
+        .wait_with_output()
+        .context("collecting binary acquirer output")?;
+    if !output.status.success() {
+        bail!(
+            "binary acquirer failed: {}",
+            String::from_utf8_lossy(&output.stderr).trim()
+        );
+    }
+    let mut acquired: BinaryAcquisition = serde_json::from_slice(
+        &fs::read(output_dir.join("metadata.json"))
+            .context("reading binary acquisition metadata")?,
+    )
+    .context("parsing binary acquisition metadata")?;
+    if acquired.requested_url != url {
+        bail!("binary acquisition requested URL does not match");
+    }
+    validate_public_url(&acquired.final_url).context("validating binary redirect target")?;
+    acquired.path = output_dir.join("payload");
+    let size = fs::metadata(&acquired.path)
+        .context("reading acquired binary metadata")?
+        .len();
+    if size != acquired.size_bytes || size > download_byte_limit {
+        bail!("binary acquisition size does not match its metadata");
+    }
+    let mut file = fs::File::open(&acquired.path).context("opening acquired binary")?;
+    let mut hash = Sha256::new();
+    let mut buffer = [0_u8; 8192];
+    loop {
+        let read = file.read(&mut buffer).context("hashing acquired binary")?;
+        if read == 0 {
+            break;
+        }
+        hash.update(
+            buffer
+                .get(..read)
+                .context("reading acquired binary buffer")?,
+        );
+    }
+    if format!("{:x}", hash.finalize()) != acquired.sha256 {
+        bail!("binary acquisition hash does not match its metadata");
+    }
+    Ok(acquired)
 }
 
 pub fn capture<F>(
@@ -57,17 +176,17 @@ where
     loop {
         if is_cancelled()? {
             terminate_process_group(&child)?;
-            let _ = child.wait();
+            child.wait().context("reaping cancelled page renderer")?;
             return Ok(Capture::Cancelled);
         }
         if SystemTime::now() >= deadline {
             terminate_process_group(&child)?;
-            let _ = child.wait();
+            child.wait().context("reaping timed out page renderer")?;
             bail!("Capture exceeds safe-web@1 duration budget");
         }
         if directory_size(staging)? > disk_byte_limit {
             terminate_process_group(&child)?;
-            let _ = child.wait();
+            child.wait().context("reaping disk-limited page renderer")?;
             bail!("Capture exceeds safe-web@1 disk budget");
         }
         if child

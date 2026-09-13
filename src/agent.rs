@@ -13,6 +13,7 @@ use fs2::FileExt;
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use sha2::{Digest, Sha256};
+use url::Url;
 
 use crate::config::Config;
 use crate::resource::CaptureBudget;
@@ -55,7 +56,7 @@ enum AgentCommand {
 #[derive(Args)]
 struct CaptureCommand {
     source: Option<PathBuf>,
-    #[arg(long)]
+    #[arg(long, global = true)]
     policy: Option<String>,
     #[command(subcommand)]
     command: Option<CaptureSubcommand>,
@@ -63,6 +64,11 @@ struct CaptureCommand {
 
 #[derive(Subcommand)]
 enum CaptureSubcommand {
+    Continue {
+        capture_id: String,
+        #[arg(long = "discovery")]
+        discovery_ids: Vec<String>,
+    },
     #[command(alias = "get")]
     Inspect {
         capture_id: String,
@@ -163,12 +169,49 @@ struct Job {
     id: String,
     state: String,
     source: String,
+    #[serde(default)]
+    operation: JobOperation,
     policy: Policy,
     created_at: u64,
     updated_at: u64,
     worker_pid: Option<u32>,
     capture_id: Option<String>,
+    #[serde(default)]
+    child_capture_ids: Vec<String>,
+    #[serde(default)]
+    checkpoint: Option<ResolutionCheckpoint>,
     error: Option<StructuredError>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+enum JobOperation {
+    #[default]
+    Capture,
+    Continue {
+        parent_capture_id: String,
+        discovery_ids: Vec<String>,
+    },
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct ResolutionCheckpoint {
+    queue: Vec<QueuedDiscovery>,
+    attempted_sources: u8,
+    downloaded_bytes: u64,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct QueuedDiscovery {
+    discovery_id: String,
+    source: String,
+    depth: u8,
+    order: u32,
+    #[serde(default)]
+    order_path: Vec<u32>,
+    ancestors: Vec<String>,
+    #[serde(default)]
+    kind: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -197,6 +240,18 @@ struct Manifest {
     artifacts: Vec<Proof>,
     #[serde(default)]
     discoveries: Vec<Discovery>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    remote_provenance: Option<RemoteProvenance>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct RemoteProvenance {
+    requested_url: String,
+    final_url: String,
+    mime: String,
+    sha256: String,
+    size_bytes: u64,
+    redirect_chain: Vec<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -283,6 +338,8 @@ struct LedgerEvent {
     event: String,
     at: u64,
     job_id: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    details: Option<Value>,
 }
 
 #[derive(Debug, Clone, Deserialize, Serialize)]
@@ -295,12 +352,22 @@ struct Reference {
 
 #[derive(Debug, Serialize, Deserialize)]
 struct Discovery {
+    #[serde(default, rename = "discovery_id")]
+    id: String,
     source: String,
     parent: Reference,
     locator: Locator,
     order: u32,
     status: String,
     reason: String,
+    #[serde(default)]
+    kind: Option<String>,
+}
+
+fn discovery_id(parent: &Reference, source: &str, locator: &Locator, order: u32) -> Result<String> {
+    let identity = serde_json::to_vec(&(parent, source, locator, order))
+        .context("serializing Discovery identity")?;
+    Ok(sha256_bytes(&identity))
 }
 
 #[derive(Deserialize)]
@@ -311,6 +378,8 @@ struct RenderedDiscovery {
     order: u32,
     status: String,
     reason: String,
+    #[serde(default)]
+    kind: Option<String>,
 }
 
 #[derive(Serialize)]
@@ -480,6 +549,10 @@ fn agent_error(error: &anyhow::Error) -> StructuredError {
 
 fn run_capture_command(command: CaptureCommand) -> Result<()> {
     match command.command {
+        Some(CaptureSubcommand::Continue {
+            capture_id,
+            discovery_ids,
+        }) => continue_capture(&capture_id, &discovery_ids, command.policy.as_deref()),
         Some(CaptureSubcommand::Inspect { capture_id }) => inspect_capture(&capture_id),
         Some(CaptureSubcommand::List { cursor, limit }) => list_captures(cursor.as_deref(), limit),
         Some(CaptureSubcommand::Search {
@@ -514,6 +587,33 @@ fn run_capture_command(command: CaptureCommand) -> Result<()> {
     }
 }
 
+fn continue_capture(
+    capture_id: &str,
+    discovery_ids: &[String],
+    policy_name: Option<&str>,
+) -> Result<()> {
+    validate_id(capture_id, "capture")?;
+    let policy = policy_for(policy_name.context("capture continue requires --policy")?)?;
+    let parent: Manifest = read_json(&captures_dir()?.join(capture_id).join("manifest.json"))?;
+    for discovery_id in discovery_ids {
+        if !parent
+            .discoveries
+            .iter()
+            .any(|discovery| discovery.id == *discovery_id)
+        {
+            bail!("unknown Discovery `{discovery_id}` for Capture `{capture_id}`");
+        }
+    }
+    create_job(
+        capture_id.to_string(),
+        policy,
+        JobOperation::Continue {
+            parent_capture_id: capture_id.to_string(),
+            discovery_ids: discovery_ids.to_vec(),
+        },
+    )
+}
+
 fn run_job_command(command: JobCommand) -> Result<()> {
     match command.command {
         JobSubcommand::Get { job_id } => print_job(&job_id),
@@ -528,17 +628,23 @@ fn run_job_command(command: JobCommand) -> Result<()> {
 fn create_capture_job(source: &Path, policy_name: &str) -> Result<()> {
     let policy = policy_for(policy_name)?;
     let source = admission::admit(source, &policy)?.into_job_source();
+    create_job(source, policy, JobOperation::Capture)
+}
 
+fn create_job(source: String, policy: Policy, operation: JobOperation) -> Result<()> {
     let now = now_secs();
     let job = Job {
         id: format!("job-{}", unique_id()),
         state: "queued".to_string(),
         source,
+        operation,
         policy,
         created_at: now,
         updated_at: now,
         worker_pid: None,
         capture_id: None,
+        child_capture_ids: Vec::new(),
+        checkpoint: None,
         error: None,
     };
     write_job(&job)?;
@@ -572,14 +678,620 @@ fn run_worker(job_id: &str) -> Result<()> {
         return Ok(());
     };
 
+    if let JobOperation::Continue {
+        parent_capture_id, ..
+    } = &job.operation
+    {
+        return match resolve_discoveries(&job, parent_capture_id) {
+            Ok(()) => Ok(()),
+            Err(error) => fail_job(job_id, &error),
+        };
+    }
+
     match publish_capture(&job) {
         Ok(Publication::Published {
             capture_id,
             partial,
+            ..
         }) => complete_job(job_id, capture_id, partial),
         Ok(Publication::Cancelled) => Ok(()),
         Err(error) => fail_job(job_id, &error),
     }
+}
+
+#[allow(clippy::too_many_lines)]
+fn resolve_discoveries(job: &Job, parent_capture_id: &str) -> Result<()> {
+    let parent: Manifest = read_json(
+        &captures_dir()?
+            .join(parent_capture_id)
+            .join("manifest.json"),
+    )?;
+    if parent.policy.id != job.policy.id || parent.policy.version != job.policy.version {
+        bail!("capture continue Policy must match the parent Capture Policy");
+    }
+    let parent_source = normalized_web_url(&parent.source.locator)?;
+    let mut checkpoint = job
+        .checkpoint
+        .clone()
+        .unwrap_or_else(|| ResolutionCheckpoint {
+            queue: parent
+                .discoveries
+                .iter()
+                .filter(|discovery| {
+                    (job.operation.discovery_ids().is_empty()
+                        && discovery.status == "skipped_budget")
+                        || job
+                            .operation
+                            .discovery_ids()
+                            .iter()
+                            .any(|id| id == &discovery.id)
+                })
+                .map(|discovery| QueuedDiscovery {
+                    discovery_id: discovery.id.clone(),
+                    source: discovery.source.clone(),
+                    depth: 1,
+                    order: discovery.order,
+                    order_path: vec![discovery.order],
+                    ancestors: vec![parent_source.clone()],
+                    kind: discovery.kind.clone(),
+                })
+                .collect(),
+            attempted_sources: 0,
+            downloaded_bytes: 0,
+        });
+    sort_resolution_queue(&mut checkpoint.queue);
+    let mut partial = false;
+    let mut child_capture_ids = job.child_capture_ids.clone();
+    while let Some(discovery) = checkpoint.queue.first().cloned() {
+        if read_job(&job.id)?.state == "cancelled" {
+            return Ok(());
+        }
+        if discovery.depth > job.policy.snapshot.limits.depth_limit {
+            append_discovery_event(
+                parent_capture_id,
+                &job.id,
+                &discovery,
+                "skipped_policy",
+                Some(json!({"reason": "depth_limit"})),
+            )?;
+            partial = true;
+            persist_resolution_progress(&job.id, &mut checkpoint, &discovery, None)?;
+            continue;
+        }
+        if checkpoint.attempted_sources >= job.policy.snapshot.limits.source_limit {
+            append_discovery_event(
+                parent_capture_id,
+                &job.id,
+                &discovery,
+                "skipped_budget",
+                None,
+            )?;
+            partial = true;
+            persist_resolution_progress(&job.id, &mut checkpoint, &discovery, None)?;
+            continue;
+        }
+        checkpoint.attempted_sources = checkpoint.attempted_sources.saturating_add(1);
+        let normalized_source = normalized_web_url(&discovery.source)?;
+        if discovery
+            .ancestors
+            .iter()
+            .any(|ancestor| ancestor == &normalized_source)
+        {
+            append_discovery_event(parent_capture_id, &job.id, &discovery, "cycle", None)?;
+            partial = true;
+            persist_resolution_progress(&job.id, &mut checkpoint, &discovery, None)?;
+            continue;
+        }
+        let staging = job_staging_dir(&job.id)?;
+        let deadline = UNIX_EPOCH
+            .checked_add(Duration::from_secs(
+                job.created_at
+                    .saturating_add(job.policy.snapshot.limits.duration_limit_secs),
+            ))
+            .context("calculating discovery resolution deadline")?;
+        if discovery.kind.as_deref() == Some("web") {
+            let publication = match publish_web_discovery(job, &discovery, &mut checkpoint.queue)? {
+                WebDiscoveryPublication::Published(publication) => publication,
+                WebDiscoveryPublication::Cycle => {
+                    append_discovery_event(parent_capture_id, &job.id, &discovery, "cycle", None)?;
+                    partial = true;
+                    persist_resolution_progress(&job.id, &mut checkpoint, &discovery, None)?;
+                    continue;
+                }
+            };
+            match publication {
+                Publication::Published {
+                    capture_id,
+                    partial: child_partial,
+                    reused,
+                } => {
+                    append_discovery_event(
+                        parent_capture_id,
+                        &job.id,
+                        &discovery,
+                        if reused {
+                            "reused"
+                        } else if child_partial {
+                            "failed"
+                        } else {
+                            "captured"
+                        },
+                        Some(
+                            json!({"capture_id": capture_id, "reference": reference_for_capture(&capture_id)?, "final_url": discovery.source}),
+                        ),
+                    )?;
+                    child_capture_ids.push(capture_id);
+                    persist_resolution_progress(
+                        &job.id,
+                        &mut checkpoint,
+                        &discovery,
+                        child_capture_ids.last().map(String::as_str),
+                    )?;
+                    partial |= child_partial;
+                }
+                Publication::Cancelled => return Ok(()),
+            }
+            sort_resolution_queue(&mut checkpoint.queue);
+            write_checkpoint(&job.id, &checkpoint)?;
+            continue;
+        }
+        let download_limit = job
+            .policy
+            .snapshot
+            .limits
+            .download_byte_limit
+            .saturating_sub(checkpoint.downloaded_bytes);
+        if download_limit == 0 {
+            append_discovery_event(
+                parent_capture_id,
+                &job.id,
+                &discovery,
+                "skipped_budget",
+                None,
+            )?;
+            partial = true;
+            persist_resolution_progress(&job.id, &mut checkpoint, &discovery, None)?;
+            continue;
+        }
+        match crate::web::acquire_binary(
+            &discovery.source,
+            &staging,
+            deadline,
+            job.policy.snapshot.limits.disk_byte_limit,
+            download_limit,
+            || Ok(read_job(&job.id)?.state == "cancelled"),
+        ) {
+            Ok(acquired) => {
+                checkpoint.downloaded_bytes = checkpoint
+                    .downloaded_bytes
+                    .saturating_add(acquired.size_bytes);
+                let normalized_final_url = normalized_web_url(&acquired.final_url)?;
+                if discovery
+                    .ancestors
+                    .iter()
+                    .any(|ancestor| ancestor == &normalized_final_url)
+                {
+                    append_discovery_event(
+                        parent_capture_id,
+                        &job.id,
+                        &discovery,
+                        "cycle",
+                        Some(
+                            json!({"requested_url": discovery.source, "final_url": acquired.final_url, "redirect_chain": acquired.redirect_chain}),
+                        ),
+                    )?;
+                    cleanup_binary_staging(&staging)?;
+                    partial = true;
+                    persist_resolution_progress(&job.id, &mut checkpoint, &discovery, None)?;
+                    continue;
+                }
+                if is_html_discovery(&acquired.path, &acquired.mime)? {
+                    let publication = publish_web_discovery(
+                        job,
+                        &QueuedDiscovery {
+                            source: acquired.final_url.clone(),
+                            kind: Some("web".to_string()),
+                            ..discovery.clone()
+                        },
+                        &mut checkpoint.queue,
+                    )?;
+                    cleanup_binary_staging(&staging)?;
+                    match publication {
+                        WebDiscoveryPublication::Cycle => {
+                            append_discovery_event(
+                                parent_capture_id,
+                                &job.id,
+                                &discovery,
+                                "cycle",
+                                Some(
+                                    json!({"requested_url": discovery.source, "final_url": acquired.final_url}),
+                                ),
+                            )?;
+                            partial = true;
+                            persist_resolution_progress(
+                                &job.id,
+                                &mut checkpoint,
+                                &discovery,
+                                None,
+                            )?;
+                        }
+                        WebDiscoveryPublication::Published(Publication::Published {
+                            capture_id,
+                            partial: child_partial,
+                            reused,
+                        }) => {
+                            append_discovery_event(
+                                parent_capture_id,
+                                &job.id,
+                                &discovery,
+                                if reused {
+                                    "reused"
+                                } else if child_partial {
+                                    "failed"
+                                } else {
+                                    "captured"
+                                },
+                                Some(
+                                    json!({"capture_id": capture_id, "reference": reference_for_capture(&capture_id)?, "requested_url": discovery.source, "final_url": acquired.final_url, "mime": acquired.mime, "sha256": acquired.sha256, "size_bytes": acquired.size_bytes, "redirect_chain": acquired.redirect_chain}),
+                                ),
+                            )?;
+                            child_capture_ids.push(capture_id);
+                            persist_resolution_progress(
+                                &job.id,
+                                &mut checkpoint,
+                                &discovery,
+                                child_capture_ids.last().map(String::as_str),
+                            )?;
+                            partial |= child_partial;
+                        }
+                        WebDiscoveryPublication::Published(Publication::Cancelled) => return Ok(()),
+                    }
+                    sort_resolution_queue(&mut checkpoint.queue);
+                    write_checkpoint(&job.id, &checkpoint)?;
+                    continue;
+                }
+                let Some(extension) = binary_extension(&acquired.path, &acquired.mime)? else {
+                    append_discovery_event(
+                        parent_capture_id,
+                        &job.id,
+                        &discovery,
+                        "unsupported",
+                        Some(
+                            json!({"requested_url": discovery.source, "final_url": acquired.final_url, "mime": acquired.mime, "sha256": acquired.sha256, "size_bytes": acquired.size_bytes, "redirect_chain": acquired.redirect_chain}),
+                        ),
+                    )?;
+                    cleanup_binary_staging(&staging)?;
+                    partial = true;
+                    persist_resolution_progress(&job.id, &mut checkpoint, &discovery, None)?;
+                    continue;
+                };
+                let typed_path = acquired.path.with_extension(extension);
+                fs::rename(&acquired.path, &typed_path)
+                    .context("typing acquired binary staging file")?;
+                match publication::publish(
+                    job,
+                    &RemoteBinaryAcquisition {
+                        job,
+                        source: &typed_path,
+                        source_url: &acquired.final_url,
+                        sha256: &acquired.sha256,
+                        provenance: RemoteProvenance {
+                            requested_url: discovery.source.clone(),
+                            final_url: acquired.final_url.clone(),
+                            mime: acquired.mime.clone(),
+                            sha256: acquired.sha256.clone(),
+                            size_bytes: acquired.size_bytes,
+                            redirect_chain: acquired.redirect_chain.clone(),
+                        },
+                    },
+                )? {
+                    Publication::Published {
+                        capture_id,
+                        partial: child_partial,
+                        reused,
+                    } => {
+                        append_discovery_event(
+                            parent_capture_id,
+                            &job.id,
+                            &discovery,
+                            if reused {
+                                "reused"
+                            } else if child_partial {
+                                "failed"
+                            } else {
+                                "captured"
+                            },
+                            Some(
+                                json!({"capture_id": capture_id, "reference": reference_for_capture(&capture_id)?, "requested_url": discovery.source, "final_url": acquired.final_url, "mime": acquired.mime, "sha256": acquired.sha256, "size_bytes": acquired.size_bytes, "redirect_chain": acquired.redirect_chain}),
+                            ),
+                        )?;
+                        child_capture_ids.push(capture_id);
+                        persist_resolution_progress(
+                            &job.id,
+                            &mut checkpoint,
+                            &discovery,
+                            child_capture_ids.last().map(String::as_str),
+                        )?;
+                        partial |= child_partial;
+                    }
+                    Publication::Cancelled => return Ok(()),
+                }
+                cleanup_binary_staging(&staging)?;
+                write_checkpoint(&job.id, &checkpoint)?;
+            }
+            Err(error) => {
+                append_discovery_event(
+                    parent_capture_id,
+                    &job.id,
+                    &discovery,
+                    "failed",
+                    Some(json!({"message": format!("{error:#}")})),
+                )?;
+                if read_job(&job.id)?.state == "cancelled" {
+                    return Ok(());
+                }
+                partial = true;
+                persist_resolution_progress(&job.id, &mut checkpoint, &discovery, None)?;
+            }
+        }
+    }
+    complete_continuation_job(&job.id, child_capture_ids, partial)
+}
+
+enum WebDiscoveryPublication {
+    Published(Publication),
+    Cycle,
+}
+
+fn publish_web_discovery(
+    job: &Job,
+    discovery: &QueuedDiscovery,
+    queue: &mut Vec<QueuedDiscovery>,
+) -> Result<WebDiscoveryPublication> {
+    let publication = match publication::publish(
+        job,
+        &web_capture::WebAcquisition {
+            job,
+            url: &discovery.source,
+            forbidden_final_urls: &discovery.ancestors,
+        },
+    ) {
+        Ok(publication) => publication,
+        Err(error) if format!("{error:#}").contains(web_capture::FINAL_URL_CYCLE) => {
+            return Ok(WebDiscoveryPublication::Cycle);
+        }
+        Err(error) => return Err(error),
+    };
+    if let Publication::Published { capture_id, .. } = &publication {
+        let child: Manifest = read_json(&captures_dir()?.join(capture_id).join("manifest.json"))?;
+        let mut ancestors = discovery.ancestors.clone();
+        ancestors.push(normalized_web_url(&child.source.locator)?);
+        let mut parent_order_path = discovery.order_path.clone();
+        if parent_order_path.is_empty() {
+            parent_order_path.push(discovery.order);
+        }
+        queue.extend(child.discoveries.into_iter().filter_map(|child| {
+            (child.status == "inventoried" || child.status == "skipped_budget").then_some(
+                QueuedDiscovery {
+                    discovery_id: child.id,
+                    source: child.source,
+                    depth: discovery.depth.saturating_add(1),
+                    order: child.order,
+                    order_path: {
+                        let mut order_path = parent_order_path.clone();
+                        order_path.push(child.order);
+                        order_path
+                    },
+                    ancestors: ancestors.clone(),
+                    kind: child.kind,
+                },
+            )
+        }));
+    }
+    Ok(WebDiscoveryPublication::Published(publication))
+}
+
+fn sort_resolution_queue(queue: &mut [QueuedDiscovery]) {
+    queue.sort_by(|left, right| {
+        left.depth.cmp(&right.depth).then_with(|| {
+            if left.order_path.is_empty() && right.order_path.is_empty() {
+                left.order.cmp(&right.order)
+            } else {
+                left.order_path.cmp(&right.order_path)
+            }
+        })
+    });
+}
+
+fn normalized_mime(mime: &str) -> String {
+    mime.split(';')
+        .next()
+        .unwrap_or_default()
+        .trim()
+        .to_ascii_lowercase()
+}
+
+fn cleanup_binary_staging(staging: &Path) -> Result<()> {
+    let path = staging.join("binary-acquisition");
+    fs::remove_dir_all(&path).with_context(|| format!("cleaning binary staging {}", path.display()))
+}
+
+fn normalized_web_url(value: &str) -> Result<String> {
+    let mut url = Url::parse(value).with_context(|| format!("parsing Web URL `{value}`"))?;
+    url.set_fragment(None);
+    Ok(url.to_string())
+}
+
+fn reference_for_capture(capture_id: &str) -> Result<Reference> {
+    let manifest: Manifest = read_json(&captures_dir()?.join(capture_id).join("manifest.json"))?;
+    Ok(reference_for(&manifest))
+}
+
+fn binary_magic(path: &Path) -> Result<Option<&'static str>> {
+    let mut file = File::open(path)
+        .with_context(|| format!("opening binary MIME probe {}", path.display()))?;
+    let mut bytes = [0_u8; 16];
+    let size = file.read(&mut bytes).context("reading binary MIME probe")?;
+    let bytes = bytes.get(..size).context("slicing binary MIME probe")?;
+    Ok(if bytes.starts_with(b"%PDF-") {
+        Some("application/pdf")
+    } else if bytes.starts_with(b"\x89PNG\r\n\x1a\n") {
+        Some("image/png")
+    } else if bytes.starts_with(&[0xff, 0xd8, 0xff]) {
+        Some("image/jpeg")
+    } else if bytes.starts_with(b"GIF87a") || bytes.starts_with(b"GIF89a") {
+        Some("image/gif")
+    } else if bytes.get(..4) == Some(b"RIFF") && bytes.get(8..12) == Some(b"WEBP") {
+        Some("image/webp")
+    } else if bytes.get(..4) == Some(b"II*\0") || bytes.get(..4) == Some(b"MM\0*") {
+        Some("image/tiff")
+    } else if bytes.get(..3) == Some(b"ID3") || has_mp3_frame_header(bytes) {
+        Some("audio/mpeg")
+    } else if bytes.get(..4) == Some(b"RIFF") && bytes.get(8..12) == Some(b"WAVE") {
+        Some("audio/wav")
+    } else if bytes.get(..4) == Some(b"OggS") {
+        Some("audio/ogg")
+    } else if bytes.get(4..8) == Some(b"ftyp") {
+        Some("video/mp4")
+    } else if bytes.get(..4) == Some(&[0x1a, 0x45, 0xdf, 0xa3]) {
+        Some("video/webm")
+    } else {
+        None
+    })
+}
+
+const fn has_mp3_frame_header(bytes: &[u8]) -> bool {
+    let Some((&first, remaining)) = bytes.split_first() else {
+        return false;
+    };
+    let Some((&second, remaining)) = remaining.split_first() else {
+        return false;
+    };
+    let Some(&third) = remaining.first() else {
+        return false;
+    };
+    first == 0xff
+        && second & 0xe0 == 0xe0
+        && second & 0x18 != 0x08
+        && second & 0x06 != 0
+        && third & 0xf0 != 0
+        && third & 0xf0 != 0xf0
+        && third & 0x0c != 0x0c
+}
+
+fn is_html_discovery(path: &Path, mime: &str) -> Result<bool> {
+    Ok(normalized_mime(mime) == "text/html" && binary_magic(path)?.is_none())
+}
+
+fn binary_extension(path: &Path, mime: &str) -> Result<Option<&'static str>> {
+    let declared = normalized_mime(mime);
+    let magic = binary_magic(path)?;
+    if magic != Some(declared.as_str()) {
+        return Ok(None);
+    }
+    Ok(match declared.as_str() {
+        "application/pdf" => Some("pdf"),
+        "image/png" => Some("png"),
+        "image/jpeg" => Some("jpg"),
+        "image/gif" => Some("gif"),
+        "image/webp" => Some("webp"),
+        "image/tiff" => Some("tiff"),
+        "audio/mpeg" => Some("mp3"),
+        "audio/mp4" => Some("m4a"),
+        "audio/ogg" => Some("ogg"),
+        "audio/wav" => Some("wav"),
+        "video/mp4" => Some("mp4"),
+        "video/webm" => Some("webm"),
+        _ => None,
+    })
+}
+
+impl JobOperation {
+    fn discovery_ids(&self) -> &[String] {
+        match self {
+            Self::Continue { discovery_ids, .. } => discovery_ids,
+            Self::Capture => &[],
+        }
+    }
+}
+
+fn job_staging_dir(job_id: &str) -> Result<PathBuf> {
+    let path = repository_dir()?.join("job-staging").join(job_id);
+    fs::create_dir_all(&path)
+        .with_context(|| format!("creating Job staging directory {}", path.display()))?;
+    Ok(path)
+}
+
+fn write_checkpoint(job_id: &str, checkpoint: &ResolutionCheckpoint) -> Result<()> {
+    let lock = lock_job(job_id)?;
+    let mut job = read_job(job_id)?;
+    job.checkpoint = Some(checkpoint.clone());
+    write_job(&job)?;
+    unlock_job(&lock)
+}
+
+fn persist_resolution_progress(
+    job_id: &str,
+    checkpoint: &mut ResolutionCheckpoint,
+    completed: &QueuedDiscovery,
+    child_capture_id: Option<&str>,
+) -> Result<()> {
+    let index = checkpoint
+        .queue
+        .iter()
+        .position(|queued| queued.discovery_id == completed.discovery_id)
+        .context("finding completed Discovery in continuation checkpoint")?;
+    checkpoint.queue.remove(index);
+    let lock = lock_job(job_id)?;
+    let mut job = read_job(job_id)?;
+    job.checkpoint = Some(checkpoint.clone());
+    if let Some(capture_id) = child_capture_id
+        && !job.child_capture_ids.iter().any(|id| id == capture_id)
+    {
+        job.child_capture_ids.push(capture_id.to_string());
+    }
+    write_job(&job)?;
+    unlock_job(&lock)
+}
+
+fn append_discovery_event(
+    capture_id: &str,
+    job_id: &str,
+    discovery: &QueuedDiscovery,
+    status: &str,
+    details: Option<Value>,
+) -> Result<()> {
+    let lock = lock_capture_ledger(capture_id)?;
+    let ledger_path = captures_dir()?.join(capture_id).join("ledger.jsonl");
+    let events: Vec<LedgerEvent> = read_json_lines(&ledger_path)?;
+    if events.iter().any(|event| {
+        event.event == "discovery_resolved"
+            && event.job_id == job_id
+            && event
+                .details
+                .as_ref()
+                .and_then(|details| details.get("discovery_id"))
+                .and_then(Value::as_str)
+                == Some(discovery.discovery_id.as_str())
+    }) {
+        return FileExt::unlock(&lock).context("unlocking Capture ledger");
+    }
+    let mut payload = serde_json::Map::new();
+    payload.insert("discovery_id".to_string(), json!(discovery.discovery_id));
+    payload.insert("status".to_string(), json!(status));
+    if let Some(Value::Object(details)) = details {
+        payload.extend(details);
+    }
+    append_json_line(
+        &ledger_path,
+        &LedgerEvent {
+            event: "discovery_resolved".to_string(),
+            at: now_secs(),
+            job_id: job_id.to_string(),
+            details: Some(Value::Object(payload)),
+        },
+    )?;
+    FileExt::unlock(&lock).context("unlocking Capture ledger")
 }
 
 fn publish_capture(job: &Job) -> Result<Publication> {
@@ -591,15 +1303,55 @@ fn publish_capture(job: &Job) -> Result<Publication> {
                 source: &source,
             },
         ),
-        admission::Source::Web(url) => {
-            publication::publish(job, &web_capture::WebAcquisition { job, url: &url })
-        }
+        admission::Source::Web(url) => publication::publish(
+            job,
+            &web_capture::WebAcquisition {
+                job,
+                url: &url,
+                forbidden_final_urls: &[],
+            },
+        ),
     }
 }
 
 struct LocalAcquisition<'a> {
     job: &'a Job,
     source: &'a Path,
+}
+
+struct RemoteBinaryAcquisition<'a> {
+    job: &'a Job,
+    source: &'a Path,
+    source_url: &'a str,
+    sha256: &'a str,
+    provenance: RemoteProvenance,
+}
+
+impl Acquisition for RemoteBinaryAcquisition<'_> {
+    fn source_hash(&self, _staging: &Path) -> Result<AcquisitionResult<String>> {
+        Ok(AcquisitionResult::Ready(self.sha256.to_string()))
+    }
+
+    fn acquire(
+        &self,
+        capture: &publication::StagedCapture,
+        source_hash: &str,
+    ) -> Result<AcquisitionResult<PreparedCapture>> {
+        let mut source_job = self.job.clone();
+        source_job.source = self.source.to_string_lossy().into_owned();
+        LocalAcquisition {
+            job: &source_job,
+            source: self.source,
+        }
+        .acquire(capture, source_hash)
+        .map(|result| match result {
+            AcquisitionResult::Ready(prepared) => AcquisitionResult::Ready(
+                prepared
+                    .with_remote_provenance(self.source_url.to_string(), self.provenance.clone()),
+            ),
+            AcquisitionResult::Cancelled => AcquisitionResult::Cancelled,
+        })
+    }
 }
 
 impl LocalAcquisition<'_> {
@@ -689,6 +1441,7 @@ impl Acquisition for LocalAcquisition<'_> {
             capabilities: Vec::new(),
             artifacts: Vec::new(),
             discoveries: Vec::new(),
+            remote_provenance: None,
         };
         if is_media_source(self.source) {
             capture_local_media(
@@ -1712,6 +2465,28 @@ fn complete_job(job_id: &str, capture_id: String, partial: bool) -> Result<()> {
     unlock_job(&lock)
 }
 
+fn complete_continuation_job(
+    job_id: &str,
+    child_capture_ids: Vec<String>,
+    partial: bool,
+) -> Result<()> {
+    let lock = lock_job(job_id)?;
+    let mut job = read_job(job_id)?;
+    if job.state != "cancelled" {
+        job.state = if partial {
+            "partial".to_string()
+        } else {
+            "succeeded".to_string()
+        };
+        job.updated_at = now_secs();
+        job.worker_pid = None;
+        job.child_capture_ids = child_capture_ids;
+        write_job(&job)?;
+        append_job_event(job_id, &job.state)?;
+    }
+    unlock_job(&lock)
+}
+
 fn register_worker(job_id: &str, worker_pid: u32) -> Result<()> {
     let lock = lock_job(job_id)?;
     let mut job = read_job(job_id)?;
@@ -1754,7 +2529,7 @@ fn error_code(error: &anyhow::Error) -> String {
 }
 
 fn print_job(job_id: &str) -> Result<()> {
-    let job = reconcile_interrupted(read_job(job_id)?)?;
+    let job = reconcile_interrupted(job_id)?;
     print_json(&job)
 }
 
@@ -1763,7 +2538,7 @@ fn wait_for_job(job_id: &str, timeout_secs: u64) -> Result<()> {
         .checked_add(Duration::from_secs(timeout_secs))
         .context("calculating Job wait deadline")?;
     loop {
-        let job = reconcile_interrupted(read_job(job_id)?)?;
+        let job = reconcile_interrupted(job_id)?;
         if is_terminal(&job.state) {
             return print_json(&job);
         }
@@ -1871,6 +2646,7 @@ fn search_captures(query: &str, cursor: Option<&str>, limit: usize) -> Result<()
             capabilities: Vec::new(),
             artifacts: Vec::new(),
             discoveries: Vec::new(),
+            remote_provenance: None,
         })
         .collect();
     print_json(&capture_page(manifests, cursor, limit, &binding)?)
@@ -2325,7 +3101,9 @@ fn mime_for_source(source: &Path) -> &'static str {
     }
 }
 
-fn reconcile_interrupted(mut job: Job) -> Result<Job> {
+fn reconcile_interrupted(job_id: &str) -> Result<Job> {
+    let lock = lock_job(job_id)?;
+    let mut job = read_job(job_id)?;
     if matches!(job.state.as_str(), "queued" | "running")
         && job
             .worker_pid
@@ -2337,6 +3115,7 @@ fn reconcile_interrupted(mut job: Job) -> Result<Job> {
         write_job(&job)?;
         append_job_event(&job.id, "interrupted")?;
     }
+    unlock_job(&lock)?;
     Ok(job)
 }
 
@@ -2352,7 +3131,7 @@ fn policy_for(name: &str) -> Result<Policy> {
         duration_limit_secs: 30 * 60,
         concurrency_limit: 2,
     };
-    let allowed_providers = if name == POLICY_NAME {
+    let allowed_providers = if name == POLICY_NAME || name == "safe-web@1" {
         vec![
             "ffmpeg".to_string(),
             "ffprobe".to_string(),
@@ -2492,6 +3271,7 @@ fn append_job_event(job_id: &str, event: &str) -> Result<()> {
             event: event.to_string(),
             at: now_secs(),
             job_id: job_id.to_string(),
+            details: None,
         },
     )
 }
@@ -2531,6 +3311,22 @@ fn lock_capture_key(source_hash: &str) -> Result<File> {
         .with_context(|| format!("opening Capture key lock {}", path.display()))?;
     file.lock_exclusive()
         .with_context(|| format!("locking Capture key {}", path.display()))?;
+    Ok(file)
+}
+
+fn lock_capture_ledger(capture_id: &str) -> Result<File> {
+    let directory = repository_dir()?.join("capture-ledgers");
+    fs::create_dir_all(&directory)
+        .with_context(|| format!("creating Capture ledger directory {}", directory.display()))?;
+    let path = directory.join(capture_id);
+    let file = OpenOptions::new()
+        .create(true)
+        .truncate(false)
+        .write(true)
+        .open(&path)
+        .with_context(|| format!("opening Capture ledger lock {}", path.display()))?;
+    file.lock_exclusive()
+        .with_context(|| format!("locking Capture ledger {}", path.display()))?;
     Ok(file)
 }
 
@@ -2645,4 +3441,106 @@ fn print_json<T: Serialize>(value: &T) -> Result<()> {
     let rendered = serde_json::to_string(value).context("serializing agent response")?;
     println!("{rendered}");
     Ok(())
+}
+
+#[cfg(test)]
+mod continuation_tests {
+    use super::{
+        QueuedDiscovery, binary_extension, is_html_discovery, sort_resolution_queue, unique_id,
+    };
+    use std::fs;
+
+    #[test]
+    fn rejects_a_declared_mime_that_conflicts_with_magic_bytes() {
+        let path = std::env::temp_dir().join(format!("scriptor-mime-lie-{}", unique_id()));
+        assert!(fs::write(&path, b"%PDF-1.4").is_ok());
+        assert_eq!(binary_extension(&path, "image/png").ok(), Some(None));
+        assert_eq!(
+            binary_extension(&path, "application/pdf").ok(),
+            Some(Some("pdf"))
+        );
+        let _ = fs::remove_file(path);
+    }
+
+    #[test]
+    fn rejects_media_declared_only_by_content_type() {
+        let path = std::env::temp_dir().join(format!("scriptor-media-lie-{}", unique_id()));
+        assert!(fs::write(&path, b"not a media container").is_ok());
+        assert_eq!(binary_extension(&path, "video/mp4").ok(), Some(None));
+        assert_eq!(binary_extension(&path, "audio/mpeg").ok(), Some(None));
+        let _ = fs::remove_file(path);
+    }
+
+    #[test]
+    fn rejects_binary_content_declared_as_html() {
+        let path = std::env::temp_dir().join(format!("scriptor-html-lie-{}", unique_id()));
+        assert!(fs::write(&path, b"%PDF-1.4").is_ok());
+        assert_eq!(is_html_discovery(&path, "text/html").ok(), Some(false));
+        assert!(fs::write(&path, b"<!doctype html><title>page</title>").is_ok());
+        assert_eq!(is_html_discovery(&path, "text/html").ok(), Some(true));
+        let _ = fs::remove_file(path);
+    }
+
+    #[test]
+    fn validates_the_full_mp3_frame_sync() {
+        let path = std::env::temp_dir().join(format!("scriptor-mp3-magic-{}", unique_id()));
+        assert!(fs::write(&path, [0xe0, 0, 0]).is_ok());
+        assert_eq!(binary_extension(&path, "audio/mpeg").ok(), Some(None));
+        assert!(fs::write(&path, [0xff, 0xfb, 0x90, 0x64]).is_ok());
+        assert_eq!(
+            binary_extension(&path, "audio/mpeg").ok(),
+            Some(Some("mp3"))
+        );
+        let _ = fs::remove_file(path);
+    }
+
+    #[test]
+    fn orders_nested_discoveries_breadth_first() {
+        let mut queue = vec![
+            QueuedDiscovery {
+                discovery_id: "deep".to_string(),
+                source: "https://example.test/deep".to_string(),
+                depth: 2,
+                order: 0,
+                order_path: vec![0, 0],
+                ancestors: Vec::new(),
+                kind: None,
+            },
+            QueuedDiscovery {
+                discovery_id: "second".to_string(),
+                source: "https://example.test/second".to_string(),
+                depth: 1,
+                order: 1,
+                order_path: vec![1],
+                ancestors: Vec::new(),
+                kind: None,
+            },
+            QueuedDiscovery {
+                discovery_id: "first".to_string(),
+                source: "https://example.test/first".to_string(),
+                depth: 1,
+                order: 0,
+                order_path: vec![0],
+                ancestors: Vec::new(),
+                kind: None,
+            },
+        ];
+        sort_resolution_queue(&mut queue);
+        assert_eq!(
+            queue
+                .iter()
+                .map(|item| item.discovery_id.as_str())
+                .collect::<Vec<_>>(),
+            vec!["first", "second", "deep"]
+        );
+    }
+
+    #[test]
+    fn source_budget_leaves_every_discovery_after_the_fiftieth_unattempted() {
+        let discoveries = (0..51).collect::<Vec<_>>();
+        let attempted = discoveries.iter().take(50).count();
+        let skipped = discoveries.iter().skip(50).count();
+        assert_eq!(attempted, 50);
+        assert_eq!(skipped, 1);
+    }
 }

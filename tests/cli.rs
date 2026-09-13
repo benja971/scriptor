@@ -147,6 +147,161 @@ printf '{"final_url":"https://93.184.216.34/"}' > "$out/provenance.json"
 const FAKE_PAGE_RENDERER_PRIVATE_TARGET: &str =
     "#!/bin/sh\necho web_private_target_refused >&2\nexit 1\n";
 
+const FAKE_PAGE_RENDERER_SKIPPED_DISCOVERY: &str = r#"#!/bin/sh
+set -eu
+while [ "$#" -gt 0 ]; do
+  if [ "$1" = "--output-dir" ]; then out="$2"; break; fi
+  shift
+done
+printf '<main>preuve</main>' > "$out/proofs/dom.html"
+printf 'preuve' > "$out/proofs/screenshot.png"
+printf '# contenu\n' > "$out/extractions/page.md"
+printf '[{"url":"https://93.184.216.34/document.pdf","parent_locator":{"kind":"url","value":"https://93.184.216.34/"},"locator":{"kind":"css-selector","value":"a"},"order":0,"status":"skipped_budget","reason":"budget"}]' > "$out/discoveries.json"
+printf '{"final_url":"https://93.184.216.34/"}' > "$out/provenance.json"
+"#;
+
+const FAKE_BINARY_ACQUIRER: &str = r#"#!/bin/sh
+set -eu
+while [ "$#" -gt 0 ]; do
+  if [ "$1" = "--output-dir" ]; then out="$2"; break; fi
+  shift
+done
+printf '%s' '%PDF-1.4' > "$out/payload"
+printf '{"requested_url":"https://93.184.216.34/document.pdf","final_url":"https://93.184.216.34/document.pdf","mime":"application/pdf","sha256":"e16fa5d9b51928755db85b917f0297babaf22c7a47e97d9212adab56e61ba04e","size_bytes":8}' > "$out/metadata.json"
+"#;
+
+const FAKE_PAGE_RENDERER_TREE: &str = r#"#!/bin/sh
+set -eu
+url=""
+while [ "$#" -gt 0 ]; do
+  case "$1" in
+    --url) url="$2"; shift 2 ;;
+    --output-dir) out="$2"; shift 2 ;;
+    *) shift ;;
+  esac
+done
+case "$url" in
+  https://93.184.216.34/tree-root)
+    final="$url"
+    discoveries='[{"url":"https://93.184.216.34/tree-a","parent_locator":{"kind":"url","value":"https://93.184.216.34/tree-root"},"locator":{"kind":"css-selector","value":"iframe:nth-of-type(1)"},"order":0,"status":"skipped_budget","reason":"budget","kind":"web"},{"url":"https://93.184.216.34/tree-b","parent_locator":{"kind":"url","value":"https://93.184.216.34/tree-root"},"locator":{"kind":"css-selector","value":"iframe:nth-of-type(2)"},"order":1,"status":"skipped_budget","reason":"budget","kind":"web"}]'
+    ;;
+  https://93.184.216.34/tree-a)
+    final="https://93.184.216.34/tree-a-final"
+    discoveries='[{"url":"https://93.184.216.34/tree-a1","parent_locator":{"kind":"url","value":"https://93.184.216.34/tree-a-final"},"locator":{"kind":"css-selector","value":"iframe:nth-of-type(1)"},"order":0,"status":"inventoried","reason":"embedded_content","kind":"web"},{"url":"https://93.184.216.34/tree-a2","parent_locator":{"kind":"url","value":"https://93.184.216.34/tree-a-final"},"locator":{"kind":"css-selector","value":"iframe:nth-of-type(2)"},"order":1,"status":"inventoried","reason":"embedded_content","kind":"web"}]'
+    ;;
+  https://93.184.216.34/tree-b)
+    final="$url"
+    discoveries='[{"url":"https://93.184.216.34/tree-b1","parent_locator":{"kind":"url","value":"https://93.184.216.34/tree-b"},"locator":{"kind":"css-selector","value":"iframe:nth-of-type(1)"},"order":0,"status":"inventoried","reason":"embedded_content","kind":"web"}]'
+    ;;
+  *)
+    final="$url"
+    discoveries='[]'
+    ;;
+esac
+printf '<main>preuve</main>' > "$out/proofs/dom.html"
+printf 'preuve' > "$out/proofs/screenshot.png"
+printf '# contenu\n' > "$out/extractions/page.md"
+printf '%s' "$discoveries" > "$out/discoveries.json"
+printf '{"initial_url":"%s","final_url":"%s","redirect_chain":["%s","%s"]}' "$url" "$final" "$url" "$final" > "$out/provenance.json"
+if [ "$url" != "https://93.184.216.34/tree-root" ]; then
+  printf '%s\n' "$url" >> "$XDG_CACHE_HOME/renderer-order"
+fi
+"#;
+
+const FAKE_PAGE_RENDERER_RESOLUTION_CASES: &str = r#"#!/bin/sh
+set -eu
+url=""
+while [ "$#" -gt 0 ]; do
+  case "$1" in
+    --url) url="$2"; shift 2 ;;
+    --output-dir) out="$2"; shift 2 ;;
+    *) shift ;;
+  esac
+done
+case "$url" in
+  https://93.184.216.34/many-root)
+    discoveries="["
+    i=0
+    while [ "$i" -lt 51 ]; do
+      [ "$i" -eq 0 ] || discoveries="$discoveries,"
+      discoveries="$discoveries{\"url\":\"https://93.184.216.34/many-$i\",\"parent_locator\":{\"kind\":\"url\",\"value\":\"$url\"},\"locator\":{\"kind\":\"css-selector\",\"value\":\"iframe:nth-of-type($i)\"},\"order\":$i,\"status\":\"skipped_budget\",\"reason\":\"budget\",\"kind\":\"web\"}"
+      i=$((i + 1))
+    done
+    discoveries="$discoveries]"
+    final="$url"
+    ;;
+  https://93.184.216.34/cycle-root)
+    discoveries='[{"url":"https://93.184.216.34/cycle-child","parent_locator":{"kind":"url","value":"https://93.184.216.34/cycle-root"},"locator":{"kind":"css-selector","value":"iframe"},"order":0,"status":"skipped_budget","reason":"budget","kind":"web"}]'
+    final="$url"
+    ;;
+  https://93.184.216.34/cycle-child)
+    discoveries='[]'
+    final="https://93.184.216.34/cycle-root"
+    ;;
+  https://93.184.216.34/slow-root)
+    discoveries='[{"url":"https://93.184.216.34/slow-child","parent_locator":{"kind":"url","value":"https://93.184.216.34/slow-root"},"locator":{"kind":"css-selector","value":"iframe"},"order":0,"status":"skipped_budget","reason":"budget","kind":"web"}]'
+    final="$url"
+    ;;
+  https://93.184.216.34/slow-child)
+    printf 'x' > "$XDG_CACHE_HOME/renderer-started"
+    while :; do :; done
+    ;;
+  https://93.184.216.34/crash-root)
+    discoveries='[{"url":"https://93.184.216.34/crash-child","parent_locator":{"kind":"url","value":"https://93.184.216.34/crash-root"},"locator":{"kind":"css-selector","value":"iframe"},"order":0,"status":"skipped_budget","reason":"budget","kind":"web"}]'
+    final="$url"
+    ;;
+  https://93.184.216.34/crash-child)
+    exit 1
+    ;;
+  *)
+    discoveries='[]'
+    final="$url"
+    ;;
+esac
+printf '<main>preuve</main>' > "$out/proofs/dom.html"
+printf 'preuve' > "$out/proofs/screenshot.png"
+printf '# contenu\n' > "$out/extractions/page.md"
+printf '%s' "$discoveries" > "$out/discoveries.json"
+printf '{"initial_url":"%s","final_url":"%s","redirect_chain":["%s","%s"]}' "$url" "$final" "$url" "$final" > "$out/provenance.json"
+case "$url" in
+  https://93.184.216.34/many-[0-9]*) printf '%s\n' "$url" >> "$XDG_CACHE_HOME/renderer-order" ;;
+esac
+"#;
+
+const FAKE_PAGE_RENDERER_MIME_LIES: &str = r#"#!/bin/sh
+set -eu
+while [ "$#" -gt 0 ]; do
+  case "$1" in
+    --output-dir) out="$2"; shift 2 ;;
+    *) shift ;;
+  esac
+done
+printf '<main>preuve</main>' > "$out/proofs/dom.html"
+printf 'preuve' > "$out/proofs/screenshot.png"
+printf '# contenu\n' > "$out/extractions/page.md"
+printf '[{"url":"https://93.184.216.34/fake-video","parent_locator":{"kind":"url","value":"https://93.184.216.34/mime-root"},"locator":{"kind":"css-selector","value":"video"},"order":0,"status":"skipped_budget","reason":"budget"},{"url":"https://93.184.216.34/fake-audio","parent_locator":{"kind":"url","value":"https://93.184.216.34/mime-root"},"locator":{"kind":"css-selector","value":"audio"},"order":1,"status":"skipped_budget","reason":"budget"}]' > "$out/discoveries.json"
+printf '{"initial_url":"https://93.184.216.34/mime-root","final_url":"https://93.184.216.34/mime-root","redirect_chain":["https://93.184.216.34/mime-root"]}' > "$out/provenance.json"
+"#;
+
+const FAKE_BINARY_ACQUIRER_MIME_LIES: &str = r#"#!/bin/sh
+set -eu
+url=""
+while [ "$#" -gt 0 ]; do
+  case "$1" in
+    --url) url="$2"; shift 2 ;;
+    --output-dir) out="$2"; shift 2 ;;
+    *) shift ;;
+  esac
+done
+case "$url" in
+  *fake-video) mime="video/mp4" ;;
+  *fake-audio) mime="audio/mpeg" ;;
+  *) exit 1 ;;
+esac
+printf 'not media' > "$out/payload"
+printf '{"requested_url":"%s","final_url":"%s","mime":"%s","sha256":"58aa1545ba429abc10d60b9b4431ee615d7e87e3ddcf15904f7199efe6fc8570","size_bytes":9,"redirect_chain":["%s"]}' "$url" "$url" "$mime" "$url" > "$out/metadata.json"
+"#;
+
 /// Faux `yt-dlp` reproduisant exactement les arguments passés par
 /// `download.rs` (`--paths`, `--output`, `--print-to-file after_move:filepath
 /// <marker>`) : écrit un faux fichier vidéo (non vide - `wait_for_file` exige
@@ -346,6 +501,54 @@ fn wait_for_job_state(path: &Path, state: &str, timeout: Duration) -> bool {
         std::thread::sleep(Duration::from_millis(10));
     }
     false
+}
+
+fn create_safe_web_capture(env: &TestEnv, source: &str) -> Value {
+    serde_json::from_slice(
+        &env.command()
+            .args(["capture", source, "--policy", "safe-web@1"])
+            .assert()
+            .success()
+            .get_output()
+            .stdout,
+    )
+    .expect("Job JSON valide")
+}
+
+fn wait_for_agent_job(env: &TestEnv, job_id: &str) -> Value {
+    serde_json::from_slice(
+        &env.command()
+            .args(["job", "wait", job_id, "--timeout-secs", "5"])
+            .assert()
+            .success()
+            .get_output()
+            .stdout,
+    )
+    .expect("Job JSON valide")
+}
+
+fn continue_safe_web_capture(env: &TestEnv, capture_id: &str) -> Value {
+    serde_json::from_slice(
+        &env.command()
+            .args(["capture", "continue", capture_id, "--policy", "safe-web@1"])
+            .assert()
+            .success()
+            .get_output()
+            .stdout,
+    )
+    .expect("Job de continuation JSON valide")
+}
+
+fn inspect_agent_capture(env: &TestEnv, capture_id: &str) -> Value {
+    serde_json::from_slice(
+        &env.command()
+            .args(["capture", "inspect", capture_id])
+            .assert()
+            .success()
+            .get_output()
+            .stdout,
+    )
+    .expect("Capture JSON valide")
 }
 
 fn assert_readable_transcription(env: &TestEnv, capture_id: &str, capture: &Value) {
@@ -736,7 +939,7 @@ fn capture_returns_a_persistent_job_then_publishes_an_inspectable_capture() {
         .stdout
         .clone();
     let finished: Value = serde_json::from_slice(&output).expect("Job JSON valide");
-    assert_eq!(finished["state"], "succeeded");
+    assert_eq!(finished["state"], "succeeded", "{finished}");
     let capture_id = finished["capture_id"]
         .as_str()
         .expect("identifiant de Capture");
@@ -963,6 +1166,13 @@ fn safe_web_publishes_a_portable_capture() {
         "proof-dom"
     );
     assert_eq!(capture["manifest"]["discoveries"][0]["order"], 0);
+    let provenance = &capture["manifest"]["remote_provenance"];
+    assert_eq!(provenance["requested_url"], "https://93.184.216.34/");
+    assert_eq!(provenance["final_url"], "https://93.184.216.34/");
+    assert_eq!(provenance["mime"], "text/html");
+    assert!(provenance["sha256"].is_string());
+    assert!(provenance["size_bytes"].is_u64());
+    assert!(provenance["redirect_chain"].is_array());
     env.command()
         .args(["capture", "search", "preuve"])
         .assert()
@@ -996,6 +1206,416 @@ fn safe_web_publishes_a_portable_capture() {
     .expect("Job de Doublon terminé JSON valide");
     assert_eq!(reused["state"], "succeeded");
     assert_eq!(reused["capture_id"], capture_id);
+}
+
+#[test]
+#[allow(clippy::too_many_lines)]
+fn capture_continue_publishes_a_discovered_pdf_without_mutating_its_parent() {
+    let env = TestEnv::new("continue-web-discovery");
+    env.install_binary(
+        "scriptor-page-renderer",
+        FAKE_PAGE_RENDERER_SKIPPED_DISCOVERY,
+    );
+    env.install_binary("scriptor-binary-acquirer", FAKE_BINARY_ACQUIRER);
+    env.install_binary("pdfinfo", FAKE_PDFINFO);
+    env.install_binary("pdftotext", FAKE_PDFTOTEXT);
+    let root: Value = serde_json::from_slice(
+        &env.command()
+            .args([
+                "capture",
+                "https://93.184.216.34/",
+                "--policy",
+                "safe-web@1",
+            ])
+            .assert()
+            .success()
+            .get_output()
+            .stdout,
+    )
+    .expect("Job JSON valide");
+    let root_job = root["job"]["job_id"].as_str().expect("Job racine");
+    let root_done: Value = serde_json::from_slice(
+        &env.command()
+            .args(["job", "wait", root_job, "--timeout-secs", "5"])
+            .assert()
+            .success()
+            .get_output()
+            .stdout,
+    )
+    .expect("Job racine fini");
+    let capture_id = root_done["capture_id"].as_str().expect("Capture racine");
+    let root_capture: Value = serde_json::from_slice(
+        &env.command()
+            .args(["capture", "inspect", capture_id])
+            .assert()
+            .success()
+            .get_output()
+            .stdout,
+    )
+    .expect("Capture racine inspectée");
+    let discovery_id = root_capture["manifest"]["discoveries"][0]["discovery_id"]
+        .as_str()
+        .expect("identifiant de Découverte");
+    let continued: Value = serde_json::from_slice(
+        &env.command()
+            .args([
+                "capture",
+                "continue",
+                capture_id,
+                "--policy",
+                "safe-web@1",
+                "--discovery",
+                discovery_id,
+            ])
+            .assert()
+            .success()
+            .get_output()
+            .stdout,
+    )
+    .expect("Job continue JSON");
+    assert!(continued["job"].is_object(), "{continued}");
+    let continue_id = continued["job"]["job_id"].as_str().expect("Job continue");
+    let finished: Value = serde_json::from_slice(
+        &env.command()
+            .args(["job", "wait", continue_id, "--timeout-secs", "5"])
+            .assert()
+            .success()
+            .get_output()
+            .stdout,
+    )
+    .expect("Job continue fini");
+    assert_eq!(finished["state"], "succeeded", "{finished}");
+    assert_eq!(
+        finished["child_capture_ids"].as_array().map(Vec::len),
+        Some(1)
+    );
+    let child_id = finished["child_capture_ids"][0]
+        .as_str()
+        .expect("Capture enfant");
+    let child: Value = serde_json::from_slice(
+        &env.command()
+            .args(["capture", "inspect", child_id])
+            .assert()
+            .success()
+            .get_output()
+            .stdout,
+    )
+    .expect("Capture enfant inspectée");
+    assert_eq!(
+        child["manifest"]["remote_provenance"]["requested_url"],
+        "https://93.184.216.34/document.pdf"
+    );
+    assert_eq!(
+        child["manifest"]["source"]["locator"],
+        "https://93.184.216.34/document.pdf"
+    );
+    let parent: Value = serde_json::from_slice(
+        &env.command()
+            .args(["capture", "inspect", capture_id])
+            .assert()
+            .success()
+            .get_output()
+            .stdout,
+    )
+    .expect("Capture parent");
+    assert_eq!(
+        parent["manifest"]["discoveries"][0]["status"],
+        "skipped_budget"
+    );
+    assert_eq!(
+        parent["ledger"].as_array().map(Vec::len),
+        Some(2),
+        "{parent}"
+    );
+    assert_eq!(
+        parent["ledger"][1]["details"]["status"], "captured",
+        "{parent}"
+    );
+    assert_eq!(
+        parent["ledger"][1]["details"]["requested_url"],
+        "https://93.184.216.34/document.pdf"
+    );
+    assert_eq!(
+        parent["ledger"][1]["details"]["sha256"],
+        "e16fa5d9b51928755db85b917f0297babaf22c7a47e97d9212adab56e61ba04e"
+    );
+    let duplicate: Value = serde_json::from_slice(
+        &env.command()
+            .args([
+                "capture",
+                "continue",
+                capture_id,
+                "--policy",
+                "safe-web@1",
+                "--discovery",
+                discovery_id,
+            ])
+            .assert()
+            .success()
+            .get_output()
+            .stdout,
+    )
+    .expect("Job de Doublon JSON");
+    let duplicate_id = duplicate["job"]["job_id"].as_str().expect("Job de Doublon");
+    env.command()
+        .args(["job", "wait", duplicate_id, "--timeout-secs", "5"])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("\"state\":\"succeeded\""));
+    let parent: Value = serde_json::from_slice(
+        &env.command()
+            .args(["capture", "inspect", capture_id])
+            .assert()
+            .success()
+            .get_output()
+            .stdout,
+    )
+    .expect("Capture parent avec Doublon");
+    assert_eq!(parent["ledger"][2]["details"]["status"], "reused");
+    let reference = &parent["ledger"][2]["details"]["reference"];
+    assert_eq!(reference["capture_id"], child_id);
+    assert!(reference["artifact_id"].is_string());
+    assert!(reference["sha256"].is_string());
+    assert!(reference["locator"].is_object());
+}
+
+#[test]
+#[allow(clippy::too_many_lines)]
+fn capture_continue_walks_web_discoveries_breadth_first_with_remote_provenance() {
+    let env = TestEnv::new("continue-web-tree");
+    env.install_binary("scriptor-page-renderer", FAKE_PAGE_RENDERER_TREE);
+    let created: Value = serde_json::from_slice(
+        &env.command()
+            .args([
+                "capture",
+                "https://93.184.216.34/tree-root",
+                "--policy",
+                "safe-web@1",
+            ])
+            .assert()
+            .success()
+            .get_output()
+            .stdout,
+    )
+    .expect("Job racine JSON");
+    let root_job = created["job"]["job_id"].as_str().expect("Job racine");
+    let root: Value = serde_json::from_slice(
+        &env.command()
+            .args(["job", "wait", root_job, "--timeout-secs", "5"])
+            .assert()
+            .success()
+            .get_output()
+            .stdout,
+    )
+    .expect("Job racine terminé");
+    let root_capture = root["capture_id"].as_str().expect("Capture racine");
+    let order_path = env.xdg_cache.join("renderer-order");
+    let continued: Value = serde_json::from_slice(
+        &env.command()
+            .args([
+                "capture",
+                "continue",
+                root_capture,
+                "--policy",
+                "safe-web@1",
+            ])
+            .assert()
+            .success()
+            .get_output()
+            .stdout,
+    )
+    .expect("Job de continuation JSON");
+    let continuation_id = continued["job"]["job_id"]
+        .as_str()
+        .expect("Job de continuation");
+    let completed: Value = serde_json::from_slice(
+        &env.command()
+            .args(["job", "wait", continuation_id, "--timeout-secs", "5"])
+            .assert()
+            .success()
+            .get_output()
+            .stdout,
+    )
+    .expect("Job de continuation terminé");
+    assert_eq!(completed["state"], "succeeded", "{completed}");
+    assert_eq!(
+        fs::read_to_string(&order_path).expect("ordre du renderer"),
+        "https://93.184.216.34/tree-a\nhttps://93.184.216.34/tree-b\nhttps://93.184.216.34/tree-a1\nhttps://93.184.216.34/tree-a2\nhttps://93.184.216.34/tree-b1\n"
+    );
+    let child_a = completed["child_capture_ids"]
+        .as_array()
+        .expect("Captures enfants")
+        .iter()
+        .find_map(Value::as_str)
+        .expect("Capture enfant a");
+    let child: Value = serde_json::from_slice(
+        &env.command()
+            .args(["capture", "inspect", child_a])
+            .assert()
+            .success()
+            .get_output()
+            .stdout,
+    )
+    .expect("Capture enfant inspectée");
+    let provenance = &child["manifest"]["remote_provenance"];
+    assert_eq!(provenance["requested_url"], "https://93.184.216.34/tree-a");
+    assert_eq!(
+        provenance["final_url"],
+        "https://93.184.216.34/tree-a-final"
+    );
+    assert_eq!(provenance["mime"], "text/html");
+    assert!(provenance["sha256"].is_string());
+    assert!(provenance["size_bytes"].is_u64());
+    assert_eq!(
+        provenance["redirect_chain"],
+        serde_json::json!([
+            "https://93.184.216.34/tree-a",
+            "https://93.184.216.34/tree-a-final"
+        ])
+    );
+}
+
+#[test]
+fn capture_continue_marks_a_web_final_url_cycle_without_publishing_a_child() {
+    let env = TestEnv::new("continue-web-cycle");
+    env.install_binary(
+        "scriptor-page-renderer",
+        FAKE_PAGE_RENDERER_RESOLUTION_CASES,
+    );
+    let created = create_safe_web_capture(&env, "https://93.184.216.34/cycle-root");
+    let root = wait_for_agent_job(&env, created["job"]["job_id"].as_str().expect("Job racine"));
+    let root_capture = root["capture_id"].as_str().expect("Capture racine");
+    let continued = continue_safe_web_capture(&env, root_capture);
+    let completed = wait_for_agent_job(
+        &env,
+        continued["job"]["job_id"]
+            .as_str()
+            .expect("Job de continuation"),
+    );
+    assert_eq!(completed["state"], "partial", "{completed}");
+    assert_eq!(completed["child_capture_ids"], serde_json::json!([]));
+    let parent = inspect_agent_capture(&env, root_capture);
+    assert_eq!(parent["ledger"][1]["details"]["status"], "cycle");
+    assert_eq!(
+        parent["ledger"][1]["details"]["discovery_id"],
+        parent["manifest"]["discoveries"][0]["discovery_id"]
+    );
+}
+
+#[test]
+fn capture_continue_rejects_lies_for_audio_and_video_mime_types() {
+    let env = TestEnv::new("continue-web-mime-lies");
+    env.install_binary("scriptor-page-renderer", FAKE_PAGE_RENDERER_MIME_LIES);
+    env.install_binary("scriptor-binary-acquirer", FAKE_BINARY_ACQUIRER_MIME_LIES);
+    let created = create_safe_web_capture(&env, "https://93.184.216.34/mime-root");
+    let root = wait_for_agent_job(&env, created["job"]["job_id"].as_str().expect("Job racine"));
+    let root_capture = root["capture_id"].as_str().expect("Capture racine");
+    let continued = continue_safe_web_capture(&env, root_capture);
+    let completed = wait_for_agent_job(
+        &env,
+        continued["job"]["job_id"]
+            .as_str()
+            .expect("Job de continuation"),
+    );
+    assert_eq!(completed["state"], "partial", "{completed}");
+    assert_eq!(completed["child_capture_ids"], serde_json::json!([]));
+    let parent = inspect_agent_capture(&env, root_capture);
+    assert_eq!(parent["ledger"][1]["details"]["status"], "unsupported");
+    assert_eq!(parent["ledger"][2]["details"]["status"], "unsupported");
+    assert_eq!(parent["ledger"][1]["details"]["mime"], "video/mp4");
+    assert_eq!(parent["ledger"][2]["details"]["mime"], "audio/mpeg");
+}
+
+#[test]
+fn capture_continue_stops_after_fifty_web_sources() {
+    let env = TestEnv::new("continue-web-source-limit");
+    env.install_binary(
+        "scriptor-page-renderer",
+        FAKE_PAGE_RENDERER_RESOLUTION_CASES,
+    );
+    let created = create_safe_web_capture(&env, "https://93.184.216.34/many-root");
+    let root = wait_for_agent_job(&env, created["job"]["job_id"].as_str().expect("Job racine"));
+    let root_capture = root["capture_id"].as_str().expect("Capture racine");
+    let continued = continue_safe_web_capture(&env, root_capture);
+    let completed = wait_for_agent_job(
+        &env,
+        continued["job"]["job_id"]
+            .as_str()
+            .expect("Job de continuation"),
+    );
+    assert_eq!(completed["state"], "partial", "{completed}");
+    assert_eq!(
+        completed["child_capture_ids"].as_array().map(Vec::len),
+        Some(50)
+    );
+    let order = fs::read_to_string(env.xdg_cache.join("renderer-order"))
+        .expect("Sources acquises par le renderer");
+    assert_eq!(order.lines().count(), 50);
+    assert!(!order.contains("many-50\n"));
+    let parent = inspect_agent_capture(&env, root_capture);
+    assert_eq!(parent["ledger"].as_array().map(Vec::len), Some(52));
+    assert_eq!(parent["ledger"][51]["details"]["status"], "skipped_budget");
+}
+
+#[test]
+fn capture_continue_fails_cleanly_when_a_child_acquisition_crashes() {
+    let env = TestEnv::new("continue-web-crash");
+    env.install_binary(
+        "scriptor-page-renderer",
+        FAKE_PAGE_RENDERER_RESOLUTION_CASES,
+    );
+    let created = create_safe_web_capture(&env, "https://93.184.216.34/crash-root");
+    let root = wait_for_agent_job(&env, created["job"]["job_id"].as_str().expect("Job racine"));
+    let root_capture = root["capture_id"].as_str().expect("Capture racine");
+    let continued = continue_safe_web_capture(&env, root_capture);
+    let completed = wait_for_agent_job(
+        &env,
+        continued["job"]["job_id"]
+            .as_str()
+            .expect("Job de continuation"),
+    );
+    assert_eq!(completed["state"], "failed", "{completed}");
+    assert!(completed["worker_pid"].is_null());
+    let captures = env.xdg_data.join("scriptor/v2/captures");
+    assert_eq!(
+        fs::read_dir(captures)
+            .expect("Référentiel de Captures")
+            .filter_map(Result::ok)
+            .filter(|entry| entry.path().join("manifest.json").is_file())
+            .count(),
+        1
+    );
+}
+
+#[test]
+fn capture_continue_cancellation_stops_a_running_web_child() {
+    let env = TestEnv::new("continue-web-cancellation");
+    env.install_binary(
+        "scriptor-page-renderer",
+        FAKE_PAGE_RENDERER_RESOLUTION_CASES,
+    );
+    let created = create_safe_web_capture(&env, "https://93.184.216.34/slow-root");
+    let root = wait_for_agent_job(&env, created["job"]["job_id"].as_str().expect("Job racine"));
+    let root_capture = root["capture_id"].as_str().expect("Capture racine");
+    let continued = continue_safe_web_capture(&env, root_capture);
+    let continuation_id = continued["job"]["job_id"]
+        .as_str()
+        .expect("Job de continuation");
+    assert!(
+        wait_for_file(
+            &env.xdg_cache.join("renderer-started"),
+            Duration::from_secs(2)
+        ),
+        "le renderer enfant ne démarre pas"
+    );
+    env.command()
+        .args(["job", "cancel", continuation_id])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("\"state\":\"cancelled\""));
+    let cancelled = wait_for_agent_job(&env, continuation_id);
+    assert_eq!(cancelled["state"], "cancelled", "{cancelled}");
+    assert_eq!(cancelled["child_capture_ids"], serde_json::json!([]));
 }
 
 #[test]

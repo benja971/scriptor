@@ -2,18 +2,22 @@ use std::fs;
 use std::path::Path;
 use std::time::{Duration, UNIX_EPOCH};
 
-use anyhow::{Context, Result};
+use anyhow::{Context, Result, bail};
 use serde_json::json;
+use url::Url;
+
+pub(super) const FINAL_URL_CYCLE: &str = "web_final_url_cycle";
 
 use super::{
     Acquisition, AcquisitionResult, Discovery, Extraction, Job, Locator, Manifest, PreparedCapture,
-    Proof, Provider, Reference, RenderedDiscovery, SourceIdentity, now_secs, read_job, read_json,
-    sha256_bytes, sha256_file,
+    Proof, Provider, Reference, RemoteProvenance, RenderedDiscovery, SourceIdentity, discovery_id,
+    now_secs, read_job, read_json, sha256_bytes, sha256_file,
 };
 
 pub(super) struct WebAcquisition<'a> {
     pub(super) job: &'a Job,
     pub(super) url: &'a str,
+    pub(super) forbidden_final_urls: &'a [String],
 }
 
 impl Acquisition for WebAcquisition<'_> {
@@ -49,6 +53,16 @@ impl Acquisition for WebAcquisition<'_> {
             crate::web::Capture::Completed(provenance) => provenance,
             crate::web::Capture::Cancelled => return Ok(AcquisitionResult::Cancelled),
         };
+        let mut final_url =
+            Url::parse(&provenance.final_url).context("parsing rendered final URL")?;
+        final_url.set_fragment(None);
+        if self
+            .forbidden_final_urls
+            .iter()
+            .any(|ancestor| ancestor == final_url.as_str())
+        {
+            bail!(FINAL_URL_CYCLE);
+        }
         if read_job(&self.job.id)?.state == "cancelled" {
             return Ok(AcquisitionResult::Cancelled);
         }
@@ -66,12 +80,14 @@ impl Acquisition for WebAcquisition<'_> {
             "proofs/dom.html",
             "text/html",
         )?;
+        let proof_hash = proof.sha256.clone();
+        let proof_size = proof.size_bytes;
         let extraction = markdown_extraction(capture.staging(), &proof, &provenance.final_url)?;
         let discoveries = discoveries(capture.staging(), capture.capture_id(), &proof)?;
         let manifest = Manifest {
             capture_id: capture.capture_id().to_string(),
             source: SourceIdentity {
-                locator: provenance.final_url,
+                locator: provenance.final_url.clone(),
                 sha256: source_hash.to_string(),
             },
             policy: self.job.policy.clone(),
@@ -81,6 +97,22 @@ impl Acquisition for WebAcquisition<'_> {
             capabilities: Vec::new(),
             artifacts,
             discoveries,
+            remote_provenance: Some(RemoteProvenance {
+                requested_url: if provenance.initial_url.is_empty() {
+                    self.url.to_string()
+                } else {
+                    provenance.initial_url.clone()
+                },
+                final_url: provenance.final_url.clone(),
+                mime: "text/html".to_string(),
+                sha256: proof_hash,
+                size_bytes: proof_size,
+                redirect_chain: if provenance.redirect_chain.is_empty() {
+                    vec![self.url.to_string(), provenance.final_url]
+                } else {
+                    provenance.redirect_chain
+                },
+            }),
         };
         Ok(AcquisitionResult::Ready(PreparedCapture::new(
             manifest, false,
@@ -115,22 +147,27 @@ fn markdown_extraction(staging: &Path, proof: &Proof, final_url: &str) -> Result
 
 fn discoveries(staging: &Path, capture_id: &str, proof: &Proof) -> Result<Vec<Discovery>> {
     let rendered: Vec<RenderedDiscovery> = read_json(&staging.join("discoveries.json"))?;
-    Ok(rendered
+    rendered
         .into_iter()
-        .map(|discovery| Discovery {
-            source: discovery.url,
-            parent: Reference {
+        .map(|discovery| {
+            let parent = Reference {
                 capture_id: capture_id.to_string(),
                 artifact_id: proof.artifact_id.clone(),
                 sha256: proof.sha256.clone(),
                 locator: Some(discovery.parent_locator),
-            },
-            locator: discovery.locator,
-            order: discovery.order,
-            status: discovery.status,
-            reason: discovery.reason,
+            };
+            Ok(Discovery {
+                id: discovery_id(&parent, &discovery.url, &discovery.locator, discovery.order)?,
+                source: discovery.url,
+                parent,
+                locator: discovery.locator,
+                order: discovery.order,
+                status: discovery.status,
+                reason: discovery.reason,
+                kind: discovery.kind,
+            })
         })
-        .collect())
+        .collect::<Result<Vec<_>>>()
 }
 
 fn proof_for(staging: &Path, artifact_id: &str, path: &str, mime: &str) -> Result<Proof> {
