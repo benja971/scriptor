@@ -207,6 +207,8 @@ struct QueuedDiscovery {
     source: String,
     depth: u8,
     order: u32,
+    #[serde(default)]
+    order_path: Vec<u32>,
     ancestors: Vec<String>,
     #[serde(default)]
     kind: Option<String>,
@@ -729,6 +731,7 @@ fn resolve_discoveries(job: &Job, parent_capture_id: &str) -> Result<()> {
                     source: discovery.source.clone(),
                     depth: 1,
                     order: discovery.order,
+                    order_path: vec![discovery.order],
                     ancestors: vec![parent_source.clone()],
                     kind: discovery.kind.clone(),
                 })
@@ -1063,6 +1066,10 @@ fn publish_web_discovery(
         let child: Manifest = read_json(&captures_dir()?.join(capture_id).join("manifest.json"))?;
         let mut ancestors = discovery.ancestors.clone();
         ancestors.push(normalized_web_url(&child.source.locator)?);
+        let mut parent_order_path = discovery.order_path.clone();
+        if parent_order_path.is_empty() {
+            parent_order_path.push(discovery.order);
+        }
         queue.extend(child.discoveries.into_iter().filter_map(|child| {
             (child.status == "inventoried" || child.status == "skipped_budget").then_some(
                 QueuedDiscovery {
@@ -1070,6 +1077,11 @@ fn publish_web_discovery(
                     source: child.source,
                     depth: discovery.depth.saturating_add(1),
                     order: child.order,
+                    order_path: {
+                        let mut order_path = parent_order_path.clone();
+                        order_path.push(child.order);
+                        order_path
+                    },
                     ancestors: ancestors.clone(),
                     kind: child.kind,
                 },
@@ -1080,7 +1092,15 @@ fn publish_web_discovery(
 }
 
 fn sort_resolution_queue(queue: &mut [QueuedDiscovery]) {
-    queue.sort_by_key(|item| (item.depth, item.order));
+    queue.sort_by(|left, right| {
+        left.depth.cmp(&right.depth).then_with(|| {
+            if left.order_path.is_empty() && right.order_path.is_empty() {
+                left.order.cmp(&right.order)
+            } else {
+                left.order_path.cmp(&right.order_path)
+            }
+        })
+    });
 }
 
 fn normalized_mime(mime: &str) -> String {
@@ -3429,6 +3449,7 @@ mod continuation_tests {
                 source: "https://example.test/deep".to_string(),
                 depth: 2,
                 order: 0,
+                order_path: vec![0, 0],
                 ancestors: Vec::new(),
                 kind: None,
             },
@@ -3437,6 +3458,7 @@ mod continuation_tests {
                 source: "https://example.test/second".to_string(),
                 depth: 1,
                 order: 1,
+                order_path: vec![1],
                 ancestors: Vec::new(),
                 kind: None,
             },
@@ -3445,6 +3467,7 @@ mod continuation_tests {
                 source: "https://example.test/first".to_string(),
                 depth: 1,
                 order: 0,
+                order_path: vec![0],
                 ancestors: Vec::new(),
                 kind: None,
             },
