@@ -173,7 +173,7 @@ struct CreatedJob<'a> {
     job: &'a Job,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Serialize, Deserialize)]
 struct Manifest {
     capture_id: String,
     source: SourceIdentity,
@@ -200,6 +200,7 @@ struct Proof {
     sha256: String,
     size_bytes: u64,
     locator: Locator,
+    created_at: u64,
 }
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -210,8 +211,11 @@ struct Extraction {
     sha256: String,
     size_bytes: u64,
     locator: Option<Locator>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    locator_provider: Option<Provider>,
     provider: Provider,
     proof_artifact_id: String,
+    created_at: u64,
 }
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -236,11 +240,21 @@ struct ProviderDependency {
     version: String,
 }
 
-#[derive(Debug, Serialize, Deserialize)]
-struct Locator {
-    kind: String,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    timestamps_secs: Option<Vec<f64>>,
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(tag = "kind", rename_all = "kebab-case")]
+enum Locator {
+    File,
+    MediaTimestamp { timestamps_secs: Vec<f64> },
+    PdfPages { first_page: u32, last_page: u32 },
+    ImageRegions { regions: Vec<ImageRegion> },
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct ImageRegion {
+    left: u32,
+    top: u32,
+    width: u32,
+    height: u32,
 }
 
 #[derive(Serialize)]
@@ -569,6 +583,7 @@ fn publish_capture(job: &Job) -> Result<Publication> {
     let proof_path = staging.join("proofs").join("source");
     copy_file_limited(source, &proof_path, &budget)
         .with_context(|| format!("copying local Source {}", source.display()))?;
+    let proof_created_at = now_secs();
     if read_job(&job.id)?.state == "cancelled" {
         fs::remove_dir_all(&staging).context("discarding cancelled Capture staging directory")?;
         return Ok(Publication::Cancelled);
@@ -590,16 +605,16 @@ fn publish_capture(job: &Job) -> Result<Publication> {
             mime: mime_for_source(source).to_string(),
             sha256: sha256_file_limited(&proof_path, &budget)?,
             size_bytes: proof_size,
-            locator: Locator {
-                kind: "file".to_string(),
-                timestamps_secs: None,
-            },
+            locator: Locator::File,
+            created_at: proof_created_at,
         },
         extractions: Vec::new(),
         capabilities: Vec::new(),
     };
     if is_media_source(source) {
         capture_local_media(job, &proof_path, &staging, &mut manifest, &budget);
+    } else if is_document_source(source) {
+        capture_local_document(job, &proof_path, &staging, &mut manifest, &budget);
     }
     let ledger_event = LedgerEvent {
         event: "capture_published".to_string(),
@@ -641,6 +656,341 @@ fn is_media_source(source: &Path) -> bool {
                 | "webm"
         )
     })
+}
+
+fn is_document_source(source: &Path) -> bool {
+    matches!(
+        mime_for_source(source),
+        "application/pdf" | "image/png" | "image/jpeg" | "image/gif" | "image/webp" | "image/tiff"
+    )
+}
+
+fn capture_local_document(
+    job: &Job,
+    proof_path: &Path,
+    staging: &Path,
+    manifest: &mut Manifest,
+    budget: &CaptureBudget<'_>,
+) {
+    let result = match mime_for_source(Path::new(&job.source)) {
+        "application/pdf" => extract_pdf_document(job, proof_path, staging, manifest, budget),
+        mime if mime.starts_with("image/") => {
+            extract_image_document(job, proof_path, staging, manifest, budget)
+        }
+        _ => return,
+    };
+    if let Err(error) = result {
+        let (name, provider, code, error) = *error;
+        discard_document_extractions(staging, manifest);
+        manifest.capabilities.push(Capability {
+            name: name.to_string(),
+            state: if code == "provider_not_allowed" {
+                "not_attempted".to_string()
+            } else {
+                "failed".to_string()
+            },
+            provider,
+            error: Some(StructuredError {
+                code: code.to_string(),
+                message: format!("{error:#}"),
+            }),
+        });
+    }
+}
+
+type DocumentFailure = Box<(&'static str, Provider, &'static str, anyhow::Error)>;
+
+fn document_failure(
+    capability: &'static str,
+    provider: Provider,
+    code: &'static str,
+    error: anyhow::Error,
+) -> DocumentFailure {
+    Box::new((capability, provider, code, error))
+}
+
+fn extract_pdf_document(
+    job: &Job,
+    proof_path: &Path,
+    staging: &Path,
+    manifest: &mut Manifest,
+    budget: &CaptureBudget<'_>,
+) -> std::result::Result<(), DocumentFailure> {
+    const CAPABILITY: &str = "pdf-text-extraction";
+    if !policy_allows(&job.policy, "pdftotext") {
+        return Err(document_failure(
+            CAPABILITY,
+            unresolved_provider("pdftotext"),
+            "provider_not_allowed",
+            denied_provider_error("pdftotext"),
+        ));
+    }
+    if !policy_allows(&job.policy, "pdfinfo") {
+        return Err(document_failure(
+            CAPABILITY,
+            unresolved_provider("pdfinfo"),
+            "provider_not_allowed",
+            denied_provider_error("pdfinfo"),
+        ));
+    }
+    let text_provider = document_provider("pdftotext", json!({ "arguments": ["-layout"] }), budget)
+        .map_err(|error| {
+            document_failure(
+                CAPABILITY,
+                unresolved_provider("pdftotext"),
+                "extraction_failed",
+                error,
+            )
+        })?;
+    let locator_provider = document_provider("pdfinfo", Value::Null, budget).map_err(|error| {
+        document_failure(
+            CAPABILITY,
+            unresolved_provider("pdfinfo"),
+            "extraction_failed",
+            error,
+        )
+    })?;
+    let page_count = pdf_page_count(proof_path, budget).map_err(|error| {
+        document_failure(
+            CAPABILITY,
+            locator_provider.clone(),
+            "extraction_failed",
+            error,
+        )
+    })?;
+    let output_dir = staging.join("extractions");
+    fs::create_dir_all(&output_dir)
+        .with_context(|| format!("creating PDF Extraction directory {}", output_dir.display()))
+        .map_err(|error| {
+            document_failure(
+                CAPABILITY,
+                text_provider.clone(),
+                "extraction_failed",
+                error,
+            )
+        })?;
+    let output_path = output_dir.join("pdf-text.txt");
+    let mut command = Command::new("pdftotext");
+    command.args(["-layout"]).arg(proof_path).arg(&output_path);
+    let output = budget.output(&mut command).map_err(|error| {
+        document_failure(
+            CAPABILITY,
+            text_provider.clone(),
+            "extraction_failed",
+            error,
+        )
+    })?;
+    provider_succeeded("pdftotext", &output).map_err(|error| {
+        document_failure(
+            CAPABILITY,
+            text_provider.clone(),
+            "extraction_failed",
+            error,
+        )
+    })?;
+    let extraction = document_extraction(
+        "extraction-pdf-text",
+        "extractions/pdf-text.txt",
+        &output_path,
+        Locator::PdfPages {
+            first_page: 1,
+            last_page: page_count,
+        },
+        Some(locator_provider),
+        text_provider.clone(),
+        budget,
+    )
+    .map_err(|error| {
+        document_failure(
+            CAPABILITY,
+            text_provider.clone(),
+            "extraction_failed",
+            error,
+        )
+    })?;
+    manifest.extractions.push(extraction);
+    manifest.capabilities.push(Capability {
+        name: CAPABILITY.to_string(),
+        state: "succeeded".to_string(),
+        provider: text_provider,
+        error: None,
+    });
+    Ok(())
+}
+
+fn extract_image_document(
+    job: &Job,
+    proof_path: &Path,
+    staging: &Path,
+    manifest: &mut Manifest,
+    budget: &CaptureBudget<'_>,
+) -> std::result::Result<(), DocumentFailure> {
+    const CAPABILITY: &str = "image-ocr";
+    if !policy_allows(&job.policy, "tesseract") {
+        return Err(document_failure(
+            CAPABILITY,
+            unresolved_provider("tesseract"),
+            "provider_not_allowed",
+            denied_provider_error("tesseract"),
+        ));
+    }
+    let provider =
+        document_provider("tesseract", json!({ "format": "tsv" }), budget).map_err(|error| {
+            document_failure(
+                CAPABILITY,
+                unresolved_provider("tesseract"),
+                "extraction_failed",
+                error,
+            )
+        })?;
+    let mut command = Command::new("tesseract");
+    command.args([proof_path, Path::new("stdout"), Path::new("tsv")]);
+    let output = budget.output(&mut command).map_err(|error| {
+        document_failure(CAPABILITY, provider.clone(), "extraction_failed", error)
+    })?;
+    provider_succeeded("tesseract", &output).map_err(|error| {
+        document_failure(CAPABILITY, provider.clone(), "extraction_failed", error)
+    })?;
+    let (text, regions) = parse_tesseract_tsv(&output.stdout).map_err(|error| {
+        document_failure(CAPABILITY, provider.clone(), "extraction_failed", error)
+    })?;
+    let output_dir = staging.join("extractions");
+    fs::create_dir_all(&output_dir)
+        .with_context(|| format!("creating OCR Extraction directory {}", output_dir.display()))
+        .map_err(|error| {
+            document_failure(CAPABILITY, provider.clone(), "extraction_failed", error)
+        })?;
+    let output_path = output_dir.join("ocr.txt");
+    budget
+        .check_disk_capacity(
+            u64::try_from(text.len())
+                .context("converting OCR output size")
+                .map_err(|error| {
+                    document_failure(CAPABILITY, provider.clone(), "extraction_failed", error)
+                })?,
+        )
+        .map_err(|error| {
+            document_failure(CAPABILITY, provider.clone(), "extraction_failed", error)
+        })?;
+    fs::write(&output_path, text)
+        .with_context(|| format!("writing OCR Extraction {}", output_path.display()))
+        .map_err(|error| {
+            document_failure(CAPABILITY, provider.clone(), "extraction_failed", error)
+        })?;
+    let extraction = document_extraction(
+        "extraction-image-ocr",
+        "extractions/ocr.txt",
+        &output_path,
+        Locator::ImageRegions { regions },
+        None,
+        provider.clone(),
+        budget,
+    )
+    .map_err(|error| (CAPABILITY, provider.clone(), "extraction_failed", error))?;
+    manifest.extractions.push(extraction);
+    manifest.capabilities.push(Capability {
+        name: CAPABILITY.to_string(),
+        state: "succeeded".to_string(),
+        provider,
+        error: None,
+    });
+    Ok(())
+}
+
+fn document_provider(
+    name: &str,
+    parameters: Value,
+    budget: &CaptureBudget<'_>,
+) -> Result<Provider> {
+    provider(name, parameters, &[], budget)
+}
+
+fn pdf_page_count(proof_path: &Path, budget: &CaptureBudget<'_>) -> Result<u32> {
+    let mut command = Command::new("pdfinfo");
+    command.arg(proof_path);
+    let output = budget.output(&mut command)?;
+    provider_succeeded("pdfinfo", &output)?;
+    let text = String::from_utf8_lossy(&output.stdout);
+    text.lines()
+        .find_map(|line| line.strip_prefix("Pages:")?.trim().parse::<u32>().ok())
+        .filter(|pages| *pages > 0)
+        .context("reading PDF page count")
+}
+
+fn provider_succeeded(name: &str, output: &std::process::Output) -> Result<()> {
+    if output.status.success() {
+        return Ok(());
+    }
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    bail!("{name} failed with {}: {}", output.status, stderr.trim());
+}
+
+fn parse_tesseract_tsv(bytes: &[u8]) -> Result<(String, Vec<ImageRegion>)> {
+    let tsv = std::str::from_utf8(bytes).context("reading tesseract TSV")?;
+    let mut text = Vec::new();
+    let mut regions = Vec::new();
+    for line in tsv.lines().skip(1) {
+        let fields: Vec<&str> = line.split('\t').collect();
+        if fields.len() != 12 || fields.get(11).is_none_or(|value| value.trim().is_empty()) {
+            continue;
+        }
+        let coordinate = |index: usize, name: &str| -> Result<u32> {
+            fields
+                .get(index)
+                .context("reading tesseract TSV coordinate")?
+                .parse()
+                .with_context(|| format!("parsing tesseract {name}"))
+        };
+        regions.push(ImageRegion {
+            left: coordinate(6, "left")?,
+            top: coordinate(7, "top")?,
+            width: coordinate(8, "width")?,
+            height: coordinate(9, "height")?,
+        });
+        text.push(fields.get(11).context("reading tesseract text")?.trim());
+    }
+    Ok((text.join("\n"), regions))
+}
+
+fn document_extraction(
+    artifact_id: &str,
+    path: &str,
+    file: &Path,
+    locator: Locator,
+    locator_provider: Option<Provider>,
+    provider: Provider,
+    budget: &CaptureBudget<'_>,
+) -> Result<Extraction> {
+    Ok(Extraction {
+        artifact_id: artifact_id.to_string(),
+        path: path.to_string(),
+        mime: "text/plain; charset=utf-8".to_string(),
+        sha256: sha256_file_limited(file, budget)?,
+        size_bytes: file_size(file)?,
+        locator: Some(locator),
+        locator_provider,
+        provider,
+        proof_artifact_id: "proof-source".to_string(),
+        created_at: now_secs(),
+    })
+}
+
+fn discard_document_extractions(staging: &Path, manifest: &mut Manifest) {
+    let path = staging.join("extractions");
+    match fs::remove_dir_all(&path) {
+        Ok(()) => manifest.extractions.retain(|extraction| {
+            !matches!(
+                extraction.artifact_id.as_str(),
+                "extraction-pdf-text" | "extraction-image-ocr"
+            )
+        }),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+        Err(error) => record_capability_failure(
+            manifest,
+            "document-extraction-cleanup",
+            &anyhow::Error::from(error).context("discarding invalid document Extraction"),
+        ),
+    }
 }
 
 fn capture_local_media(
@@ -949,9 +1299,8 @@ fn capture_frames(
                         &path,
                         "image/jpeg",
                         &extraction_path,
-                        Some(Locator {
-                            kind: "media-timestamp".to_string(),
-                            timestamps_secs: Some(vec![timestamp]),
+                        Some(Locator::MediaTimestamp {
+                            timestamps_secs: vec![timestamp],
                         }),
                         frames_provider.clone(),
                         budget,
@@ -1104,8 +1453,10 @@ fn extraction(
         sha256: sha256_file_limited(file, budget)?,
         size_bytes: file_size(file)?,
         locator,
+        locator_provider: None,
         provider,
         proof_artifact_id: "proof-source".to_string(),
+        created_at: now_secs(),
     })
 }
 
@@ -1412,6 +1763,8 @@ fn search_captures(query: &str, cursor: Option<&str>, limit: usize) -> Result<()
             policy: capture.policy,
             published_at: capture.published_at,
             proof: capture.proof,
+            extractions: Vec::new(),
+            capabilities: Vec::new(),
         })
         .collect();
     print_json(&capture_page(manifests, cursor, limit, &binding)?)
@@ -1792,10 +2145,22 @@ fn is_text_mime(mime: &str) -> bool {
 }
 
 fn mime_for_source(source: &Path) -> &'static str {
-    match source.extension().and_then(|extension| extension.to_str()) {
+    match source
+        .extension()
+        .and_then(|extension| extension.to_str())
+        .map(str::to_ascii_lowercase)
+        .as_deref()
+    {
         Some("txt" | "md" | "csv" | "log") => "text/plain",
         Some("json") => "application/json",
         Some("xml") => "application/xml",
+        Some("pdf") => "application/pdf",
+        Some("png") => "image/png",
+        Some("jpg" | "jpeg") => "image/jpeg",
+        Some("gif") => "image/gif",
+        Some("webp") => "image/webp",
+        Some("tif" | "tiff") => "image/tiff",
+        _ if is_media_source(source) => media_mime(source),
         _ => "application/octet-stream",
     }
 }
@@ -1835,6 +2200,9 @@ fn safe_local_policy(name: &str) -> Result<Policy> {
             "ffmpeg".to_string(),
             "ffprobe".to_string(),
             "whisper-cli".to_string(),
+            "pdftotext".to_string(),
+            "pdfinfo".to_string(),
+            "tesseract".to_string(),
         ],
     };
     let canonical_snapshot =
@@ -2014,6 +2382,22 @@ fn read_json_lines<T: for<'de> Deserialize<'de>>(path: &Path) -> Result<Vec<T>> 
         .lines()
         .map(|line| serde_json::from_str(line).context("reading ledger event"))
         .collect()
+}
+
+fn sha256_file(path: &Path) -> Result<String> {
+    let mut file = File::open(path).with_context(|| format!("opening {}", path.display()))?;
+    let mut hash = Sha256::new();
+    let mut buffer = [0_u8; 8192];
+    loop {
+        let read = file
+            .read(&mut buffer)
+            .with_context(|| format!("reading {}", path.display()))?;
+        if read == 0 {
+            break;
+        }
+        hash.update(buffer.get(..read).context("reading hash buffer")?);
+    }
+    Ok(format!("{:x}", hash.finalize()))
 }
 
 fn sha256_file_limited(path: &Path, budget: &CaptureBudget<'_>) -> Result<String> {
