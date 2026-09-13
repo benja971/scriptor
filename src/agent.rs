@@ -885,7 +885,7 @@ fn resolve_discoveries(job: &Job, parent_capture_id: &str) -> Result<()> {
                     persist_resolution_progress(&job.id, &mut checkpoint, &discovery, None)?;
                     continue;
                 }
-                if normalized_mime(&acquired.mime) == "text/html" {
+                if is_html_discovery(&acquired.path, &acquired.mime)? {
                     let publication = publish_web_discovery(
                         job,
                         &QueuedDiscovery {
@@ -1127,14 +1127,13 @@ fn reference_for_capture(capture_id: &str) -> Result<Reference> {
     Ok(reference_for(&manifest))
 }
 
-fn binary_extension(path: &Path, mime: &str) -> Result<Option<&'static str>> {
-    let declared = normalized_mime(mime);
+fn binary_magic(path: &Path) -> Result<Option<&'static str>> {
     let mut file = File::open(path)
         .with_context(|| format!("opening binary MIME probe {}", path.display()))?;
     let mut bytes = [0_u8; 16];
     let size = file.read(&mut bytes).context("reading binary MIME probe")?;
     let bytes = bytes.get(..size).context("slicing binary MIME probe")?;
-    let magic = if bytes.starts_with(b"%PDF-") {
+    Ok(if bytes.starts_with(b"%PDF-") {
         Some("application/pdf")
     } else if bytes.starts_with(b"\x89PNG\r\n\x1a\n") {
         Some("image/png")
@@ -1146,9 +1145,7 @@ fn binary_extension(path: &Path, mime: &str) -> Result<Option<&'static str>> {
         Some("image/webp")
     } else if bytes.get(..4) == Some(b"II*\0") || bytes.get(..4) == Some(b"MM\0*") {
         Some("image/tiff")
-    } else if bytes.get(..3) == Some(b"ID3")
-        || bytes.first().is_some_and(|byte| byte & 0xe0 == 0xe0)
-    {
+    } else if bytes.get(..3) == Some(b"ID3") || has_mp3_frame_header(bytes) {
         Some("audio/mpeg")
     } else if bytes.get(..4) == Some(b"RIFF") && bytes.get(8..12) == Some(b"WAVE") {
         Some("audio/wav")
@@ -1160,7 +1157,35 @@ fn binary_extension(path: &Path, mime: &str) -> Result<Option<&'static str>> {
         Some("video/webm")
     } else {
         None
+    })
+}
+
+const fn has_mp3_frame_header(bytes: &[u8]) -> bool {
+    let Some((&first, remaining)) = bytes.split_first() else {
+        return false;
     };
+    let Some((&second, remaining)) = remaining.split_first() else {
+        return false;
+    };
+    let Some(&third) = remaining.first() else {
+        return false;
+    };
+    first == 0xff
+        && second & 0xe0 == 0xe0
+        && second & 0x18 != 0x08
+        && second & 0x06 != 0
+        && third & 0xf0 != 0
+        && third & 0xf0 != 0xf0
+        && third & 0x0c != 0x0c
+}
+
+fn is_html_discovery(path: &Path, mime: &str) -> Result<bool> {
+    Ok(normalized_mime(mime) == "text/html" && binary_magic(path)?.is_none())
+}
+
+fn binary_extension(path: &Path, mime: &str) -> Result<Option<&'static str>> {
+    let declared = normalized_mime(mime);
+    let magic = binary_magic(path)?;
     if magic != Some(declared.as_str()) {
         return Ok(None);
     }
@@ -3417,7 +3442,9 @@ fn print_json<T: Serialize>(value: &T) -> Result<()> {
 
 #[cfg(test)]
 mod continuation_tests {
-    use super::{QueuedDiscovery, binary_extension, sort_resolution_queue, unique_id};
+    use super::{
+        QueuedDiscovery, binary_extension, is_html_discovery, sort_resolution_queue, unique_id,
+    };
     use std::fs;
 
     #[test]
@@ -3438,6 +3465,29 @@ mod continuation_tests {
         assert!(fs::write(&path, b"not a media container").is_ok());
         assert_eq!(binary_extension(&path, "video/mp4").ok(), Some(None));
         assert_eq!(binary_extension(&path, "audio/mpeg").ok(), Some(None));
+        let _ = fs::remove_file(path);
+    }
+
+    #[test]
+    fn rejects_binary_content_declared_as_html() {
+        let path = std::env::temp_dir().join(format!("scriptor-html-lie-{}", unique_id()));
+        assert!(fs::write(&path, b"%PDF-1.4").is_ok());
+        assert_eq!(is_html_discovery(&path, "text/html").ok(), Some(false));
+        assert!(fs::write(&path, b"<!doctype html><title>page</title>").is_ok());
+        assert_eq!(is_html_discovery(&path, "text/html").ok(), Some(true));
+        let _ = fs::remove_file(path);
+    }
+
+    #[test]
+    fn validates_the_full_mp3_frame_sync() {
+        let path = std::env::temp_dir().join(format!("scriptor-mp3-magic-{}", unique_id()));
+        assert!(fs::write(&path, [0xe0, 0, 0]).is_ok());
+        assert_eq!(binary_extension(&path, "audio/mpeg").ok(), Some(None));
+        assert!(fs::write(&path, [0xff, 0xfb, 0x90, 0x64]).is_ok());
+        assert_eq!(
+            binary_extension(&path, "audio/mpeg").ok(),
+            Some(Some("mp3"))
+        );
         let _ = fs::remove_file(path);
     }
 

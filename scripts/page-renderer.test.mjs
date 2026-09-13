@@ -77,6 +77,29 @@ try {
   await new Promise((resolve) => binaryRedirectServer.close(resolve));
 }
 
+const rebindingOutput = await mkdtemp(join(tmpdir(), "scriptor-acquirer-rebinding-"));
+let preflightChecks = 0;
+try {
+  await assert.rejects(
+    acquire(["--url", "http://public.test/rebinding", "--output-dir", rebindingOutput, "--max-download-bytes", "1024"], {
+      assertPublic: async (value) => {
+        assert.equal(new URL(value).hostname, "public.test");
+        preflightChecks += 1;
+      },
+      createPinnedProxy: (limit) => createPinnedProxy(limit, async (host) => {
+        assert.equal(host, "public.test");
+        assert.equal(preflightChecks, 1);
+        throw new Error("web_private_target_refused");
+      }),
+    }),
+    /web_private_target_refused/,
+    "the binary acquirer must reject a host that rebinds to a private address after preflight",
+  );
+  assert.equal(preflightChecks, 1);
+} finally {
+  await rm(rebindingOutput, { recursive: true, force: true });
+}
+
 for (const browserName of ["firefox", "chromium"]) {
   const options = launchOptions(browserName, proxy);
   if (browserName === "chromium") {
