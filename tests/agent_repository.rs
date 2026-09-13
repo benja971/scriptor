@@ -92,6 +92,17 @@ impl Drop for TestRepository {
 }
 
 #[test]
+fn capture_continue_requires_a_known_capture_and_an_explicit_policy() {
+    let repository = TestRepository::new("continue-contract");
+    repository
+        .command()
+        .args(["capture", "continue", "capture-1-1"])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("\"code\":\"policy_required\""));
+}
+
+#[test]
 fn list_has_stable_pages_and_verifiable_references() {
     let repository = TestRepository::new("list");
     repository.capture("alpha.txt", b"alpha");

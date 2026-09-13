@@ -7,6 +7,8 @@ import { join } from "node:path";
 
 const rendererModule = process.env.SCRIPTOR_PAGE_RENDERER_MODULE ?? "./page-renderer.mjs";
 const { createPinnedProxy, launchBrowser, launchOptions, privateIp, protectContext, render } = await import(rendererModule);
+const acquirerModule = process.env.SCRIPTOR_BINARY_ACQUIRER_MODULE ?? "./binary-acquirer.mjs";
+const { acquire } = await import(acquirerModule);
 
 assert.equal(privateIp("100.64.0.1"), true);
 assert.equal(privateIp("198.18.0.1"), true);
@@ -46,6 +48,33 @@ try {
   await redirectBrowser.close();
   await new Promise((resolve) => redirectProxy.server.close(resolve));
   await new Promise((resolve) => redirectServer.close(resolve));
+}
+
+const binaryRedirectServer = createServer((_request, response) => {
+  response.writeHead(302, { location: "http://private.test/private" }).end();
+});
+await new Promise((resolve) => binaryRedirectServer.listen(0, "127.0.0.1", resolve));
+const binaryRedirectAddress = binaryRedirectServer.address();
+assert.ok(binaryRedirectAddress && typeof binaryRedirectAddress !== "string");
+const binaryOutput = await mkdtemp(join(tmpdir(), "scriptor-acquirer-private-"));
+try {
+  const publicOnly = async (value) => {
+    if (new URL(value).hostname !== "public.test") throw new Error("web_private_target_refused");
+  };
+  await assert.rejects(
+    acquire(["--url", `http://public.test:${binaryRedirectAddress.port}/redirect`, "--output-dir", binaryOutput, "--max-download-bytes", "1024"], {
+      assertPublic: publicOnly,
+      createPinnedProxy: (limit) => createPinnedProxy(limit, async (host) => {
+        if (host === "public.test") return "127.0.0.1";
+        throw new Error("web_private_target_refused");
+      }),
+    }),
+    /web_private_target_refused/,
+    "the binary acquirer must refuse a private redirect through the pinned proxy",
+  );
+} finally {
+  await rm(binaryOutput, { recursive: true, force: true });
+  await new Promise((resolve) => binaryRedirectServer.close(resolve));
 }
 
 for (const browserName of ["firefox", "chromium"]) {

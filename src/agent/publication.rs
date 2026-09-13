@@ -2,8 +2,8 @@ use std::fs;
 use std::path::{Path, PathBuf};
 
 use super::{
-    Job, LedgerEvent, Manifest, captures_dir, find_capture_by_source_hash, lock_capture_key,
-    now_secs, read_job, rebuild_search_index, record_index_degradation,
+    Job, LedgerEvent, Manifest, RemoteProvenance, captures_dir, find_capture_by_source_hash,
+    lock_capture_key, now_secs, read_job, rebuild_search_index, record_index_degradation,
 };
 use crate::resource::directory_size;
 use anyhow::{Context, Result, bail};
@@ -14,7 +14,11 @@ pub(super) enum AcquisitionResult<T> {
 }
 
 pub(super) enum Publication {
-    Published { capture_id: String, partial: bool },
+    Published {
+        capture_id: String,
+        partial: bool,
+        reused: bool,
+    },
     Cancelled,
 }
 
@@ -26,6 +30,16 @@ pub(super) struct PreparedCapture {
 impl PreparedCapture {
     pub(super) const fn new(manifest: Manifest, partial: bool) -> Self {
         Self { manifest, partial }
+    }
+
+    pub(super) fn with_remote_provenance(
+        mut self,
+        locator: String,
+        provenance: RemoteProvenance,
+    ) -> Self {
+        self.manifest.source.locator = locator;
+        self.manifest.remote_provenance = Some(provenance);
+        self
     }
 }
 
@@ -76,6 +90,7 @@ pub(super) fn publish(job: &Job, acquisition: &dyn Acquisition) -> Result<Public
         return Ok(Publication::Published {
             capture_id,
             partial: false,
+            reused: true,
         });
     }
     let prepared = match acquisition.acquire(&capture, &source_hash)? {
@@ -99,6 +114,7 @@ pub(super) fn publish(job: &Job, acquisition: &dyn Acquisition) -> Result<Public
     Ok(Publication::Published {
         capture_id,
         partial: prepared.partial,
+        reused: false,
     })
 }
 
@@ -124,6 +140,7 @@ fn write_metadata(job: &Job, staging: &Path, manifest: &Manifest) -> Result<()> 
         event: "capture_published".to_string(),
         at: now_secs(),
         job_id: job.id.clone(),
+        details: None,
     })
     .context("serializing Capture ledger")?;
     ledger_data.push(b'\n');

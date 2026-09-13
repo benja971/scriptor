@@ -7,8 +7,8 @@ use serde_json::json;
 
 use super::{
     Acquisition, AcquisitionResult, Discovery, Extraction, Job, Locator, Manifest, PreparedCapture,
-    Proof, Provider, Reference, RenderedDiscovery, SourceIdentity, now_secs, read_job, read_json,
-    sha256_bytes, sha256_file,
+    Proof, Provider, Reference, RenderedDiscovery, SourceIdentity, discovery_id, now_secs,
+    read_job, read_json, sha256_bytes, sha256_file,
 };
 
 pub(super) struct WebAcquisition<'a> {
@@ -81,6 +81,7 @@ impl Acquisition for WebAcquisition<'_> {
             capabilities: Vec::new(),
             artifacts,
             discoveries,
+            remote_provenance: None,
         };
         Ok(AcquisitionResult::Ready(PreparedCapture::new(
             manifest, false,
@@ -115,22 +116,27 @@ fn markdown_extraction(staging: &Path, proof: &Proof, final_url: &str) -> Result
 
 fn discoveries(staging: &Path, capture_id: &str, proof: &Proof) -> Result<Vec<Discovery>> {
     let rendered: Vec<RenderedDiscovery> = read_json(&staging.join("discoveries.json"))?;
-    Ok(rendered
+    rendered
         .into_iter()
-        .map(|discovery| Discovery {
-            source: discovery.url,
-            parent: Reference {
+        .map(|discovery| {
+            let parent = Reference {
                 capture_id: capture_id.to_string(),
                 artifact_id: proof.artifact_id.clone(),
                 sha256: proof.sha256.clone(),
                 locator: Some(discovery.parent_locator),
-            },
-            locator: discovery.locator,
-            order: discovery.order,
-            status: discovery.status,
-            reason: discovery.reason,
+            };
+            Ok(Discovery {
+                id: discovery_id(&parent, &discovery.url, &discovery.locator, discovery.order)?,
+                source: discovery.url,
+                parent,
+                locator: discovery.locator,
+                order: discovery.order,
+                status: discovery.status,
+                reason: discovery.reason,
+                kind: discovery.kind,
+            })
         })
-        .collect())
+        .collect::<Result<Vec<_>>>()
 }
 
 fn proof_for(staging: &Path, artifact_id: &str, path: &str, mime: &str) -> Result<Proof> {

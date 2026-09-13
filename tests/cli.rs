@@ -147,6 +147,29 @@ printf '{"final_url":"https://93.184.216.34/"}' > "$out/provenance.json"
 const FAKE_PAGE_RENDERER_PRIVATE_TARGET: &str =
     "#!/bin/sh\necho web_private_target_refused >&2\nexit 1\n";
 
+const FAKE_PAGE_RENDERER_SKIPPED_DISCOVERY: &str = r#"#!/bin/sh
+set -eu
+while [ "$#" -gt 0 ]; do
+  if [ "$1" = "--output-dir" ]; then out="$2"; break; fi
+  shift
+done
+printf '<main>preuve</main>' > "$out/proofs/dom.html"
+printf 'preuve' > "$out/proofs/screenshot.png"
+printf '# contenu\n' > "$out/extractions/page.md"
+printf '[{"url":"https://93.184.216.34/document.pdf","parent_locator":{"kind":"url","value":"https://93.184.216.34/"},"locator":{"kind":"css-selector","value":"a"},"order":0,"status":"skipped_budget","reason":"budget"}]' > "$out/discoveries.json"
+printf '{"final_url":"https://93.184.216.34/"}' > "$out/provenance.json"
+"#;
+
+const FAKE_BINARY_ACQUIRER: &str = r#"#!/bin/sh
+set -eu
+while [ "$#" -gt 0 ]; do
+  if [ "$1" = "--output-dir" ]; then out="$2"; break; fi
+  shift
+done
+printf '%s' '%PDF-1.4' > "$out/payload"
+printf '{"requested_url":"https://93.184.216.34/document.pdf","final_url":"https://93.184.216.34/document.pdf","mime":"application/pdf","sha256":"e16fa5d9b51928755db85b917f0297babaf22c7a47e97d9212adab56e61ba04e","size_bytes":8}' > "$out/metadata.json"
+"#;
+
 /// Faux `yt-dlp` reproduisant exactement les arguments passés par
 /// `download.rs` (`--paths`, `--output`, `--print-to-file after_move:filepath
 /// <marker>`) : écrit un faux fichier vidéo (non vide - `wait_for_file` exige
@@ -736,7 +759,7 @@ fn capture_returns_a_persistent_job_then_publishes_an_inspectable_capture() {
         .stdout
         .clone();
     let finished: Value = serde_json::from_slice(&output).expect("Job JSON valide");
-    assert_eq!(finished["state"], "succeeded");
+    assert_eq!(finished["state"], "succeeded", "{finished}");
     let capture_id = finished["capture_id"]
         .as_str()
         .expect("identifiant de Capture");
@@ -996,6 +1019,172 @@ fn safe_web_publishes_a_portable_capture() {
     .expect("Job de Doublon terminé JSON valide");
     assert_eq!(reused["state"], "succeeded");
     assert_eq!(reused["capture_id"], capture_id);
+}
+
+#[test]
+#[allow(clippy::too_many_lines)]
+fn capture_continue_publishes_a_discovered_pdf_without_mutating_its_parent() {
+    let env = TestEnv::new("continue-web-discovery");
+    env.install_binary(
+        "scriptor-page-renderer",
+        FAKE_PAGE_RENDERER_SKIPPED_DISCOVERY,
+    );
+    env.install_binary("scriptor-binary-acquirer", FAKE_BINARY_ACQUIRER);
+    env.install_binary("pdfinfo", FAKE_PDFINFO);
+    env.install_binary("pdftotext", FAKE_PDFTOTEXT);
+    let root: Value = serde_json::from_slice(
+        &env.command()
+            .args([
+                "capture",
+                "https://93.184.216.34/",
+                "--policy",
+                "safe-web@1",
+            ])
+            .assert()
+            .success()
+            .get_output()
+            .stdout,
+    )
+    .expect("Job JSON valide");
+    let root_job = root["job"]["job_id"].as_str().expect("Job racine");
+    let root_done: Value = serde_json::from_slice(
+        &env.command()
+            .args(["job", "wait", root_job, "--timeout-secs", "5"])
+            .assert()
+            .success()
+            .get_output()
+            .stdout,
+    )
+    .expect("Job racine fini");
+    let capture_id = root_done["capture_id"].as_str().expect("Capture racine");
+    let root_capture: Value = serde_json::from_slice(
+        &env.command()
+            .args(["capture", "inspect", capture_id])
+            .assert()
+            .success()
+            .get_output()
+            .stdout,
+    )
+    .expect("Capture racine inspectée");
+    let discovery_id = root_capture["manifest"]["discoveries"][0]["discovery_id"]
+        .as_str()
+        .expect("identifiant de Découverte");
+    let continued: Value = serde_json::from_slice(
+        &env.command()
+            .args([
+                "capture",
+                "continue",
+                capture_id,
+                "--policy",
+                "safe-web@1",
+                "--discovery",
+                discovery_id,
+            ])
+            .assert()
+            .success()
+            .get_output()
+            .stdout,
+    )
+    .expect("Job continue JSON");
+    assert!(continued["job"].is_object(), "{continued}");
+    let continue_id = continued["job"]["job_id"].as_str().expect("Job continue");
+    let finished: Value = serde_json::from_slice(
+        &env.command()
+            .args(["job", "wait", continue_id, "--timeout-secs", "5"])
+            .assert()
+            .success()
+            .get_output()
+            .stdout,
+    )
+    .expect("Job continue fini");
+    assert_eq!(finished["state"], "succeeded", "{finished}");
+    assert_eq!(
+        finished["child_capture_ids"].as_array().map(Vec::len),
+        Some(1)
+    );
+    let child_id = finished["child_capture_ids"][0]
+        .as_str()
+        .expect("Capture enfant");
+    let child: Value = serde_json::from_slice(
+        &env.command()
+            .args(["capture", "inspect", child_id])
+            .assert()
+            .success()
+            .get_output()
+            .stdout,
+    )
+    .expect("Capture enfant inspectée");
+    assert_eq!(
+        child["manifest"]["remote_provenance"]["requested_url"],
+        "https://93.184.216.34/document.pdf"
+    );
+    assert_eq!(
+        child["manifest"]["source"]["locator"],
+        "https://93.184.216.34/document.pdf"
+    );
+    let parent: Value = serde_json::from_slice(
+        &env.command()
+            .args(["capture", "inspect", capture_id])
+            .assert()
+            .success()
+            .get_output()
+            .stdout,
+    )
+    .expect("Capture parent");
+    assert_eq!(
+        parent["manifest"]["discoveries"][0]["status"],
+        "skipped_budget"
+    );
+    assert_eq!(
+        parent["ledger"].as_array().map(Vec::len),
+        Some(2),
+        "{parent}"
+    );
+    assert_eq!(
+        parent["ledger"][1]["details"]["status"], "captured",
+        "{parent}"
+    );
+    assert_eq!(
+        parent["ledger"][1]["details"]["requested_url"],
+        "https://93.184.216.34/document.pdf"
+    );
+    assert_eq!(
+        parent["ledger"][1]["details"]["sha256"],
+        "e16fa5d9b51928755db85b917f0297babaf22c7a47e97d9212adab56e61ba04e"
+    );
+    let duplicate: Value = serde_json::from_slice(
+        &env.command()
+            .args([
+                "capture",
+                "continue",
+                capture_id,
+                "--policy",
+                "safe-web@1",
+                "--discovery",
+                discovery_id,
+            ])
+            .assert()
+            .success()
+            .get_output()
+            .stdout,
+    )
+    .expect("Job de Doublon JSON");
+    let duplicate_id = duplicate["job"]["job_id"].as_str().expect("Job de Doublon");
+    env.command()
+        .args(["job", "wait", duplicate_id, "--timeout-secs", "5"])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("\"state\":\"succeeded\""));
+    let parent: Value = serde_json::from_slice(
+        &env.command()
+            .args(["capture", "inspect", capture_id])
+            .assert()
+            .success()
+            .get_output()
+            .stdout,
+    )
+    .expect("Capture parent avec Doublon");
+    assert_eq!(parent["ledger"][2]["details"]["status"], "reused");
 }
 
 #[test]
