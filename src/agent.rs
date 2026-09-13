@@ -8,7 +8,7 @@ use std::thread;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use anyhow::{Context, Result, bail};
-use clap::{Args, Parser, Subcommand};
+use clap::{Args, Parser, Subcommand, ValueEnum};
 use fs2::FileExt;
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
@@ -21,6 +21,7 @@ use crate::unique_id::unique_id;
 use crate::{audio, frames, transcribe};
 
 mod admission;
+mod derive;
 mod error;
 mod publication;
 mod web_capture;
@@ -45,12 +46,30 @@ struct AgentCli {
 #[derive(Subcommand)]
 enum AgentCommand {
     Capture(CaptureCommand),
+    Derive(DeriveCommand),
     Job(JobCommand),
     #[command(name = "capture-worker", hide = true)]
     CaptureWorker {
         #[arg(long)]
         job_id: String,
     },
+}
+
+#[derive(Args)]
+struct DeriveCommand {
+    capture_id: String,
+    #[arg(long, value_enum)]
+    recipe: RecipeKind,
+    #[arg(long)]
+    provider: String,
+    #[arg(long)]
+    policy: Option<String>,
+    #[arg(long, conflicts_with = "reference")]
+    whole_capture: bool,
+    #[arg(long)]
+    reference: Vec<String>,
+    #[arg(long)]
+    parameters: Option<String>,
 }
 
 #[derive(Args)]
@@ -145,6 +164,8 @@ struct PolicySnapshot {
     limits: Limits,
     allows_remote_calls: bool,
     allowed_providers: Vec<String>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    allowed_recipes: Vec<RecipeKind>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -176,6 +197,8 @@ struct Job {
     updated_at: u64,
     worker_pid: Option<u32>,
     capture_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    derive_id: Option<String>,
     #[serde(default)]
     child_capture_ids: Vec<String>,
     #[serde(default)]
@@ -192,6 +215,47 @@ enum JobOperation {
         parent_capture_id: String,
         discovery_ids: Vec<String>,
     },
+    Derive {
+        capture_id: String,
+        recipe: Recipe,
+        provider: String,
+        parameters: Value,
+    },
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, ValueEnum)]
+#[serde(rename_all = "kebab-case")]
+enum RecipeKind {
+    StructuredSummary,
+    ProvenClaims,
+    Checklist,
+    MarkdownNote,
+    SourcedAnswer,
+}
+
+impl RecipeKind {
+    const fn as_str(self) -> &'static str {
+        match self {
+            Self::StructuredSummary => "structured-summary",
+            Self::ProvenClaims => "proven-claims",
+            Self::Checklist => "checklist",
+            Self::MarkdownNote => "markdown-note",
+            Self::SourcedAnswer => "sourced-answer",
+        }
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct Recipe {
+    kind: RecipeKind,
+    target: RecipeTarget,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+enum RecipeTarget {
+    Capture { capture_id: String },
+    References { references: Vec<Reference> },
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -218,6 +282,8 @@ struct QueuedDiscovery {
 struct StructuredError {
     code: String,
     message: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    capability: Option<String>,
 }
 
 #[derive(Serialize)]
@@ -308,7 +374,7 @@ struct ProviderDependency {
     version: String,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(tag = "kind", rename_all = "kebab-case")]
 enum Locator {
     File,
@@ -319,7 +385,7 @@ enum Locator {
     CssSelector { value: String },
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 struct ImageRegion {
     left: u32,
     top: u32,
@@ -331,6 +397,7 @@ struct ImageRegion {
 struct InspectedCapture {
     manifest: Manifest,
     ledger: Vec<LedgerEvent>,
+    derivatives: Vec<derive::Derivative>,
 }
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -342,7 +409,7 @@ struct LedgerEvent {
     details: Option<Value>,
 }
 
-#[derive(Debug, Clone, Deserialize, Serialize)]
+#[derive(Debug, Clone, Deserialize, PartialEq, Serialize)]
 struct Reference {
     capture_id: String,
     artifact_id: String,
@@ -424,7 +491,7 @@ struct ReadArtifact {
     content: ReadContent,
 }
 
-#[derive(Serialize)]
+#[derive(Debug, Clone, Deserialize, Serialize)]
 struct ArtifactMetadata {
     artifact_id: String,
     path: String,
@@ -480,7 +547,7 @@ pub fn is_agent_command(arguments: &[OsString]) -> bool {
     arguments.get(1).is_some_and(|argument| {
         matches!(
             argument.to_str(),
-            Some("capture" | "job" | "capture-worker")
+            Some("capture" | "derive" | "job" | "capture-worker")
         )
     })
 }
@@ -492,6 +559,7 @@ pub fn run(arguments: Vec<OsString>) -> Result<()> {
     };
     let result = match cli.command {
         AgentCommand::Capture(command) => run_capture_command(command),
+        AgentCommand::Derive(command) => run_derive_command(command),
         AgentCommand::Job(command) => run_job_command(command),
         AgentCommand::CaptureWorker { job_id } => run_worker(&job_id),
     };
@@ -503,11 +571,65 @@ pub fn run(arguments: Vec<OsString>) -> Result<()> {
     }
 }
 
+fn run_derive_command(command: DeriveCommand) -> Result<()> {
+    let policy_name = command
+        .policy
+        .as_deref()
+        .context("derive requires --policy")?;
+    let parameters = command
+        .parameters
+        .as_deref()
+        .map_or_else(
+            || Ok(Value::Object(serde_json::Map::new())),
+            serde_json::from_str,
+        )
+        .context("parsing Derive parameters as JSON")?;
+    let references = command
+        .reference
+        .iter()
+        .map(|reference| {
+            serde_json::from_str(reference).context("parsing Derive Reference as JSON")
+        })
+        .collect::<Result<Vec<Reference>>>()?;
+    if !command.whole_capture && references.is_empty() {
+        bail!("derive requires --whole-capture or --reference");
+    }
+    let target = if command.whole_capture {
+        RecipeTarget::Capture {
+            capture_id: command.capture_id.clone(),
+        }
+    } else {
+        RecipeTarget::References { references }
+    };
+    let policy = policy_for(policy_name)?;
+    derive::admit(
+        &command.capture_id,
+        command.recipe,
+        &command.provider,
+        &target,
+        &policy,
+    )?;
+    create_job(
+        command.capture_id.clone(),
+        policy,
+        JobOperation::Derive {
+            capture_id: command.capture_id,
+            recipe: Recipe {
+                kind: command.recipe,
+                target,
+            },
+            provider: command.provider,
+            parameters,
+        },
+    )
+}
+
 fn print_agent_error(code: &str, message: String) -> Result<()> {
     print_json(&AgentError {
         error: StructuredError {
             code: code.to_string(),
             message,
+            capability: None,
         },
     })
 }
@@ -518,6 +640,10 @@ fn agent_error(error: &anyhow::Error) -> StructuredError {
         "invalid_cursor"
     } else if message.contains("requires --policy") {
         "policy_required"
+    } else if message.contains("Recipe `") && message.contains("is not allowed by Policy") {
+        "recipe_not_allowed"
+    } else if message.contains("Provider `") && message.contains("is not allowed by Policy") {
+        "provider_not_allowed"
     } else if message.contains("limit must") {
         "invalid_pagination"
     } else if message.contains("length must") || message.contains("UTF-8 character boundary") {
@@ -544,6 +670,7 @@ fn agent_error(error: &anyhow::Error) -> StructuredError {
     StructuredError {
         code: code.to_string(),
         message,
+        capability: None,
     }
 }
 
@@ -643,6 +770,7 @@ fn create_job(source: String, policy: Policy, operation: JobOperation) -> Result
         updated_at: now,
         worker_pid: None,
         capture_id: None,
+        derive_id: None,
         child_capture_ids: Vec::new(),
         checkpoint: None,
         error: None,
@@ -684,6 +812,13 @@ fn run_worker(job_id: &str) -> Result<()> {
     {
         return match resolve_discoveries(&job, parent_capture_id) {
             Ok(()) => Ok(()),
+            Err(error) => fail_job(job_id, &error),
+        };
+    }
+
+    if matches!(job.operation, JobOperation::Derive { .. }) {
+        return match derive::publish(&job) {
+            Ok(derive_id) => complete_derive_job(job_id, derive_id),
             Err(error) => fail_job(job_id, &error),
         };
     }
@@ -1210,7 +1345,7 @@ impl JobOperation {
     fn discovery_ids(&self) -> &[String] {
         match self {
             Self::Continue { discovery_ids, .. } => discovery_ids,
-            Self::Capture => &[],
+            Self::Capture | Self::Derive { .. } => &[],
         }
     }
 }
@@ -1531,6 +1666,7 @@ fn capture_local_document(
             error: Some(StructuredError {
                 code: code.to_string(),
                 message: format!("{error:#}"),
+                capability: None,
             }),
         });
     }
@@ -2170,6 +2306,7 @@ fn failed_capability(name: &str, provider: Provider, error: &anyhow::Error) -> C
         error: Some(StructuredError {
             code: "capability_failed".to_string(),
             message: format!("{error:#}"),
+            capability: None,
         }),
     }
 }
@@ -2182,6 +2319,7 @@ fn blocked_capability(name: &str, provider: Provider, error: &anyhow::Error) -> 
         error: Some(StructuredError {
             code: "capability_blocked".to_string(),
             message: format!("required capability failed: {error:#}"),
+            capability: None,
         }),
     }
 }
@@ -2221,6 +2359,7 @@ fn record_capability_failure(manifest: &mut Manifest, name: &str, error: &anyhow
         capability.error = Some(StructuredError {
             code: "capability_failed".to_string(),
             message: format!("{error:#}"),
+            capability: None,
         });
     } else {
         manifest.capabilities.push(failed_capability(
@@ -2430,6 +2569,7 @@ fn start_job(job_id: &str) -> Result<Option<Job>> {
                 "{}@{} concurrency budget exceeded",
                 job.policy.id, job.policy.version
             ),
+            capability: None,
         });
         write_job(&job)?;
         append_job_event(job_id, "failed")?;
@@ -2461,6 +2601,20 @@ fn complete_job(job_id: &str, capture_id: String, partial: bool) -> Result<()> {
         job.worker_pid = None;
         write_job(&job)?;
         append_job_event(job_id, &job.state)?;
+    }
+    unlock_job(&lock)
+}
+
+fn complete_derive_job(job_id: &str, derive_id: String) -> Result<()> {
+    let lock = lock_job(job_id)?;
+    let mut job = read_job(job_id)?;
+    if job.state != "cancelled" {
+        job.state = "succeeded".to_string();
+        job.updated_at = now_secs();
+        job.derive_id = Some(derive_id);
+        job.worker_pid = None;
+        write_job(&job)?;
+        append_job_event(job_id, "succeeded")?;
     }
     unlock_job(&lock)
 }
@@ -2507,9 +2661,17 @@ fn fail_job(job_id: &str, error: &anyhow::Error) -> Result<()> {
     job.state = "failed".to_string();
     job.updated_at = now_secs();
     job.worker_pid = None;
+    let (code, capability) = match &job.operation {
+        JobOperation::Derive { recipe, .. } => (
+            "derive_provider_failed".to_string(),
+            Some(recipe.kind.as_str().to_string()),
+        ),
+        _ => (error_code(error), None),
+    };
     job.error = Some(StructuredError {
-        code: error_code(error),
+        code,
         message: format!("{error:#}"),
+        capability,
     });
     write_job(&job)?;
     append_job_event(&job.id, "failed")?;
@@ -2567,7 +2729,12 @@ fn inspect_capture(capture_id: &str) -> Result<()> {
     let directory = captures_dir()?.join(capture_id);
     let manifest: Manifest = read_json(&directory.join("manifest.json"))?;
     let ledger = read_json_lines(&directory.join("ledger.jsonl"))?;
-    print_json(&InspectedCapture { manifest, ledger })
+    let derivatives = derive::list(capture_id)?;
+    print_json(&InspectedCapture {
+        manifest,
+        ledger,
+        derivatives,
+    })
 }
 
 fn run_index_command(command: &IndexCommand) -> Result<()> {
@@ -2601,6 +2768,7 @@ fn search_captures(query: &str, cursor: Option<&str>, limit: usize) -> Result<()
                 error: StructuredError {
                     code: "index_unavailable".to_string(),
                     message: format!("search Index is unavailable: {error:#}"),
+                    capability: None,
                 },
             });
         }
@@ -2610,6 +2778,7 @@ fn search_captures(query: &str, cursor: Option<&str>, limit: usize) -> Result<()
             error: StructuredError {
                 code: "index_unavailable".to_string(),
                 message: "search Index version is unsupported".to_string(),
+                capability: None,
             },
         });
     }
@@ -2667,8 +2836,12 @@ fn read_artifact(
     }
     let directory = captures_dir()?.join(&request.capture_id);
     let manifest: Manifest = read_json(&directory.join("manifest.json"))?;
-    let artifact =
-        artifact_for(&manifest, &request.artifact_id).context("unknown artifact identifier")?;
+    let artifact = artifact_for(&manifest, &request.artifact_id)
+        .or(derive::artifact_for(
+            &request.capture_id,
+            &request.artifact_id,
+        )?)
+        .context("unknown artifact identifier")?;
     if !is_text_mime(&artifact.mime) {
         bail!("binary artifacts cannot be read on stdout");
     }
@@ -2919,6 +3092,7 @@ fn record_index_degradation(error: &anyhow::Error) {
                 error: StructuredError {
                     code: "index_degraded".to_string(),
                     message: format!("{error:#}"),
+                    capability: None,
                 },
             },
         )
@@ -3120,8 +3294,10 @@ fn reconcile_interrupted(job_id: &str) -> Result<Job> {
 }
 
 fn policy_for(name: &str) -> Result<Policy> {
-    if name != POLICY_NAME && name != "safe-web@1" {
-        bail!("unsupported Policy `{name}`; expected `{POLICY_NAME}` or `safe-web@1`");
+    if name != POLICY_NAME && name != "safe-web@1" && name != "safe-local-derive@1" {
+        bail!(
+            "unsupported Policy `{name}`; expected `{POLICY_NAME}`, `safe-web@1` or `safe-local-derive@1`"
+        );
     }
     let limits = Limits {
         depth_limit: 2,
@@ -3131,33 +3307,46 @@ fn policy_for(name: &str) -> Result<Policy> {
         duration_limit_secs: 30 * 60,
         concurrency_limit: 2,
     };
-    let allowed_providers = if name == POLICY_NAME || name == "safe-web@1" {
-        vec![
-            "ffmpeg".to_string(),
-            "ffprobe".to_string(),
-            "whisper-cli".to_string(),
-            "pdftotext".to_string(),
-            "pdfinfo".to_string(),
-            "tesseract".to_string(),
-        ]
+    let (allowed_providers, allowed_recipes) = if name == "safe-local-derive@1" {
+        (
+            vec!["scriptor-local-derive".to_string()],
+            vec![
+                RecipeKind::StructuredSummary,
+                RecipeKind::ProvenClaims,
+                RecipeKind::Checklist,
+                RecipeKind::MarkdownNote,
+                RecipeKind::SourcedAnswer,
+            ],
+        )
     } else {
-        Vec::new()
+        (
+            vec![
+                "ffmpeg".to_string(),
+                "ffprobe".to_string(),
+                "whisper-cli".to_string(),
+                "pdftotext".to_string(),
+                "pdfinfo".to_string(),
+                "tesseract".to_string(),
+            ],
+            Vec::new(),
+        )
     };
     let snapshot = PolicySnapshot {
         duplicate_mode: "reuse".to_string(),
         limits,
         allows_remote_calls: name == "safe-web@1",
         allowed_providers,
+        allowed_recipes,
     };
     let canonical_snapshot =
         serde_json::to_value(&snapshot).context("normalizing Policy snapshot")?;
     let snapshot_bytes =
         serde_json::to_vec(&canonical_snapshot).context("serializing Policy snapshot")?;
     Ok(Policy {
-        id: if name == POLICY_NAME {
-            "safe-local"
-        } else {
-            "safe-web"
+        id: match name {
+            POLICY_NAME => "safe-local",
+            "safe-web@1" => "safe-web",
+            _ => "safe-local-derive",
         }
         .to_string(),
         version: 1,
