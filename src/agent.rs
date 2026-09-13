@@ -2529,7 +2529,7 @@ fn error_code(error: &anyhow::Error) -> String {
 }
 
 fn print_job(job_id: &str) -> Result<()> {
-    let job = reconcile_interrupted(read_job(job_id)?)?;
+    let job = reconcile_interrupted(job_id)?;
     print_json(&job)
 }
 
@@ -2538,7 +2538,7 @@ fn wait_for_job(job_id: &str, timeout_secs: u64) -> Result<()> {
         .checked_add(Duration::from_secs(timeout_secs))
         .context("calculating Job wait deadline")?;
     loop {
-        let job = reconcile_interrupted(read_job(job_id)?)?;
+        let job = reconcile_interrupted(job_id)?;
         if is_terminal(&job.state) {
             return print_json(&job);
         }
@@ -3101,7 +3101,9 @@ fn mime_for_source(source: &Path) -> &'static str {
     }
 }
 
-fn reconcile_interrupted(mut job: Job) -> Result<Job> {
+fn reconcile_interrupted(job_id: &str) -> Result<Job> {
+    let lock = lock_job(job_id)?;
+    let mut job = read_job(job_id)?;
     if matches!(job.state.as_str(), "queued" | "running")
         && job
             .worker_pid
@@ -3113,6 +3115,7 @@ fn reconcile_interrupted(mut job: Job) -> Result<Job> {
         write_job(&job)?;
         append_job_event(&job.id, "interrupted")?;
     }
+    unlock_job(&lock)?;
     Ok(job)
 }
 
