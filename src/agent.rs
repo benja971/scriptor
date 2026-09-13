@@ -70,6 +70,8 @@ struct DeriveCommand {
     reference: Vec<String>,
     #[arg(long)]
     parameters: Option<String>,
+    #[arg(long)]
+    retry_of: Option<String>,
 }
 
 #[derive(Args)]
@@ -199,6 +201,8 @@ struct Job {
     capture_id: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     derive_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    retry_of: Option<String>,
     #[serde(default)]
     child_capture_ids: Vec<String>,
     #[serde(default)]
@@ -584,6 +588,7 @@ fn run_derive_command(command: DeriveCommand) -> Result<()> {
             serde_json::from_str,
         )
         .context("parsing Derive parameters as JSON")?;
+    derive::validate_parameters(&parameters)?;
     let references = command
         .reference
         .iter()
@@ -592,7 +597,10 @@ fn run_derive_command(command: DeriveCommand) -> Result<()> {
         })
         .collect::<Result<Vec<Reference>>>()?;
     if !command.whole_capture && references.is_empty() {
-        bail!("derive requires --whole-capture or --reference");
+        return Err(coded_error(
+            AgentErrorCode::InvalidDeriveTarget,
+            "derive requires --whole-capture or --reference",
+        ));
     }
     let target = if command.whole_capture {
         RecipeTarget::Capture {
@@ -609,6 +617,9 @@ fn run_derive_command(command: DeriveCommand) -> Result<()> {
         &target,
         &policy,
     )?;
+    if let Some(retry_of) = command.retry_of.as_deref() {
+        derive::admit_retry(retry_of, &command.capture_id, command.recipe)?;
+    }
     create_job(
         command.capture_id.clone(),
         policy,
@@ -621,6 +632,7 @@ fn run_derive_command(command: DeriveCommand) -> Result<()> {
             provider: command.provider,
             parameters,
         },
+        command.retry_of,
     )
 }
 
@@ -636,14 +648,21 @@ fn print_agent_error(code: &str, message: String) -> Result<()> {
 
 fn agent_error(error: &anyhow::Error) -> StructuredError {
     let message = format!("{error:#}");
+    if let Some(code) = error.chain().find_map(|cause| {
+        cause
+            .downcast_ref::<CodedError>()
+            .map(|coded| coded.code.as_str())
+    }) {
+        return StructuredError {
+            code: code.to_string(),
+            message,
+            capability: None,
+        };
+    }
     let code = if message.contains("pagination cursor") {
         "invalid_cursor"
     } else if message.contains("requires --policy") {
         "policy_required"
-    } else if message.contains("Recipe `") && message.contains("is not allowed by Policy") {
-        "recipe_not_allowed"
-    } else if message.contains("Provider `") && message.contains("is not allowed by Policy") {
-        "provider_not_allowed"
     } else if message.contains("limit must") {
         "invalid_pagination"
     } else if message.contains("length must") || message.contains("UTF-8 character boundary") {
@@ -738,6 +757,7 @@ fn continue_capture(
             parent_capture_id: capture_id.to_string(),
             discovery_ids: discovery_ids.to_vec(),
         },
+        None,
     )
 }
 
@@ -755,10 +775,15 @@ fn run_job_command(command: JobCommand) -> Result<()> {
 fn create_capture_job(source: &Path, policy_name: &str) -> Result<()> {
     let policy = policy_for(policy_name)?;
     let source = admission::admit(source, &policy)?.into_job_source();
-    create_job(source, policy, JobOperation::Capture)
+    create_job(source, policy, JobOperation::Capture, None)
 }
 
-fn create_job(source: String, policy: Policy, operation: JobOperation) -> Result<()> {
+fn create_job(
+    source: String,
+    policy: Policy,
+    operation: JobOperation,
+    retry_of: Option<String>,
+) -> Result<()> {
     let now = now_secs();
     let job = Job {
         id: format!("job-{}", unique_id()),
@@ -771,6 +796,7 @@ fn create_job(source: String, policy: Policy, operation: JobOperation) -> Result
         worker_pid: None,
         capture_id: None,
         derive_id: None,
+        retry_of,
         child_capture_ids: Vec::new(),
         checkpoint: None,
         error: None,
@@ -818,7 +844,7 @@ fn run_worker(job_id: &str) -> Result<()> {
 
     if matches!(job.operation, JobOperation::Derive { .. }) {
         return match derive::publish(&job) {
-            Ok(derive_id) => complete_derive_job(job_id, derive_id),
+            Ok(()) => Ok(()),
             Err(error) => fail_job(job_id, &error),
         };
     }
@@ -2605,20 +2631,6 @@ fn complete_job(job_id: &str, capture_id: String, partial: bool) -> Result<()> {
     unlock_job(&lock)
 }
 
-fn complete_derive_job(job_id: &str, derive_id: String) -> Result<()> {
-    let lock = lock_job(job_id)?;
-    let mut job = read_job(job_id)?;
-    if job.state != "cancelled" {
-        job.state = "succeeded".to_string();
-        job.updated_at = now_secs();
-        job.derive_id = Some(derive_id);
-        job.worker_pid = None;
-        write_job(&job)?;
-        append_job_event(job_id, "succeeded")?;
-    }
-    unlock_job(&lock)
-}
-
 fn complete_continuation_job(
     job_id: &str,
     child_capture_ids: Vec<String>,
@@ -2661,9 +2673,14 @@ fn fail_job(job_id: &str, error: &anyhow::Error) -> Result<()> {
     job.state = "failed".to_string();
     job.updated_at = now_secs();
     job.worker_pid = None;
+    let typed_code = error.chain().find_map(|cause| {
+        cause
+            .downcast_ref::<CodedError>()
+            .map(|coded| coded.code.as_str().to_string())
+    });
     let (code, capability) = match &job.operation {
         JobOperation::Derive { recipe, .. } => (
-            "derive_provider_failed".to_string(),
+            typed_code.unwrap_or_else(|| "derive_provider_failed".to_string()),
             Some(recipe.kind.as_str().to_string()),
         ),
         _ => (error_code(error), None),
@@ -3294,10 +3311,8 @@ fn reconcile_interrupted(job_id: &str) -> Result<Job> {
 }
 
 fn policy_for(name: &str) -> Result<Policy> {
-    if name != POLICY_NAME && name != "safe-web@1" && name != "safe-local-derive@1" {
-        bail!(
-            "unsupported Policy `{name}`; expected `{POLICY_NAME}`, `safe-web@1` or `safe-local-derive@1`"
-        );
+    if name != POLICY_NAME && name != "safe-web@1" {
+        bail!("unsupported Policy `{name}`; expected `{POLICY_NAME}` or `safe-web@1`");
     }
     let limits = Limits {
         depth_limit: 2,
@@ -3307,29 +3322,25 @@ fn policy_for(name: &str) -> Result<Policy> {
         duration_limit_secs: 30 * 60,
         concurrency_limit: 2,
     };
-    let (allowed_providers, allowed_recipes) = if name == "safe-local-derive@1" {
-        (
-            vec!["scriptor-local-derive".to_string()],
-            vec![
-                RecipeKind::StructuredSummary,
-                RecipeKind::ProvenClaims,
-                RecipeKind::Checklist,
-                RecipeKind::MarkdownNote,
-                RecipeKind::SourcedAnswer,
-            ],
-        )
+    let mut allowed_providers = vec![
+        "ffmpeg".to_string(),
+        "ffprobe".to_string(),
+        "whisper-cli".to_string(),
+        "pdftotext".to_string(),
+        "pdfinfo".to_string(),
+        "tesseract".to_string(),
+    ];
+    let allowed_recipes = if name == POLICY_NAME {
+        allowed_providers.push("scriptor-local-derive".to_string());
+        vec![
+            RecipeKind::StructuredSummary,
+            RecipeKind::ProvenClaims,
+            RecipeKind::Checklist,
+            RecipeKind::MarkdownNote,
+            RecipeKind::SourcedAnswer,
+        ]
     } else {
-        (
-            vec![
-                "ffmpeg".to_string(),
-                "ffprobe".to_string(),
-                "whisper-cli".to_string(),
-                "pdftotext".to_string(),
-                "pdfinfo".to_string(),
-                "tesseract".to_string(),
-            ],
-            Vec::new(),
-        )
+        Vec::new()
     };
     let snapshot = PolicySnapshot {
         duplicate_mode: "reuse".to_string(),
@@ -3343,10 +3354,10 @@ fn policy_for(name: &str) -> Result<Policy> {
     let snapshot_bytes =
         serde_json::to_vec(&canonical_snapshot).context("serializing Policy snapshot")?;
     Ok(Policy {
-        id: match name {
-            POLICY_NAME => "safe-local",
-            "safe-web@1" => "safe-web",
-            _ => "safe-local-derive",
+        id: if name == POLICY_NAME {
+            "safe-local"
+        } else {
+            "safe-web"
         }
         .to_string(),
         version: 1,

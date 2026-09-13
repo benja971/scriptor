@@ -6,7 +6,7 @@ Le Contrat agent crée un Dérivé avec une sélection explicite :
 scriptor derive <capture_id> \
   --recipe markdown-note \
   --provider scriptor-local-derive \
-  --policy safe-local-derive@1 \
+  --policy safe-local@1 \
   --whole-capture
 ```
 
@@ -14,7 +14,12 @@ scriptor derive <capture_id> \
 Il peut être remplacé par un ou plusieurs `--reference '<json>'`. Les Dérivés
 antérieurs ne sont jamais ajoutés implicitement aux entrées.
 
-La Policy `safe-local-derive@1` interdit les appels distants, autorise uniquement
+Une relance explicite ajoute `--retry-of <job_id>`. Scriptor vérifie que le Job
+précédent concerne la même Capture et la même Recette, puis conserve ce lien
+dans le nouveau Job. Chaque tentative garde un `job_id` distinct et chaque
+succès publie un nouveau `derive_id`.
+
+La Policy `safe-local@1` interdit les appels distants, autorise
 le binaire `scriptor-local-derive` et les Recettes suivantes :
 
 - `structured-summary`
@@ -49,6 +54,11 @@ Un code de sortie non nul échoue le Job avec la Capacité correspondant à la
 Recette. Scriptor borne la durée, l'espace disque et les sorties diagnostiques,
 calcule la version du Provider depuis le hash de son binaire, puis publie le
 Dérivé dans `captures/<capture_id>/derivatives/<derive_id>/`.
+
+Les paramètres demandés et effectifs doivent être des objets JSON sans champ de
+secret, jeton, mot de passe, cookie, autorisation, clé privée ni identifiant
+d'accès.
+Scriptor refuse ces champs avant toute persistance.
 
 Le moteur local derrière `scriptor-local-derive` n'est pas distribué par ce
 projet. Il doit respecter cette interface et être présent dans `PATH`.

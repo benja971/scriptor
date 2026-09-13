@@ -154,6 +154,24 @@ echo 'modele local indisponible' >&2
 exit 1
 ";
 
+const FAKE_LOCAL_DERIVE_PROVIDER_SECRET: &str = r#"#!/bin/sh
+set -eu
+while [ "$#" -gt 0 ]; do
+  case "$1" in
+    --output) output="$2"; shift 2 ;;
+    *) shift ;;
+  esac
+done
+printf 'contenu' > "$output"
+printf '{"mime":"text/plain","effective_parameters":{"api_token":"secret"}}'
+"#;
+
+const FAKE_LOCAL_DERIVE_PROVIDER_BLOCKING: &str = r#"#!/bin/sh
+set -eu
+printf 'started' > "$XDG_CACHE_HOME/derive-started"
+while [ ! -f "$XDG_CACHE_HOME/derive-release" ]; do :; done
+"#;
+
 const FAKE_PAGE_RENDERER: &str = r#"#!/bin/sh
 set -eu
 while [ "$#" -gt 0 ]; do
@@ -2322,7 +2340,7 @@ fn derive_whole_capture_publishes_a_readable_traced_derivative() {
                 "--provider",
                 "scriptor-local-derive",
                 "--policy",
-                "safe-local-derive@1",
+                "safe-local@1",
                 "--whole-capture",
                 "--parameters",
                 r#"{"style":"requested"}"#,
@@ -2434,7 +2452,7 @@ fn derive_transmits_only_selected_verified_references() {
                 "--provider",
                 "scriptor-local-derive",
                 "--policy",
-                "safe-local-derive@1",
+                "safe-local@1",
                 "--reference",
                 &reference.to_string(),
             ])
@@ -2472,7 +2490,7 @@ fn derive_transmits_only_selected_verified_references() {
                 "--provider",
                 "scriptor-local-derive",
                 "--policy",
-                "safe-local-derive@1",
+                "safe-local@1",
                 "--reference",
                 &forged.to_string(),
             ])
@@ -2513,7 +2531,7 @@ fn derive_refuses_missing_policy_and_unauthorized_recipe_or_provider() {
                 "--provider",
                 "scriptor-local-derive",
                 "--policy",
-                "safe-local@1",
+                "safe-web@1",
                 "--whole-capture",
             ],
             "recipe_not_allowed",
@@ -2527,7 +2545,7 @@ fn derive_refuses_missing_policy_and_unauthorized_recipe_or_provider() {
                 "--provider",
                 "other-provider",
                 "--policy",
-                "safe-local-derive@1",
+                "safe-local@1",
                 "--whole-capture",
             ],
             "provider_not_allowed",
@@ -2553,20 +2571,24 @@ fn rerunning_a_recipe_creates_distinct_immutable_derivatives() {
     let env = TestEnv::new("derive-rerun");
     env.install_binary("scriptor-local-derive", FAKE_LOCAL_DERIVE_PROVIDER);
     let capture_id = create_text_capture(&env);
-    let run = || {
+    let run = |retry_of: Option<&str>| {
+        let mut arguments = vec![
+            "derive".to_string(),
+            capture_id.clone(),
+            "--recipe".to_string(),
+            "markdown-note".to_string(),
+            "--provider".to_string(),
+            "scriptor-local-derive".to_string(),
+            "--policy".to_string(),
+            "safe-local@1".to_string(),
+            "--whole-capture".to_string(),
+        ];
+        if let Some(job_id) = retry_of {
+            arguments.extend(["--retry-of".to_string(), job_id.to_string()]);
+        }
         let created: Value = serde_json::from_slice(
             &env.command()
-                .args([
-                    "derive",
-                    &capture_id,
-                    "--recipe",
-                    "markdown-note",
-                    "--provider",
-                    "scriptor-local-derive",
-                    "--policy",
-                    "safe-local-derive@1",
-                    "--whole-capture",
-                ])
+                .args(arguments)
                 .assert()
                 .success()
                 .get_output()
@@ -2585,7 +2607,7 @@ fn rerunning_a_recipe_creates_distinct_immutable_derivatives() {
         )
     };
 
-    let (first_job, first_derive) = run();
+    let (first_job, first_derive) = run(None);
     let first_path = env
         .xdg_data
         .join("scriptor/v2/captures")
@@ -2594,7 +2616,7 @@ fn rerunning_a_recipe_creates_distinct_immutable_derivatives() {
         .join(&first_derive)
         .join("content");
     let first_bytes = fs::read(&first_path).expect("premier Derive lisible");
-    let (second_job, second_derive) = run();
+    let (second_job, second_derive) = run(Some(&first_job));
 
     assert_ne!(first_job, second_job);
     assert_ne!(first_derive, second_derive);
@@ -2607,6 +2629,16 @@ fn rerunning_a_recipe_creates_distinct_immutable_derivatives() {
     assert_eq!(capture["ledger"].as_array().map(Vec::len), Some(3));
     assert_eq!(capture["ledger"][1]["details"]["derive_id"], first_derive);
     assert_eq!(capture["ledger"][2]["details"]["derive_id"], second_derive);
+    let second_job_state: Value = serde_json::from_slice(
+        &env.command()
+            .args(["job", "get", &second_job])
+            .assert()
+            .success()
+            .get_output()
+            .stdout,
+    )
+    .expect("Job de relance JSON valide");
+    assert_eq!(second_job_state["retry_of"], first_job);
 }
 
 #[test]
@@ -2614,20 +2646,24 @@ fn failed_derive_capability_is_structured_and_retry_is_a_distinct_attempt() {
     let env = TestEnv::new("derive-failure-retry");
     env.install_binary("scriptor-local-derive", FAKE_LOCAL_DERIVE_PROVIDER_FAILURE);
     let capture_id = create_text_capture(&env);
-    let create = || {
+    let create = |retry_of: Option<&str>| {
+        let mut arguments = vec![
+            "derive".to_string(),
+            capture_id.clone(),
+            "--recipe".to_string(),
+            "sourced-answer".to_string(),
+            "--provider".to_string(),
+            "scriptor-local-derive".to_string(),
+            "--policy".to_string(),
+            "safe-local@1".to_string(),
+            "--whole-capture".to_string(),
+        ];
+        if let Some(job_id) = retry_of {
+            arguments.extend(["--retry-of".to_string(), job_id.to_string()]);
+        }
         serde_json::from_slice::<Value>(
             &env.command()
-                .args([
-                    "derive",
-                    &capture_id,
-                    "--recipe",
-                    "sourced-answer",
-                    "--provider",
-                    "scriptor-local-derive",
-                    "--policy",
-                    "safe-local-derive@1",
-                    "--whole-capture",
-                ])
+                .args(arguments)
                 .assert()
                 .success()
                 .get_output()
@@ -2636,7 +2672,7 @@ fn failed_derive_capability_is_structured_and_retry_is_a_distinct_attempt() {
         .expect("Job de Derive JSON valide")
     };
 
-    let failed = create();
+    let failed = create(None);
     let failed_job_id = failed["job"]["job_id"]
         .as_str()
         .expect("premiere tentative");
@@ -2657,12 +2693,120 @@ fn failed_derive_capability_is_structured_and_retry_is_a_distinct_attempt() {
     );
 
     env.install_binary("scriptor-local-derive", FAKE_LOCAL_DERIVE_PROVIDER);
-    let retried = create();
+    let retried = create(Some(failed_job_id));
+    assert_eq!(retried["job"]["retry_of"], failed_job_id);
     let retry_job_id = retried["job"]["job_id"].as_str().expect("relance");
     assert_ne!(failed_job_id, retry_job_id);
     let retry_job = wait_for_agent_job(&env, retry_job_id);
     assert_eq!(retry_job["state"], "succeeded", "{retry_job}");
     assert!(retry_job["derive_id"].is_string());
+}
+
+#[test]
+fn derive_never_persists_parameters_marked_as_sensitive() {
+    let env = TestEnv::new("derive-sensitive-parameters");
+    env.install_binary("scriptor-local-derive", FAKE_LOCAL_DERIVE_PROVIDER);
+    let capture_id = create_text_capture(&env);
+    let refused: Value = serde_json::from_slice(
+        &env.command()
+            .args([
+                "derive",
+                &capture_id,
+                "--recipe",
+                "markdown-note",
+                "--provider",
+                "scriptor-local-derive",
+                "--policy",
+                "safe-local@1",
+                "--whole-capture",
+                "--parameters",
+                r#"{"api_token":"secret"}"#,
+            ])
+            .assert()
+            .success()
+            .get_output()
+            .stdout,
+    )
+    .expect("refus des parametres JSON valide");
+    assert_eq!(refused["error"]["code"], "sensitive_parameters");
+    assert!(!env.xdg_cache.join("derive-request.json").exists());
+
+    env.install_binary("scriptor-local-derive", FAKE_LOCAL_DERIVE_PROVIDER_SECRET);
+    let created: Value = serde_json::from_slice(
+        &env.command()
+            .args([
+                "derive",
+                &capture_id,
+                "--recipe",
+                "markdown-note",
+                "--provider",
+                "scriptor-local-derive",
+                "--policy",
+                "safe-local@1",
+                "--whole-capture",
+            ])
+            .assert()
+            .success()
+            .get_output()
+            .stdout,
+    )
+    .expect("Job de Derive JSON valide");
+    let job_id = created["job"]["job_id"].as_str().expect("Job de Derive");
+    let failed = wait_for_agent_job(&env, job_id);
+    assert_eq!(failed["state"], "failed", "{failed}");
+    assert_eq!(failed["error"]["code"], "sensitive_parameters");
+    assert_eq!(failed["error"]["capability"], "markdown-note");
+    assert!(
+        inspect_agent_capture(&env, &capture_id)["derivatives"]
+            .as_array()
+            .is_some_and(Vec::is_empty)
+    );
+}
+
+#[test]
+fn cancelling_a_running_derive_never_publishes_it() {
+    let env = TestEnv::new("derive-cancellation");
+    env.install_binary("scriptor-local-derive", FAKE_LOCAL_DERIVE_PROVIDER_BLOCKING);
+    let capture_id = create_text_capture(&env);
+    let created: Value = serde_json::from_slice(
+        &env.command()
+            .args([
+                "derive",
+                &capture_id,
+                "--recipe",
+                "markdown-note",
+                "--provider",
+                "scriptor-local-derive",
+                "--policy",
+                "safe-local@1",
+                "--whole-capture",
+            ])
+            .assert()
+            .success()
+            .get_output()
+            .stdout,
+    )
+    .expect("Job de Derive JSON valide");
+    let job_id = created["job"]["job_id"].as_str().expect("Job de Derive");
+    assert!(wait_for_file(
+        &env.xdg_cache.join("derive-started"),
+        Duration::from_secs(5)
+    ));
+    let cancelled: Value = serde_json::from_slice(
+        &env.command()
+            .args(["job", "cancel", job_id])
+            .assert()
+            .success()
+            .get_output()
+            .stdout,
+    )
+    .expect("annulation JSON valide");
+    assert_eq!(cancelled["state"], "cancelled");
+    assert!(
+        inspect_agent_capture(&env, &capture_id)["derivatives"]
+            .as_array()
+            .is_some_and(Vec::is_empty)
+    );
 }
 
 /// Test end-to-end avec les **vrais** binaires (`ffmpeg`, `whisper-cli`,

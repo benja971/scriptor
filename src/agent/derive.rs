@@ -6,12 +6,13 @@ use anyhow::{Context, Result, bail};
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 
+use super::{AgentErrorCode, coded_error};
 use super::{
     ArtifactMetadata, Capability, Job, JobOperation, LedgerEvent, Manifest, Policy, Provider,
-    Recipe, RecipeKind, RecipeTarget, Reference, append_json_line,
-    artifact_for as capture_artifact_for, captures_dir, file_size, lock_capture_ledger, now_secs,
-    provider_path, read_job, read_json, reference_for_artifact, sha256_file, unique_id, unlock_job,
-    write_json,
+    Recipe, RecipeKind, RecipeTarget, Reference, append_job_event, append_json_line,
+    artifact_for as capture_artifact_for, captures_dir, file_size, lock_capture_ledger, lock_job,
+    now_secs, provider_path, read_job, read_json, reference_for_artifact, sha256_file, unique_id,
+    unlock_job, write_job, write_json,
 };
 use crate::resource::CaptureBudget;
 
@@ -50,6 +51,18 @@ struct ProviderResponse {
     effective_parameters: Value,
 }
 
+struct StagedPublication<'a> {
+    job: &'a Job,
+    capture_id: &'a str,
+    recipe: &'a Recipe,
+    provider_name: &'a str,
+    parameters: &'a Value,
+    inputs: &'a [(Reference, ArtifactMetadata)],
+    capture_dir: &'a Path,
+    staging: &'a Path,
+    derive_id: &'a str,
+}
+
 pub(super) fn admit(
     capture_id: &str,
     recipe: RecipeKind,
@@ -59,24 +72,24 @@ pub(super) fn admit(
 ) -> Result<()> {
     super::validate_id(capture_id, "capture")?;
     if !policy.snapshot.allowed_recipes.contains(&recipe) {
-        bail!(
-            "Recipe `{}` is not allowed by Policy {}@{}",
-            recipe.as_str(),
-            policy.id,
-            policy.version
-        );
+        return Err(coded_error(
+            AgentErrorCode::RecipeNotAllowed,
+            format!(
+                "Recipe `{}` is not allowed by Policy {}@{}",
+                recipe.as_str(),
+                policy.id,
+                policy.version
+            ),
+        ));
     }
-    if !policy
-        .snapshot
-        .allowed_providers
-        .iter()
-        .any(|allowed| allowed == provider)
-    {
-        bail!(
-            "Provider `{provider}` is not allowed by Policy {}@{}",
-            policy.id,
-            policy.version
-        );
+    if !super::policy_allows(policy, provider) {
+        return Err(coded_error(
+            AgentErrorCode::ProviderNotAllowed,
+            format!(
+                "Provider `{provider}` is not allowed by Policy {}@{}",
+                policy.id, policy.version
+            ),
+        ));
     }
     if policy.snapshot.allows_remote_calls {
         bail!("local Derive Policy cannot allow remote calls");
@@ -85,7 +98,29 @@ pub(super) fn admit(
     resolve_inputs(capture_id, &manifest, target).map(drop)
 }
 
-pub(super) fn publish(job: &Job) -> Result<String> {
+pub(super) fn admit_retry(job_id: &str, capture_id: &str, recipe: RecipeKind) -> Result<()> {
+    let previous = read_job(job_id).context("reading retried Derive Job")?;
+    let JobOperation::Derive {
+        capture_id: previous_capture,
+        recipe: previous_recipe,
+        ..
+    } = previous.operation
+    else {
+        return Err(coded_error(
+            AgentErrorCode::InvalidRetry,
+            "retry target is not a Derive Job",
+        ));
+    };
+    if previous_capture != capture_id || previous_recipe.kind != recipe {
+        return Err(coded_error(
+            AgentErrorCode::InvalidRetry,
+            "retry target does not match the Derive request",
+        ));
+    }
+    Ok(())
+}
+
+pub(super) fn publish(job: &Job) -> Result<()> {
     let JobOperation::Derive {
         capture_id,
         recipe,
@@ -109,42 +144,42 @@ pub(super) fn publish(job: &Job) -> Result<String> {
     let staging = derivatives_dir.join(format!(".{derive_id}"));
     fs::create_dir(&staging)
         .with_context(|| format!("creating Derivative staging {}", staging.display()))?;
-    let result = publish_staged(
+    let result = publish_staged(&StagedPublication {
         job,
         capture_id,
         recipe,
-        provider,
+        provider_name: provider,
         parameters,
-        &inputs,
-        &capture_dir,
-        &staging,
-        &derive_id,
-    );
-    if result.is_err() {
+        inputs: &inputs,
+        capture_dir: &capture_dir,
+        staging: &staging,
+        derive_id: &derive_id,
+    });
+    if result.is_err() || result.as_ref().is_ok_and(|published| !published) {
         drop(fs::remove_dir_all(&staging));
     }
-    result
+    result.map(drop)
 }
 
-#[allow(clippy::too_many_arguments)]
-fn publish_staged(
-    job: &Job,
-    capture_id: &str,
-    recipe: &Recipe,
-    provider_name: &str,
-    parameters: &Value,
-    inputs: &[(Reference, ArtifactMetadata)],
-    capture_dir: &Path,
-    staging: &Path,
-    derive_id: &str,
-) -> Result<String> {
+fn publish_staged(publication: &StagedPublication<'_>) -> Result<bool> {
+    let StagedPublication {
+        job,
+        capture_id: _,
+        recipe,
+        provider_name,
+        parameters,
+        inputs,
+        capture_dir,
+        staging,
+        derive_id: _,
+    } = publication;
     let provider_binary = provider_path(provider_name)?;
     let request_path = staging.join("request.json");
     let output_path = staging.join("content");
     let request = ProviderRequest {
         version: 1,
-        recipe: recipe.clone(),
-        parameters: parameters.clone(),
+        recipe: (*recipe).clone(),
+        parameters: (*parameters).clone(),
         inputs: inputs
             .iter()
             .map(|(reference, artifact)| {
@@ -165,6 +200,7 @@ fn publish_staged(
         &output_path,
         staging,
     )?;
+    validate_parameters(&response.effective_parameters)?;
     if !fs::symlink_metadata(&output_path)
         .context("reading Derive output metadata")?
         .file_type()
@@ -172,71 +208,107 @@ fn publish_staged(
     {
         bail!("Derive Provider did not produce its output artifact");
     }
-    let relative_path = format!("derivatives/{derive_id}/content");
+    let derivative = build_derivative(publication, response, &provider_binary, &output_path)?;
+    write_json(&staging.join("manifest.json"), &derivative)?;
+    fs::remove_file(&request_path).context("removing transient Derive request")?;
+    commit_derivative(publication, &derivative)
+}
+
+fn build_derivative(
+    publication: &StagedPublication<'_>,
+    response: ProviderResponse,
+    provider_binary: &Path,
+    output_path: &Path,
+) -> Result<Derivative> {
     let created_at = now_secs();
     let provider = Provider {
-        name: provider_name.to_string(),
-        version: format!("sha256:{}", sha256_file(&provider_binary)?),
+        name: publication.provider_name.to_string(),
+        version: format!("sha256:{}", sha256_file(provider_binary)?),
         parameters: response.effective_parameters,
         dependencies: Vec::new(),
     };
     let artifact = ArtifactMetadata {
-        artifact_id: format!("{derive_id}-content"),
-        path: relative_path,
+        artifact_id: format!("{}-content", publication.derive_id),
+        path: format!("derivatives/{}/content", publication.derive_id),
         mime: response.mime,
-        sha256: sha256_file(&output_path)?,
-        size_bytes: file_size(&output_path)?,
+        sha256: sha256_file(output_path)?,
+        size_bytes: file_size(output_path)?,
         locator: None,
         created_at,
         provider: Some(provider.clone()),
         proof_artifact_id: None,
     };
-    let reference = reference_for_artifact(capture_id, &artifact);
-    let derivative = Derivative {
-        derive_id: derive_id.to_string(),
-        capture_id: capture_id.to_string(),
-        job_id: job.id.clone(),
-        recipe: recipe.clone(),
+    let reference = reference_for_artifact(publication.capture_id, &artifact);
+    Ok(Derivative {
+        derive_id: publication.derive_id.to_string(),
+        capture_id: publication.capture_id.to_string(),
+        job_id: publication.job.id.clone(),
+        recipe: publication.recipe.clone(),
         provider: provider.clone(),
-        inputs: inputs
+        inputs: publication
+            .inputs
             .iter()
             .map(|(reference, _)| reference.clone())
             .collect(),
         artifact,
-        reference: reference.clone(),
+        reference,
         capability: Capability {
-            name: recipe.kind.as_str().to_string(),
+            name: publication.recipe.kind.as_str().to_string(),
             state: "succeeded".to_string(),
             provider,
             error: None,
         },
         created_at,
-    };
-    write_json(&staging.join("manifest.json"), &derivative)?;
-    fs::remove_file(&request_path).context("removing transient Derive request")?;
-    let final_dir = capture_dir.join("derivatives").join(derive_id);
-    fs::rename(staging, &final_dir)
-        .with_context(|| format!("publishing Derivative {derive_id}"))?;
-    let ledger_lock = lock_capture_ledger(capture_id)?;
+    })
+}
+
+fn commit_derivative(publication: &StagedPublication<'_>, derivative: &Derivative) -> Result<bool> {
+    let job_lock = lock_job(&publication.job.id)?;
+    let mut current_job = read_job(&publication.job.id)?;
+    if current_job.state == "cancelled" {
+        unlock_job(&job_lock)?;
+        return Ok(false);
+    }
+    let ledger_lock = lock_capture_ledger(publication.capture_id)?;
+    let final_dir = publication
+        .capture_dir
+        .join("derivatives")
+        .join(publication.derive_id);
+    fs::rename(publication.staging, &final_dir)
+        .with_context(|| format!("publishing Derivative {}", publication.derive_id))?;
     let append = append_json_line(
-        &capture_dir.join("ledger.jsonl"),
+        &publication.capture_dir.join("ledger.jsonl"),
         &LedgerEvent {
             event: "derivative_published".to_string(),
-            at: created_at,
-            job_id: job.id.clone(),
+            at: derivative.created_at,
+            job_id: publication.job.id.clone(),
             details: Some(json!({
-                "derive_id": derive_id,
-                "recipe": recipe,
+                "derive_id": publication.derive_id,
+                "recipe": publication.recipe,
                 "provider": derivative.provider,
                 "inputs": derivative.inputs,
-                "reference": reference,
+                "reference": derivative.reference,
             })),
         },
     );
-    let unlock = unlock_job(&ledger_lock);
-    append?;
-    unlock?;
-    Ok(derive_id.to_string())
+    if let Err(error) = append {
+        fs::rename(&final_dir, publication.staging)
+            .context("rolling back Derivative publication")?;
+        unlock_job(&ledger_lock)?;
+        unlock_job(&job_lock)?;
+        return Err(error);
+    }
+    current_job.state = "succeeded".to_string();
+    current_job.updated_at = now_secs();
+    current_job.derive_id = Some(publication.derive_id.to_string());
+    current_job.worker_pid = None;
+    write_job(&current_job)?;
+    append_job_event(&publication.job.id, "succeeded")?;
+    let unlock_ledger = unlock_job(&ledger_lock);
+    let unlock_job_result = unlock_job(&job_lock);
+    unlock_ledger?;
+    unlock_job_result?;
+    Ok(true)
 }
 
 fn invoke_provider(
@@ -273,9 +345,68 @@ fn invoke_provider(
     serde_json::from_slice(&process.stdout).context("reading Derive Provider response")
 }
 
+pub(super) fn validate_parameters(parameters: &Value) -> Result<()> {
+    if !parameters.is_object() {
+        return Err(coded_error(
+            AgentErrorCode::SensitiveParameters,
+            "Derive parameters must be a JSON object without secrets",
+        ));
+    }
+    reject_sensitive_keys(parameters)
+}
+
+fn reject_sensitive_keys(value: &Value) -> Result<()> {
+    match value {
+        Value::Object(fields) => {
+            for (name, nested) in fields {
+                let normalized = name
+                    .chars()
+                    .filter(char::is_ascii_alphanumeric)
+                    .flat_map(char::to_lowercase)
+                    .collect::<String>();
+                let sensitive = matches!(
+                    normalized.as_str(),
+                    "apikey"
+                        | "apitoken"
+                        | "authorization"
+                        | "cookie"
+                        | "credential"
+                        | "credentials"
+                        | "password"
+                        | "privatekey"
+                        | "secret"
+                        | "secretkey"
+                        | "clientsecret"
+                        | "token"
+                        | "accesstoken"
+                        | "refreshtoken"
+                ) || normalized.ends_with("token")
+                    || normalized.ends_with("secret")
+                    || normalized.ends_with("password")
+                    || normalized.ends_with("credential")
+                    || normalized.ends_with("cookie")
+                    || normalized.ends_with("privatekey");
+                if sensitive {
+                    return Err(coded_error(
+                        AgentErrorCode::SensitiveParameters,
+                        format!("Derive parameters contain sensitive field `{name}`"),
+                    ));
+                }
+                reject_sensitive_keys(nested)?;
+            }
+            Ok(())
+        }
+        Value::Array(values) => values.iter().try_for_each(reject_sensitive_keys),
+        _ => Ok(()),
+    }
+}
+
 pub(super) fn list(capture_id: &str) -> Result<Vec<Derivative>> {
     let directory = captures_dir()?.join(capture_id).join("derivatives");
-    if !directory.exists() {
+    if !directory
+        .try_exists()
+        .with_context(|| format!("checking Derivative directory {}", directory.display()))?
+    {
         return Ok(Vec::new());
     }
     let mut derivatives = Vec::new();
