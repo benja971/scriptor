@@ -72,17 +72,19 @@ where
     loop {
         if is_cancelled()? {
             terminate_process_group(&child)?;
-            let _ = child.wait();
+            child.wait().context("reaping cancelled binary acquirer")?;
             bail!("binary acquisition cancelled");
         }
         if SystemTime::now() >= deadline {
             terminate_process_group(&child)?;
-            let _ = child.wait();
+            child.wait().context("reaping timed out binary acquirer")?;
             bail!("Capture exceeds safe-web@1 duration budget");
         }
         if directory_size(staging)? > disk_byte_limit {
             terminate_process_group(&child)?;
-            let _ = child.wait();
+            child
+                .wait()
+                .context("reaping disk-limited binary acquirer")?;
             bail!("Capture exceeds safe-web@1 disk budget");
         }
         if child

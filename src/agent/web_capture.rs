@@ -7,8 +7,8 @@ use serde_json::json;
 
 use super::{
     Acquisition, AcquisitionResult, Discovery, Extraction, Job, Locator, Manifest, PreparedCapture,
-    Proof, Provider, Reference, RenderedDiscovery, SourceIdentity, discovery_id, now_secs,
-    read_job, read_json, sha256_bytes, sha256_file,
+    Proof, Provider, Reference, RemoteProvenance, RenderedDiscovery, SourceIdentity, discovery_id,
+    now_secs, read_job, read_json, sha256_bytes, sha256_file,
 };
 
 pub(super) struct WebAcquisition<'a> {
@@ -66,12 +66,14 @@ impl Acquisition for WebAcquisition<'_> {
             "proofs/dom.html",
             "text/html",
         )?;
+        let proof_hash = proof.sha256.clone();
+        let proof_size = proof.size_bytes;
         let extraction = markdown_extraction(capture.staging(), &proof, &provenance.final_url)?;
         let discoveries = discoveries(capture.staging(), capture.capture_id(), &proof)?;
         let manifest = Manifest {
             capture_id: capture.capture_id().to_string(),
             source: SourceIdentity {
-                locator: provenance.final_url,
+                locator: provenance.final_url.clone(),
                 sha256: source_hash.to_string(),
             },
             policy: self.job.policy.clone(),
@@ -81,7 +83,14 @@ impl Acquisition for WebAcquisition<'_> {
             capabilities: Vec::new(),
             artifacts,
             discoveries,
-            remote_provenance: None,
+            remote_provenance: Some(RemoteProvenance {
+                requested_url: self.url.to_string(),
+                final_url: provenance.final_url.clone(),
+                mime: "text/html".to_string(),
+                sha256: proof_hash,
+                size_bytes: proof_size,
+                redirect_chain: vec![self.url.to_string(), provenance.final_url],
+            }),
         };
         Ok(AcquisitionResult::Ready(PreparedCapture::new(
             manifest, false,

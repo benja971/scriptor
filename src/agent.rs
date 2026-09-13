@@ -680,7 +680,10 @@ fn run_worker(job_id: &str) -> Result<()> {
         parent_capture_id, ..
     } = &job.operation
     {
-        return resolve_discoveries(&job, parent_capture_id);
+        return match resolve_discoveries(&job, parent_capture_id) {
+            Ok(()) => Ok(()),
+            Err(error) => fail_job(job_id, &error),
+        };
     }
 
     match publish_capture(&job) {
@@ -801,7 +804,9 @@ fn resolve_discoveries(job: &Job, parent_capture_id: &str) -> Result<()> {
                         } else {
                             "captured"
                         },
-                        Some(json!({"capture_id": capture_id, "final_url": discovery.source})),
+                        Some(
+                            json!({"capture_id": capture_id, "reference": reference_for_capture(&capture_id)?, "final_url": discovery.source}),
+                        ),
                     )?;
                     child_capture_ids.push(capture_id);
                     persist_resolution_progress(
@@ -863,7 +868,7 @@ fn resolve_discoveries(job: &Job, parent_capture_id: &str) -> Result<()> {
                             json!({"requested_url": discovery.source, "final_url": acquired.final_url, "redirect_chain": acquired.redirect_chain}),
                         ),
                     )?;
-                    let _ = fs::remove_dir_all(staging.join("binary-acquisition"));
+                    cleanup_binary_staging(&staging)?;
                     partial = true;
                     persist_resolution_progress(&job.id, &mut checkpoint, &discovery, None)?;
                     continue;
@@ -878,7 +883,7 @@ fn resolve_discoveries(job: &Job, parent_capture_id: &str) -> Result<()> {
                         },
                         &mut checkpoint.queue,
                     )?;
-                    let _ = fs::remove_dir_all(staging.join("binary-acquisition"));
+                    cleanup_binary_staging(&staging)?;
                     match publication {
                         Publication::Published {
                             capture_id,
@@ -897,7 +902,7 @@ fn resolve_discoveries(job: &Job, parent_capture_id: &str) -> Result<()> {
                                     "captured"
                                 },
                                 Some(
-                                    json!({"capture_id": capture_id, "requested_url": discovery.source, "final_url": acquired.final_url, "mime": acquired.mime, "sha256": acquired.sha256, "size_bytes": acquired.size_bytes, "redirect_chain": acquired.redirect_chain}),
+                                    json!({"capture_id": capture_id, "reference": reference_for_capture(&capture_id)?, "requested_url": discovery.source, "final_url": acquired.final_url, "mime": acquired.mime, "sha256": acquired.sha256, "size_bytes": acquired.size_bytes, "redirect_chain": acquired.redirect_chain}),
                                 ),
                             )?;
                             child_capture_ids.push(capture_id);
@@ -915,7 +920,7 @@ fn resolve_discoveries(job: &Job, parent_capture_id: &str) -> Result<()> {
                     write_checkpoint(&job.id, &checkpoint)?;
                     continue;
                 }
-                let Some(extension) = binary_extension(&acquired.path, &acquired.mime) else {
+                let Some(extension) = binary_extension(&acquired.path, &acquired.mime)? else {
                     append_discovery_event(
                         parent_capture_id,
                         &job.id,
@@ -967,7 +972,7 @@ fn resolve_discoveries(job: &Job, parent_capture_id: &str) -> Result<()> {
                                 "captured"
                             },
                             Some(
-                                json!({"capture_id": capture_id, "requested_url": discovery.source, "final_url": acquired.final_url, "mime": acquired.mime, "sha256": acquired.sha256, "size_bytes": acquired.size_bytes, "redirect_chain": acquired.redirect_chain}),
+                                json!({"capture_id": capture_id, "reference": reference_for_capture(&capture_id)?, "requested_url": discovery.source, "final_url": acquired.final_url, "mime": acquired.mime, "sha256": acquired.sha256, "size_bytes": acquired.size_bytes, "redirect_chain": acquired.redirect_chain}),
                             ),
                         )?;
                         child_capture_ids.push(capture_id);
@@ -981,7 +986,7 @@ fn resolve_discoveries(job: &Job, parent_capture_id: &str) -> Result<()> {
                     }
                     Publication::Cancelled => return Ok(()),
                 }
-                let _ = fs::remove_dir_all(staging.join("binary-acquisition"));
+                cleanup_binary_staging(&staging)?;
                 write_checkpoint(&job.id, &checkpoint)?;
             }
             Err(error) => {
@@ -1047,18 +1052,29 @@ fn normalized_mime(mime: &str) -> String {
         .to_ascii_lowercase()
 }
 
+fn cleanup_binary_staging(staging: &Path) -> Result<()> {
+    let path = staging.join("binary-acquisition");
+    fs::remove_dir_all(&path).with_context(|| format!("cleaning binary staging {}", path.display()))
+}
+
 fn normalized_web_url(value: &str) -> Result<String> {
     let mut url = Url::parse(value).with_context(|| format!("parsing Web URL `{value}`"))?;
     url.set_fragment(None);
     Ok(url.to_string())
 }
 
-fn binary_extension(path: &Path, mime: &str) -> Option<&'static str> {
+fn reference_for_capture(capture_id: &str) -> Result<Reference> {
+    let manifest: Manifest = read_json(&captures_dir()?.join(capture_id).join("manifest.json"))?;
+    Ok(reference_for(&manifest))
+}
+
+fn binary_extension(path: &Path, mime: &str) -> Result<Option<&'static str>> {
     let declared = normalized_mime(mime);
-    let mut file = File::open(path).ok()?;
-    let mut bytes = [0_u8; 12];
-    let size = file.read(&mut bytes).ok()?;
-    let bytes = bytes.get(..size)?;
+    let mut file = File::open(path)
+        .with_context(|| format!("opening binary MIME probe {}", path.display()))?;
+    let mut bytes = [0_u8; 16];
+    let size = file.read(&mut bytes).context("reading binary MIME probe")?;
+    let bytes = bytes.get(..size).context("slicing binary MIME probe")?;
     let magic = if bytes.starts_with(b"%PDF-") {
         Some("application/pdf")
     } else if bytes.starts_with(b"\x89PNG\r\n\x1a\n") {
@@ -1069,13 +1085,27 @@ fn binary_extension(path: &Path, mime: &str) -> Option<&'static str> {
         Some("image/gif")
     } else if bytes.get(..4) == Some(b"RIFF") && bytes.get(8..12) == Some(b"WEBP") {
         Some("image/webp")
+    } else if bytes.get(..4) == Some(b"II*\0") || bytes.get(..4) == Some(b"MM\0*") {
+        Some("image/tiff")
+    } else if bytes.get(..3) == Some(b"ID3")
+        || bytes.first().is_some_and(|byte| byte & 0xe0 == 0xe0)
+    {
+        Some("audio/mpeg")
+    } else if bytes.get(..4) == Some(b"RIFF") && bytes.get(8..12) == Some(b"WAVE") {
+        Some("audio/wav")
+    } else if bytes.get(..4) == Some(b"OggS") {
+        Some("audio/ogg")
+    } else if bytes.get(4..8) == Some(b"ftyp") {
+        Some("video/mp4")
+    } else if bytes.get(..4) == Some(&[0x1a, 0x45, 0xdf, 0xa3]) {
+        Some("video/webm")
     } else {
         None
     };
-    if magic.is_some_and(|observed| observed != declared) {
-        return None;
+    if magic != Some(declared.as_str()) {
+        return Ok(None);
     }
-    match declared.as_str() {
+    Ok(match declared.as_str() {
         "application/pdf" => Some("pdf"),
         "image/png" => Some("png"),
         "image/jpeg" => Some("jpg"),
@@ -1089,7 +1119,7 @@ fn binary_extension(path: &Path, mime: &str) -> Option<&'static str> {
         "video/mp4" => Some("mp4"),
         "video/webm" => Some("webm"),
         _ => None,
-    }
+    })
 }
 
 impl JobOperation {
@@ -3330,8 +3360,11 @@ mod continuation_tests {
     fn rejects_a_declared_mime_that_conflicts_with_magic_bytes() {
         let path = std::env::temp_dir().join(format!("scriptor-mime-lie-{}", unique_id()));
         assert!(fs::write(&path, b"%PDF-1.4").is_ok());
-        assert_eq!(binary_extension(&path, "image/png"), None);
-        assert_eq!(binary_extension(&path, "application/pdf"), Some("pdf"));
+        assert_eq!(binary_extension(&path, "image/png").ok(), Some(None));
+        assert_eq!(
+            binary_extension(&path, "application/pdf").ok(),
+            Some(Some("pdf"))
+        );
         let _ = fs::remove_file(path);
     }
 }
