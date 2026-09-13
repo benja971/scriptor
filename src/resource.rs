@@ -12,6 +12,8 @@ use nix::sys::signal::{Signal, killpg};
 use nix::unistd::Pid;
 
 const POLL_INTERVAL: Duration = Duration::from_millis(10);
+const MAX_DIAGNOSTIC_BYTES: usize = 1024 * 1024;
+const MAX_DIAGNOSTIC_BYTES_U64: u64 = 1024 * 1024;
 
 /// Budget partagé par les Providers d'une Capture. Chaque process est isolé
 /// dans son groupe afin que son arrêt emporte les éventuels enfants qu'il a
@@ -98,9 +100,15 @@ fn terminate_process_group(child: &mut Child) -> Result<ExitStatus> {
     child.wait().context("reaping budget-exhausted Provider")
 }
 
-fn read_pipe(mut pipe: impl Read) -> std::io::Result<Vec<u8>> {
+fn read_pipe(pipe: impl Read) -> std::io::Result<Vec<u8>> {
     let mut bytes = Vec::new();
-    pipe.read_to_end(&mut bytes)?;
+    pipe.take(MAX_DIAGNOSTIC_BYTES_U64 + 1)
+        .read_to_end(&mut bytes)?;
+    if bytes.len() > MAX_DIAGNOSTIC_BYTES {
+        return Err(std::io::Error::other(
+            "Provider diagnostic output exceeds memory limit",
+        ));
+    }
     Ok(bytes)
 }
 

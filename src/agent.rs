@@ -1738,13 +1738,15 @@ fn proof_for(staging: &Path, artifact_id: &str, path: &str, mime: &str) -> Resul
 }
 
 fn start_job(job_id: &str) -> Result<Option<Job>> {
+    let repository_lock = lock_jobs()?;
     let lock = lock_job(job_id)?;
     let mut job = read_job(job_id)?;
     if job.state == "cancelled" {
         unlock_job(&lock)?;
+        unlock_jobs(&repository_lock)?;
         return Ok(None);
     }
-    if active_jobs()? > usize::from(job.policy.snapshot.limits.concurrency_limit) {
+    if running_jobs()? >= usize::from(job.policy.snapshot.limits.concurrency_limit) {
         job.state = "failed".to_string();
         job.updated_at = now_secs();
         job.error = Some(StructuredError {
@@ -1757,6 +1759,7 @@ fn start_job(job_id: &str) -> Result<Option<Job>> {
         write_job(&job)?;
         append_job_event(job_id, "failed")?;
         unlock_job(&lock)?;
+        unlock_jobs(&repository_lock)?;
         return Ok(None);
     }
     job.state = "running".to_string();
@@ -1765,6 +1768,7 @@ fn start_job(job_id: &str) -> Result<Option<Job>> {
     write_job(&job)?;
     append_job_event(job_id, "running")?;
     unlock_job(&lock)?;
+    unlock_jobs(&repository_lock)?;
     Ok(Some(job))
 }
 
@@ -2516,7 +2520,19 @@ fn validate_id(id: &str, prefix: &str) -> Result<()> {
     Ok(())
 }
 
-fn active_jobs() -> Result<usize> {
+fn lock_jobs() -> Result<File> {
+    let path = jobs_dir()?.join("admission.lock");
+    let file = OpenOptions::new()
+        .create(true)
+        .truncate(false)
+        .write(true)
+        .open(&path)
+        .with_context(|| format!("opening Job admission lock {}", path.display()))?;
+    file.lock_exclusive().context("locking Job admission")?;
+    Ok(file)
+}
+
+fn running_jobs() -> Result<usize> {
     let mut active: usize = 0;
     for entry in fs::read_dir(jobs_dir()?).context("listing Jobs")? {
         let entry = entry.context("reading Job directory entry")?;
@@ -2528,7 +2544,7 @@ fn active_jobs() -> Result<usize> {
             continue;
         }
         let job: Job = read_json(&entry.path())?;
-        if matches!(job.state.as_str(), "queued" | "running") {
+        if job.state == "running" {
             active = active.checked_add(1).context("counting active Jobs")?;
         }
     }
@@ -2537,6 +2553,10 @@ fn active_jobs() -> Result<usize> {
 
 fn unlock_job(file: &File) -> Result<()> {
     FileExt::unlock(file).context("unlocking Job")
+}
+
+fn unlock_jobs(file: &File) -> Result<()> {
+    FileExt::unlock(file).context("unlocking Job admission")
 }
 
 fn write_job(job: &Job) -> Result<()> {
