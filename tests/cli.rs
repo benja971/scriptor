@@ -1054,7 +1054,16 @@ fn capture_bounds_provider_diagnostics_in_memory() {
 fn capture_admission_enforces_concurrency_before_launching_a_provider() {
     let env = TestEnv::new("capture-concurrency");
     env.write_config(&env.work_dir.join("out"));
-    env.install_binary("ffmpeg", "#!/bin/sh\nsleep 2\n");
+    let started = env.work_dir.join("provider-started");
+    let release = env.work_dir.join("provider-release");
+    env.install_binary(
+        "ffmpeg",
+        &format!(
+            "#!/bin/sh\nset -eu\nprintf x > \"{}\"\nwhile [ ! -f \"{}\" ]; do :; done\n",
+            started.display(),
+            release.display()
+        ),
+    );
     let first_source = env.write_media_file("first.mp4");
     let second_source = env.write_media_file("second.mp4");
     let first_path = write_capture_worker_job(&env, "job-61", &first_source, &["ffmpeg"], 30);
@@ -1083,15 +1092,17 @@ fn capture_admission_enforces_concurrency_before_launching_a_provider() {
         "running",
         Duration::from_secs(1)
     ));
+    assert!(wait_for_file(&started, Duration::from_secs(1)));
     env.command()
         .args(["capture-worker", "--job-id", "job-62"])
         .assert()
         .success();
+    fs::write(&release, b"release").expect("libération du faux Provider");
+    first_worker.wait().expect("attente du premier Worker");
     let second: Value = serde_json::from_slice(&fs::read(&second_path).expect("lecture du Job"))
         .expect("Job JSON valide");
     assert_eq!(second["state"], "failed");
     assert_eq!(second["error"]["code"], "concurrency_limit_exceeded");
-    first_worker.wait().expect("attente du premier Worker");
 }
 
 #[test]
