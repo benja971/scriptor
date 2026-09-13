@@ -2439,18 +2439,23 @@ fn policy_for(name: &str) -> Result<Policy> {
         duration_limit_secs: 30 * 60,
         concurrency_limit: 2,
     };
-    let snapshot = PolicySnapshot {
-        duplicate_mode: "reuse".to_string(),
-        limits,
-        allows_remote_calls: name == "safe-web@1",
-        allowed_providers: vec![
+    let allowed_providers = if name == POLICY_NAME {
+        vec![
             "ffmpeg".to_string(),
             "ffprobe".to_string(),
             "whisper-cli".to_string(),
             "pdftotext".to_string(),
             "pdfinfo".to_string(),
             "tesseract".to_string(),
-        ],
+        ]
+    } else {
+        Vec::new()
+    };
+    let snapshot = PolicySnapshot {
+        duplicate_mode: "reuse".to_string(),
+        limits,
+        allows_remote_calls: name == "safe-web@1",
+        allowed_providers,
     };
     let canonical_snapshot =
         serde_json::to_value(&snapshot).context("normalizing Policy snapshot")?;
