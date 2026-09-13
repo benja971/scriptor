@@ -315,6 +315,23 @@ fn wait_for_file(path: &Path, timeout: Duration) -> bool {
     has_content(path)
 }
 
+fn wait_for_job_state(path: &Path, state: &str, timeout: Duration) -> bool {
+    let deadline = Instant::now()
+        .checked_add(timeout)
+        .unwrap_or_else(Instant::now);
+    while Instant::now() < deadline {
+        if fs::read(path)
+            .ok()
+            .and_then(|content| serde_json::from_slice::<Value>(&content).ok())
+            .is_some_and(|job| job["state"] == state)
+        {
+            return true;
+        }
+        std::thread::sleep(Duration::from_millis(10));
+    }
+    false
+}
+
 fn assert_readable_transcription(env: &TestEnv, capture_id: &str, capture: &Value) {
     let transcription = capture["manifest"]["extractions"]
         .as_array()
@@ -861,6 +878,72 @@ fn capture_rejects_a_proof_that_leaves_no_disk_budget_for_its_metadata() {
             .as_str()
             .is_some_and(|message| message.contains("disk budget"))
     );
+}
+
+#[test]
+fn capture_bounds_provider_diagnostics_in_memory() {
+    let env = TestEnv::new("capture-provider-diagnostics");
+    env.install_binary(
+        "pdfinfo",
+        "#!/bin/sh\ni=0\nwhile [ \"$i\" -lt 16385 ]; do\n  printf 'xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx'\n  i=$((i + 1))\ndone\n",
+    );
+    env.install_binary("pdftotext", FAKE_PDFTOTEXT);
+    let source = env.work_dir.join("verbose.pdf");
+    fs::write(&source, b"original pdf bytes").expect("écriture du PDF");
+    let path = write_capture_worker_job(&env, "job-63", &source, &["pdfinfo", "pdftotext"], 30);
+
+    env.command()
+        .args(["capture-worker", "--job-id", "job-63"])
+        .assert()
+        .success();
+    let job: Value =
+        serde_json::from_slice(&fs::read(path).expect("lecture du Job")).expect("Job JSON valide");
+    assert_eq!(job["state"], "partial");
+    assert!(job["capture_id"].is_string());
+}
+
+#[test]
+fn capture_admission_enforces_concurrency_before_launching_a_provider() {
+    let env = TestEnv::new("capture-concurrency");
+    env.write_config(&env.work_dir.join("out"));
+    env.install_binary("ffmpeg", "#!/bin/sh\nsleep 2\n");
+    let first_source = env.write_media_file("first.mp4");
+    let second_source = env.write_media_file("second.mp4");
+    let first_path = write_capture_worker_job(&env, "job-61", &first_source, &["ffmpeg"], 30);
+    let second_path = write_capture_worker_job(&env, "job-62", &second_source, &["ffmpeg"], 30);
+    for path in [&first_path, &second_path] {
+        let mut job: Value = serde_json::from_slice(&fs::read(path).expect("lecture du Job"))
+            .expect("Job JSON valide");
+        job["policy"]["snapshot"]["limits"]["max_concurrency"] = Value::from(1);
+        fs::write(
+            path,
+            serde_json::to_vec(&job).expect("sérialisation du Job"),
+        )
+        .expect("écriture du Job");
+    }
+
+    let mut first_worker = std::process::Command::new(env!("CARGO_BIN_EXE_scriptor"))
+        .env("PATH", &env.bin_dir)
+        .env("XDG_CONFIG_HOME", &env.xdg_config)
+        .env("XDG_CACHE_HOME", &env.xdg_cache)
+        .env("XDG_DATA_HOME", &env.xdg_data)
+        .args(["capture-worker", "--job-id", "job-61"])
+        .spawn()
+        .expect("lancement du premier Worker");
+    assert!(wait_for_job_state(
+        &first_path,
+        "running",
+        Duration::from_secs(1)
+    ));
+    env.command()
+        .args(["capture-worker", "--job-id", "job-62"])
+        .assert()
+        .success();
+    let second: Value = serde_json::from_slice(&fs::read(&second_path).expect("lecture du Job"))
+        .expect("Job JSON valide");
+    assert_eq!(second["state"], "failed");
+    assert_eq!(second["error"]["code"], "concurrency_limit_exceeded");
+    first_worker.wait().expect("attente du premier Worker");
 }
 
 #[test]
