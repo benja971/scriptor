@@ -1664,6 +1664,8 @@ fn publish_web_capture(job: &Job) -> Result<Publication> {
         policy: job.policy.clone(),
         published_at: now_secs(),
         proof,
+        extractions: Vec::new(),
+        capabilities: Vec::new(),
         artifacts,
     };
     write_json(&staging.join("manifest.json"), &manifest)?;
@@ -1679,7 +1681,10 @@ fn publish_web_capture(job: &Job) -> Result<Publication> {
         bail!("Capture exceeds safe-web@1 disk budget");
     }
     fs::rename(&staging, &final_dir).with_context(|| format!("publishing Capture {capture_id}"))?;
-    Ok(Publication::Published(capture_id))
+    Ok(Publication::Published {
+        capture_id,
+        partial: false,
+    })
 }
 
 fn directory_size(path: &Path) -> Result<u64> {
@@ -1712,6 +1717,8 @@ fn proof_for(staging: &Path, artifact_id: &str, path: &str, mime: &str) -> Resul
         size_bytes: fs::metadata(&file)
             .with_context(|| format!("reading Proof metadata {}", file.display()))?
             .len(),
+        locator: Locator::File,
+        created_at: now_secs(),
     })
 }
 
@@ -1931,6 +1938,7 @@ fn search_captures(query: &str, cursor: Option<&str>, limit: usize) -> Result<()
             proof: capture.proof,
             extractions: Vec::new(),
             capabilities: Vec::new(),
+            artifacts: Vec::new(),
         })
         .collect();
     print_json(&capture_page(manifests, cursor, limit, &binding)?)
