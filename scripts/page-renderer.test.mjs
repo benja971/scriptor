@@ -3,7 +3,10 @@ import { createServer } from "node:http";
 import { request as httpRequest } from "node:http";
 
 const rendererModule = process.env.SCRIPTOR_PAGE_RENDERER_MODULE ?? "./page-renderer.mjs";
-const { createPinnedProxy, launchBrowser, launchOptions, protectContext } = await import(rendererModule);
+const { createPinnedProxy, launchBrowser, launchOptions, privateIp, protectContext } = await import(rendererModule);
+
+assert.equal(privateIp("100.64.0.1"), true);
+assert.equal(privateIp("198.18.0.1"), true);
 
 const proxyServer = createServer((_request, response) => response.writeHead(502).end());
 await new Promise((resolve) => proxyServer.listen(0, "127.0.0.1", resolve));

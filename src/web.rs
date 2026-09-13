@@ -174,6 +174,7 @@ pub fn validate_public_url(value: &str) -> Result<()> {
 fn is_private_ip(ip: IpAddr) -> bool {
     match ip {
         IpAddr::V4(ip) => {
+            let octets = ip.octets();
             ip.is_private()
                 || ip.is_loopback()
                 || ip.is_link_local()
@@ -181,6 +182,8 @@ fn is_private_ip(ip: IpAddr) -> bool {
                 || ip.is_unspecified()
                 || ip.is_documentation()
                 || ip.is_multicast()
+                || (octets[0] == 100 && (64..=127).contains(&octets[1]))
+                || (octets[0] == 198 && matches!(octets[1], 18 | 19))
                 || ip == Ipv4Addr::UNSPECIFIED
         }
         IpAddr::V6(ip) => {
@@ -215,6 +218,8 @@ mod tests {
             "http://[::ffff:169.254.169.254]/latest/meta-data/",
             "http://[::ffff:172.16.0.1]/",
             "http://169.254.169.254/latest/meta-data/",
+            "http://100.64.0.1/",
+            "http://198.18.0.1/",
             "http://user:secret@example.com/",
         ] {
             assert!(validate_public_url(url).is_err(), "{url} must be refused");
