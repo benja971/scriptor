@@ -11,16 +11,23 @@
 //! tests ne font pas de `.wait()` sur le process ; ils "pollent" (avec
 //! timeout court) l'apparition du fichier de Sortie ou de log.
 
-#![allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
+#![allow(
+    clippy::expect_used,
+    clippy::indexing_slicing,
+    clippy::panic,
+    clippy::unwrap_used
+)]
 
 use std::fs;
 use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::time::{Duration, Instant};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use assert_cmd::Command;
 use predicates::prelude::*;
+use serde_json::Value;
+use sha2::{Digest, Sha256};
 
 static COUNTER: AtomicU64 = AtomicU64::new(0);
 
@@ -110,6 +117,36 @@ echo "boom: fake whisper-cli failure" >&2
 exit 1
 "#;
 
+const FAKE_PDFINFO: &str = "#!/bin/sh\necho 'Pages: 2'\n";
+
+const FAKE_PDFTOTEXT: &str = r#"#!/bin/sh
+set -eu
+printf 'Premiere page\nDeuxieme page\n' > "$3"
+"#;
+
+const FAKE_TESSERACT: &str = r"#!/bin/sh
+printf 'level\tpage_num\tblock_num\tpar_num\tline_num\tword_num\tleft\ttop\twidth\theight\tconf\ttext\n'
+printf '5\t1\t1\t1\t1\t1\t12\t24\t36\t48\t95\tBonjour\n'
+";
+
+const FAKE_TESSERACT_FAILURE: &str = "#!/bin/sh\necho 'ocr indisponible' >&2\nexit 1\n";
+
+const FAKE_PAGE_RENDERER: &str = r#"#!/bin/sh
+set -eu
+while [ "$#" -gt 0 ]; do
+  if [ "$1" = "--output-dir" ]; then out="$2"; break; fi
+  shift
+done
+printf '<main>preuve</main>' > "$out/proofs/dom.html"
+printf 'preuve' > "$out/proofs/screenshot.png"
+printf '# contenu\n' > "$out/extractions/page.md"
+printf '[{"url":"https://93.184.216.34/document.pdf","parent_locator":{"kind":"url","value":"https://93.184.216.34/"},"locator":{"kind":"css-selector","value":"html > body:nth-of-type(1) > a:nth-of-type(1)"},"order":0,"status":"inventoried","reason":"linked_document"}]' > "$out/discoveries.json"
+printf '{"final_url":"https://93.184.216.34/"}' > "$out/provenance.json"
+"#;
+
+const FAKE_PAGE_RENDERER_PRIVATE_TARGET: &str =
+    "#!/bin/sh\necho web_private_target_refused >&2\nexit 1\n";
+
 /// Faux `yt-dlp` reproduisant exactement les arguments passés par
 /// `download.rs` (`--paths`, `--output`, `--print-to-file after_move:filepath
 /// <marker>`) : écrit un faux fichier vidéo (non vide - `wait_for_file` exige
@@ -190,6 +227,10 @@ impl TestEnv {
             self.work_dir.join("models").display(),
         );
         fs::write(config_dir.join("config.toml"), config).expect("écriture du config.toml de test");
+        let models_dir = self.work_dir.join("models");
+        fs::create_dir_all(&models_dir).expect("création du répertoire des Modèles de test");
+        fs::write(models_dir.join("ggml-small.bin"), b"fake whisper model")
+            .expect("écriture du Modèle de test");
     }
 
     fn command(&self) -> Command {
@@ -200,6 +241,10 @@ impl TestEnv {
             .env("XDG_CACHE_HOME", &self.xdg_cache)
             .env("XDG_DATA_HOME", &self.xdg_data);
         command
+    }
+
+    fn install_binary(&self, name: &str, script: &str) {
+        write_executable(&self.bin_dir, name, script);
     }
 
     fn write_media_file(&self, name: &str) -> PathBuf {
@@ -219,6 +264,56 @@ impl Drop for TestEnv {
     }
 }
 
+fn write_capture_worker_job(
+    env: &TestEnv,
+    job_id: &str,
+    source: &Path,
+    allowed_providers: &[&str],
+    duration_secs: u64,
+) -> PathBuf {
+    let created_at = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .expect("horloge système après l'époque Unix")
+        .as_secs();
+    let jobs_dir = env.xdg_data.join("scriptor/v2/jobs");
+    fs::create_dir_all(&jobs_dir).expect("création du répertoire de Jobs");
+    let job = serde_json::json!({
+        "job_id": job_id,
+        "state": "queued",
+        "source": source,
+        "policy": {
+            "id": "safe-local",
+            "version": 1,
+            "sha256": "test-policy",
+            "snapshot": {
+                "duplicate_mode": "reuse",
+                "limits": {
+                    "max_depth": 2,
+                    "max_sources": 50,
+                    "max_download_bytes": 2_147_483_648_u64,
+                    "max_disk_bytes": 10_737_418_240_u64,
+                    "max_duration_secs": duration_secs,
+                    "max_concurrency": 2
+                },
+                "allows_remote_calls": false,
+                "allowed_providers": allowed_providers
+            }
+        },
+        "created_at": created_at,
+        "updated_at": created_at,
+        "worker_pid": null,
+        "capture_id": null,
+        "error": null
+    });
+    let path = jobs_dir.join(format!("{job_id}.json"));
+    fs::write(
+        &path,
+        serde_json::to_vec(&job).expect("sérialisation du Job de test"),
+    )
+    .expect("écriture du Job de test");
+    path
+}
+
 /// Attend que `path` existe avec un contenu non vide, avec un timeout court :
 /// le Worker étant détaché, le process initial rend la main avant que le
 /// fichier n'existe.
@@ -234,6 +329,54 @@ fn wait_for_file(path: &Path, timeout: Duration) -> bool {
         std::thread::sleep(Duration::from_millis(50));
     }
     has_content(path)
+}
+
+fn wait_for_job_state(path: &Path, state: &str, timeout: Duration) -> bool {
+    let deadline = Instant::now()
+        .checked_add(timeout)
+        .unwrap_or_else(Instant::now);
+    while Instant::now() < deadline {
+        if fs::read(path)
+            .ok()
+            .and_then(|content| serde_json::from_slice::<Value>(&content).ok())
+            .is_some_and(|job| job["state"] == state)
+        {
+            return true;
+        }
+        std::thread::sleep(Duration::from_millis(10));
+    }
+    false
+}
+
+fn assert_readable_transcription(env: &TestEnv, capture_id: &str, capture: &Value) {
+    let transcription = capture["manifest"]["extractions"]
+        .as_array()
+        .and_then(|extractions| {
+            extractions
+                .iter()
+                .find(|extraction| extraction["artifact_id"] == "extraction-transcription")
+        })
+        .expect("Extraction de transcription");
+    let reference = serde_json::json!({
+        "capture_id": capture_id,
+        "artifact_id": transcription["artifact_id"],
+        "sha256": transcription["sha256"],
+        "locator": transcription["locator"],
+    })
+    .to_string();
+    let read: Value = serde_json::from_slice(
+        &env.command()
+            .args(["capture", "read", "--reference", &reference])
+            .assert()
+            .success()
+            .get_output()
+            .stdout,
+    )
+    .expect("lecture JSON valide");
+    assert_eq!(read["artifact"]["artifact_id"], "extraction-transcription");
+    assert_eq!(read["artifact"]["provider"]["name"], "whisper-cli");
+    assert_eq!(read["reference"]["locator"], Value::Null);
+    assert_eq!(read["content"]["text"], "faux contenu transcrit\n");
 }
 
 #[test]
@@ -545,6 +688,930 @@ fn failure_notification_reports_source_and_log_which_contains_the_error() {
     assert!(
         !env.work_dir.join("interview").exists(),
         "aucun dossier de Sortie orphelin ne doit rester si le Pipeline échoue"
+    );
+}
+
+#[test]
+fn capture_returns_a_persistent_job_then_publishes_an_inspectable_capture() {
+    let env = TestEnv::new("capture-contract");
+    let source = env.write_media_file("notes.txt");
+
+    let output = env
+        .command()
+        .args([
+            "capture",
+            source.to_str().expect("chemin utf-8"),
+            "--policy",
+            "safe-local@1",
+        ])
+        .assert()
+        .success()
+        .get_output()
+        .stdout
+        .clone();
+    let created: Value = serde_json::from_slice(&output).expect("Job JSON valide");
+    let job_id = created["job"]["job_id"]
+        .as_str()
+        .expect("identifiant de Job")
+        .to_string();
+    assert_eq!(created["job"]["policy"]["id"], "safe-local");
+    assert_eq!(created["job"]["policy"]["version"], 1);
+    assert_eq!(
+        created["job"]["policy"]["snapshot"]["duplicate_mode"],
+        "reuse"
+    );
+    let policy_snapshot = serde_json::to_vec(&created["job"]["policy"]["snapshot"])
+        .expect("snapshot de Policy sérialisable");
+    assert_eq!(
+        created["job"]["policy"]["sha256"],
+        format!("{:x}", Sha256::digest(policy_snapshot))
+    );
+
+    let output = env
+        .command()
+        .args(["job", "wait", &job_id, "--timeout-secs", "5"])
+        .assert()
+        .success()
+        .get_output()
+        .stdout
+        .clone();
+    let finished: Value = serde_json::from_slice(&output).expect("Job JSON valide");
+    assert_eq!(finished["state"], "succeeded");
+    let capture_id = finished["capture_id"]
+        .as_str()
+        .expect("identifiant de Capture");
+
+    let output = env
+        .command()
+        .args(["capture", "inspect", capture_id])
+        .assert()
+        .success()
+        .get_output()
+        .stdout
+        .clone();
+    let capture: Value = serde_json::from_slice(&output).expect("Capture JSON valide");
+    assert_eq!(capture["manifest"]["capture_id"], capture_id);
+    assert_eq!(
+        capture["manifest"]["proof"]["sha256"]
+            .as_str()
+            .map(str::len),
+        Some(64)
+    );
+    assert_eq!(capture["ledger"][0]["event"], "capture_published");
+}
+
+#[test]
+fn capture_requires_an_explicit_policy_and_reuses_an_identical_source() {
+    let env = TestEnv::new("capture-policy-duplicate");
+    let source = env.write_media_file("notes.txt");
+
+    env.command()
+        .args(["capture", source.to_str().expect("chemin utf-8")])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("\"code\":\"policy_required\""))
+        .stderr(predicate::str::is_empty());
+
+    let create_job = |env: &TestEnv| -> String {
+        let output = env
+            .command()
+            .args([
+                "capture",
+                source.to_str().expect("chemin utf-8"),
+                "--policy",
+                "safe-local@1",
+            ])
+            .assert()
+            .success()
+            .get_output()
+            .stdout
+            .clone();
+        serde_json::from_slice::<Value>(&output).expect("Job JSON valide")["job"]["job_id"]
+            .as_str()
+            .expect("identifiant de Job")
+            .to_string()
+    };
+
+    let first_job = create_job(&env);
+    let first: Value = serde_json::from_slice(
+        &env.command()
+            .args(["job", "wait", &first_job, "--timeout-secs", "5"])
+            .assert()
+            .success()
+            .get_output()
+            .stdout,
+    )
+    .expect("Job JSON valide");
+    let second_job = create_job(&env);
+    let second: Value = serde_json::from_slice(
+        &env.command()
+            .args(["job", "wait", &second_job, "--timeout-secs", "5"])
+            .assert()
+            .success()
+            .get_output()
+            .stdout,
+    )
+    .expect("Job JSON valide");
+
+    assert_eq!(first["state"], "succeeded");
+    assert_eq!(second["state"], "succeeded");
+    assert_eq!(first["capture_id"], second["capture_id"]);
+}
+
+#[test]
+fn capture_budget_failure_is_reported_as_a_structured_job_error() {
+    let env = TestEnv::new("capture-budget");
+    let source = env.work_dir.join("too-large.bin");
+    fs::File::create(&source)
+        .expect("création de la Source")
+        .set_len(10 * 1024 * 1024 * 1024 + 1)
+        .expect("création d'une Source sparse hors budget");
+
+    let output = env
+        .command()
+        .args([
+            "capture",
+            source.to_str().expect("chemin utf-8"),
+            "--policy",
+            "safe-local@1",
+        ])
+        .assert()
+        .success()
+        .get_output()
+        .stdout
+        .clone();
+    let job_id =
+        serde_json::from_slice::<Value>(&output).expect("Job JSON valide")["job"]["job_id"]
+            .as_str()
+            .expect("identifiant de Job")
+            .to_string();
+
+    let finished: Value = serde_json::from_slice(
+        &env.command()
+            .args(["job", "wait", &job_id, "--timeout-secs", "5"])
+            .assert()
+            .success()
+            .get_output()
+            .stdout,
+    )
+    .expect("Job JSON valide");
+    assert_eq!(finished["state"], "failed");
+    assert_eq!(finished["error"]["code"], "capture_failed");
+    assert!(
+        finished["error"]["message"]
+            .as_str()
+            .is_some_and(|message| message.contains("disk budget"))
+    );
+    let captures = env.xdg_data.join("scriptor/v2/captures");
+    assert!(
+        !captures.exists()
+            || fs::read_dir(captures)
+                .expect("lecture des Captures")
+                .next()
+                .is_none(),
+        "un staging en échec ne doit pas rester sur disque"
+    );
+}
+
+#[test]
+fn capture_rejects_a_proof_that_leaves_no_disk_budget_for_its_metadata() {
+    let env = TestEnv::new("capture-metadata-budget");
+    let source = env.work_dir.join("source.bin");
+    fs::write(&source, b"x").expect("écriture de la Source");
+    let job_id = "job-2";
+    let job_path = write_capture_worker_job(&env, job_id, &source, &[], 30);
+    let mut job: Value = serde_json::from_slice(&fs::read(&job_path).expect("lecture du Job"))
+        .expect("Job JSON valide");
+    job["policy"]["snapshot"]["limits"]["max_disk_bytes"] = Value::from(1_u64);
+    fs::write(
+        &job_path,
+        serde_json::to_vec(&job).expect("sérialisation du Job modifié"),
+    )
+    .expect("écriture du Job modifié");
+
+    env.command()
+        .args(["capture-worker", "--job-id", job_id])
+        .assert()
+        .success();
+
+    let finished: Value =
+        serde_json::from_slice(&fs::read(job_path).expect("lecture du Job terminé"))
+            .expect("Job JSON valide");
+    assert_eq!(finished["state"], "failed");
+    assert!(
+        finished["error"]["message"]
+            .as_str()
+            .is_some_and(|message| message.contains("disk budget"))
+    );
+    assert!(
+        fs::read_dir(env.xdg_data.join("scriptor/v2/captures"))
+            .expect("lecture des Captures")
+            .next()
+            .is_none(),
+        "un staging en échec ne doit pas rester sur disque"
+    );
+}
+
+#[test]
+fn safe_web_publishes_a_portable_capture() {
+    let env = TestEnv::new("safe-web");
+    env.install_binary("scriptor-page-renderer", FAKE_PAGE_RENDERER);
+    let created: Value = serde_json::from_slice(
+        &env.command()
+            .args([
+                "capture",
+                "https://93.184.216.34/",
+                "--policy",
+                "safe-web@1",
+            ])
+            .assert()
+            .success()
+            .get_output()
+            .stdout,
+    )
+    .expect("Job JSON valide");
+    let job_id = created["job"]["job_id"]
+        .as_str()
+        .expect("identifiant de Job");
+    let job: Value = serde_json::from_slice(
+        &env.command()
+            .args(["job", "wait", job_id, "--timeout-secs", "5"])
+            .assert()
+            .success()
+            .get_output()
+            .stdout,
+    )
+    .expect("Job JSON valide");
+    assert_eq!(job["state"], "succeeded", "{job}");
+    let capture_id = job["capture_id"].as_str().expect("identifiant de Capture");
+    let capture: Value = serde_json::from_slice(
+        &env.command()
+            .args(["capture", "inspect", capture_id])
+            .assert()
+            .success()
+            .get_output()
+            .stdout,
+    )
+    .expect("Capture JSON valide");
+    assert_eq!(capture["manifest"]["proof"]["artifact_id"], "proof-dom");
+    assert_eq!(
+        capture["manifest"]["extractions"][0]["artifact_id"],
+        "extraction-markdown"
+    );
+    assert_eq!(
+        capture["manifest"]["discoveries"][0]["parent"]["artifact_id"],
+        "proof-dom"
+    );
+    assert_eq!(capture["manifest"]["discoveries"][0]["order"], 0);
+    env.command()
+        .args(["capture", "search", "preuve"])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains(capture_id));
+    let duplicate: Value = serde_json::from_slice(
+        &env.command()
+            .args([
+                "capture",
+                "https://93.184.216.34/",
+                "--policy",
+                "safe-web@1",
+            ])
+            .assert()
+            .success()
+            .get_output()
+            .stdout,
+    )
+    .expect("Job de Doublon JSON valide");
+    let duplicate_job = duplicate["job"]["job_id"]
+        .as_str()
+        .expect("identifiant du Job de Doublon");
+    let reused: Value = serde_json::from_slice(
+        &env.command()
+            .args(["job", "wait", duplicate_job, "--timeout-secs", "5"])
+            .assert()
+            .success()
+            .get_output()
+            .stdout,
+    )
+    .expect("Job de Doublon terminé JSON valide");
+    assert_eq!(reused["state"], "succeeded");
+    assert_eq!(reused["capture_id"], capture_id);
+}
+
+#[test]
+fn safe_web_preserves_a_renderer_refusal_code_in_the_job_contract() {
+    let env = TestEnv::new("safe-web-refusal");
+    env.install_binary("scriptor-page-renderer", FAKE_PAGE_RENDERER_PRIVATE_TARGET);
+    let created: Value = serde_json::from_slice(
+        &env.command()
+            .args([
+                "capture",
+                "https://93.184.216.34/",
+                "--policy",
+                "safe-web@1",
+            ])
+            .assert()
+            .success()
+            .get_output()
+            .stdout,
+    )
+    .expect("Job JSON valide");
+    let job_id = created["job"]["job_id"]
+        .as_str()
+        .expect("identifiant de Job");
+    env.command()
+        .args(["job", "wait", job_id, "--timeout-secs", "5"])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains(
+            "\"code\":\"web_private_target_refused\"",
+        ));
+}
+
+#[test]
+fn capture_bounds_provider_diagnostics_in_memory() {
+    let env = TestEnv::new("capture-provider-diagnostics");
+    env.install_binary(
+        "pdfinfo",
+        "#!/bin/sh\ni=0\nwhile [ \"$i\" -lt 16385 ]; do\n  printf 'xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx'\n  i=$((i + 1))\ndone\n",
+    );
+    env.install_binary("pdftotext", FAKE_PDFTOTEXT);
+    let source = env.work_dir.join("verbose.pdf");
+    fs::write(&source, b"original pdf bytes").expect("écriture du PDF");
+    let path = write_capture_worker_job(&env, "job-63", &source, &["pdfinfo", "pdftotext"], 30);
+
+    env.command()
+        .args(["capture-worker", "--job-id", "job-63"])
+        .assert()
+        .success();
+    let job: Value =
+        serde_json::from_slice(&fs::read(path).expect("lecture du Job")).expect("Job JSON valide");
+    assert_eq!(job["state"], "partial");
+    assert!(job["capture_id"].is_string());
+}
+
+#[test]
+fn capture_admission_enforces_concurrency_before_launching_a_provider() {
+    let env = TestEnv::new("capture-concurrency");
+    env.write_config(&env.work_dir.join("out"));
+    env.install_binary("ffmpeg", "#!/bin/sh\nsleep 2\n");
+    let first_source = env.write_media_file("first.mp4");
+    let second_source = env.write_media_file("second.mp4");
+    let first_path = write_capture_worker_job(&env, "job-61", &first_source, &["ffmpeg"], 30);
+    let second_path = write_capture_worker_job(&env, "job-62", &second_source, &["ffmpeg"], 30);
+    for path in [&first_path, &second_path] {
+        let mut job: Value = serde_json::from_slice(&fs::read(path).expect("lecture du Job"))
+            .expect("Job JSON valide");
+        job["policy"]["snapshot"]["limits"]["max_concurrency"] = Value::from(1);
+        fs::write(
+            path,
+            serde_json::to_vec(&job).expect("sérialisation du Job"),
+        )
+        .expect("écriture du Job");
+    }
+
+    let mut first_worker = std::process::Command::new(env!("CARGO_BIN_EXE_scriptor"))
+        .env("PATH", &env.bin_dir)
+        .env("XDG_CONFIG_HOME", &env.xdg_config)
+        .env("XDG_CACHE_HOME", &env.xdg_cache)
+        .env("XDG_DATA_HOME", &env.xdg_data)
+        .args(["capture-worker", "--job-id", "job-61"])
+        .spawn()
+        .expect("lancement du premier Worker");
+    assert!(wait_for_job_state(
+        &first_path,
+        "running",
+        Duration::from_secs(1)
+    ));
+    env.command()
+        .args(["capture-worker", "--job-id", "job-62"])
+        .assert()
+        .success();
+    let second: Value = serde_json::from_slice(&fs::read(&second_path).expect("lecture du Job"))
+        .expect("Job JSON valide");
+    assert_eq!(second["state"], "failed");
+    assert_eq!(second["error"]["code"], "concurrency_limit_exceeded");
+    first_worker.wait().expect("attente du premier Worker");
+}
+
+#[test]
+fn capture_stops_a_running_provider_at_its_duration_budget_before_starting_frames() {
+    let env = TestEnv::new("capture-provider-duration-budget");
+    env.write_config(&env.work_dir.join("out"));
+    let source = env.write_media_file("interview.mp4");
+    let audio_started = env.work_dir.join("audio-started");
+    let frames_started = env.work_dir.join("frames-started");
+    write_executable(
+        &env.bin_dir,
+        "ffmpeg",
+        &format!(
+            "#!/bin/sh\nset -eu\nfor arg in \"$@\"; do\n  if [ \"$arg\" = \"-map\" ]; then\n    : > \"{}\"\n    exit 0\n  fi\ndone\n: > \"{}\"\nwhile :; do :; done\n",
+            frames_started.display(),
+            audio_started.display(),
+        ),
+    );
+    let job_id = "job-1";
+    let job_path = write_capture_worker_job(
+        &env,
+        job_id,
+        &source,
+        &["ffmpeg", "ffprobe", "whisper-cli"],
+        2,
+    );
+
+    let started = Instant::now();
+    env.command()
+        .args(["capture-worker", "--job-id", job_id])
+        .assert()
+        .success();
+
+    let finished: Value =
+        serde_json::from_slice(&fs::read(job_path).expect("lecture du Job terminé"))
+            .expect("Job JSON valide");
+    assert!(started.elapsed() < Duration::from_secs(5));
+    assert_eq!(finished["state"], "partial");
+    assert!(audio_started.exists());
+    assert!(!frames_started.exists());
+    let capture_id = finished["capture_id"]
+        .as_str()
+        .expect("la Capture partielle est publiée");
+    let capture: Value = serde_json::from_slice(
+        &env.command()
+            .args(["capture", "inspect", capture_id])
+            .assert()
+            .success()
+            .get_output()
+            .stdout,
+    )
+    .expect("Capture JSON valide");
+    assert!(
+        capture["manifest"]["capabilities"]
+            .as_array()
+            .is_some_and(|capabilities| capabilities.iter().any(|capability| {
+                capability["name"] == "audio-extraction"
+                    && capability["state"] == "failed"
+                    && capability["error"]["message"]
+                        .as_str()
+                        .is_some_and(|message| message.contains("duration budget"))
+            }))
+    );
+    assert!(
+        capture["manifest"]["capabilities"]
+            .as_array()
+            .is_some_and(|capabilities| capabilities.iter().any(|capability| {
+                capability["name"] == "transcription" && capability["state"] == "not_attempted"
+            }))
+    );
+}
+
+#[test]
+fn cancelling_a_running_local_capture_stops_the_provider_without_publishing() {
+    let env = TestEnv::new("capture-cancellation");
+    env.write_config(&env.work_dir.join("out"));
+    let source = env.write_media_file("interview.mp4");
+    let provider_started = env.work_dir.join("provider-started");
+    write_executable(
+        &env.bin_dir,
+        "ffmpeg",
+        &format!(
+            "#!/bin/sh\n: > \"{}\"\nwhile :; do :; done\n",
+            provider_started.display()
+        ),
+    );
+    let job_id = "job-64";
+    let job_path = write_capture_worker_job(&env, job_id, &source, &["ffmpeg"], 30);
+    let mut worker = std::process::Command::new(env!("CARGO_BIN_EXE_scriptor"))
+        .env("PATH", &env.bin_dir)
+        .env("XDG_CONFIG_HOME", &env.xdg_config)
+        .env("XDG_CACHE_HOME", &env.xdg_cache)
+        .env("XDG_DATA_HOME", &env.xdg_data)
+        .args(["capture-worker", "--job-id", job_id])
+        .spawn()
+        .expect("lancement du Worker");
+    let deadline = Instant::now() + Duration::from_secs(1);
+    while !provider_started.exists() && Instant::now() < deadline {
+        std::thread::sleep(Duration::from_millis(10));
+    }
+    assert!(
+        provider_started.exists(),
+        "le Provider a démarré: {}",
+        fs::read_to_string(&job_path).expect("lecture du Job en cours")
+    );
+
+    env.command()
+        .args(["job", "cancel", job_id])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("\"state\":\"cancelled\""));
+    worker.wait().expect("arrêt du Worker annulé");
+
+    let job: Value = serde_json::from_slice(&fs::read(job_path).expect("lecture du Job"))
+        .expect("Job JSON valide");
+    assert_eq!(job["state"], "cancelled");
+    assert!(job["capture_id"].is_null());
+    let captures = env.xdg_data.join("scriptor").join("v2").join("captures");
+    assert!(
+        fs::read_dir(captures)
+            .expect("lecture des Captures")
+            .next()
+            .is_none(),
+        "aucune Capture, même staging, ne doit survivre à l annulation"
+    );
+}
+
+#[test]
+fn capture_keeps_authorized_media_capabilities_when_policy_denies_only_frames() {
+    let env = TestEnv::new("capture-partial-provider-policy");
+    env.write_config(&env.work_dir.join("out"));
+    let source = env.write_media_file("interview.mp4");
+    let job_id = "job-1";
+    let job_path = write_capture_worker_job(&env, job_id, &source, &["ffmpeg", "whisper-cli"], 30);
+
+    env.command()
+        .args(["capture-worker", "--job-id", job_id])
+        .assert()
+        .success();
+
+    let finished: Value =
+        serde_json::from_slice(&fs::read(job_path).expect("lecture du Job terminé"))
+            .expect("Job JSON valide");
+    assert_eq!(finished["state"], "partial");
+    let capture_id = finished["capture_id"]
+        .as_str()
+        .expect("la Capture partielle est publiée");
+    let capture: Value = serde_json::from_slice(
+        &env.command()
+            .args(["capture", "inspect", capture_id])
+            .assert()
+            .success()
+            .get_output()
+            .stdout,
+    )
+    .expect("Capture JSON valide");
+    let capabilities = capture["manifest"]["capabilities"]
+        .as_array()
+        .expect("capabilities présentes");
+    assert!(capabilities.iter().any(|capability| {
+        capability["name"] == "audio-extraction" && capability["state"] == "succeeded"
+    }));
+    assert!(capabilities.iter().any(|capability| {
+        capability["name"] == "transcription" && capability["state"] == "succeeded"
+    }));
+    assert!(capabilities.iter().any(|capability| {
+        capability["name"] == "frames"
+            && capability["state"] == "not_attempted"
+            && capability["provider"]["name"] == "ffprobe"
+    }));
+}
+
+#[test]
+fn capture_local_media_publishes_proof_and_located_extractions() {
+    let env = TestEnv::new("capture-local-media");
+    env.write_config(&env.work_dir.join("out"));
+    let source = env.write_media_file("interview.MP4");
+
+    let created: Value = serde_json::from_slice(
+        &env.command()
+            .args([
+                "capture",
+                source.to_str().expect("chemin utf-8"),
+                "--policy",
+                "safe-local@1",
+            ])
+            .assert()
+            .success()
+            .get_output()
+            .stdout,
+    )
+    .expect("Job JSON valide");
+    let job_id = created["job"]["job_id"]
+        .as_str()
+        .expect("identifiant de Job");
+    let finished: Value = serde_json::from_slice(
+        &env.command()
+            .args(["job", "wait", job_id, "--timeout-secs", "5"])
+            .assert()
+            .success()
+            .get_output()
+            .stdout,
+    )
+    .expect("Job JSON valide");
+    assert_eq!(finished["state"], "succeeded");
+    let capture_id = finished["capture_id"]
+        .as_str()
+        .expect("identifiant de Capture");
+
+    let capture: Value = serde_json::from_slice(
+        &env.command()
+            .args(["capture", "inspect", capture_id])
+            .assert()
+            .success()
+            .get_output()
+            .stdout,
+    )
+    .expect("Capture JSON valide");
+    assert_eq!(capture["manifest"]["proof"]["path"], "proofs/source");
+    assert_eq!(capture["manifest"]["proof"]["locator"]["kind"], "file");
+    assert_eq!(capture["manifest"]["proof"]["mime"], "video/mp4");
+    assert_eq!(
+        capture["manifest"]["extractions"].as_array().map(Vec::len),
+        Some(2)
+    );
+    assert!(
+        capture["manifest"]["extractions"]
+            .as_array()
+            .is_some_and(|extractions| extractions.iter().any(|extraction| {
+                extraction["artifact_id"] == "extraction-transcription"
+                    && extraction["path"] == "extractions/transcription.txt"
+                    && extraction["locator"].is_null()
+                    && extraction["provider"]["name"] == "whisper-cli"
+                    && extraction["provider"]["version"].as_str().is_some()
+                    && extraction["provider"]["parameters"]["model"]["sha256"]
+                        .as_str()
+                        .is_some()
+            }))
+    );
+    assert!(
+        capture["manifest"]["extractions"]
+            .as_array()
+            .is_some_and(|extractions| extractions.iter().any(|extraction| {
+                extraction["artifact_id"] == "extraction-frame-0000"
+                    && extraction["locator"]["kind"] == "media-timestamp"
+                    && extraction["provider"]["name"] == "ffmpeg"
+                    && extraction["provider"]["version"].as_str().is_some()
+                    && extraction["provider"]["dependencies"][0]["name"] == "ffprobe"
+            }))
+    );
+
+    assert_readable_transcription(&env, capture_id, &capture);
+}
+
+#[test]
+fn capture_local_media_publishes_partial_results_when_transcription_capability_fails() {
+    let env = TestEnv::new("capture-media-partial");
+    env.write_config(&env.work_dir.join("out"));
+    write_executable(&env.bin_dir, "whisper-cli", FAKE_WHISPER_CLI_FAILURE);
+    let source = env.write_media_file("interview.M4A");
+
+    let created: Value = serde_json::from_slice(
+        &env.command()
+            .args([
+                "capture",
+                source.to_str().expect("chemin utf-8"),
+                "--policy",
+                "safe-local@1",
+            ])
+            .assert()
+            .success()
+            .get_output()
+            .stdout,
+    )
+    .expect("Job JSON valide");
+    let job_id = created["job"]["job_id"]
+        .as_str()
+        .expect("identifiant de Job");
+    let finished: Value = serde_json::from_slice(
+        &env.command()
+            .args(["job", "wait", job_id, "--timeout-secs", "5"])
+            .assert()
+            .success()
+            .get_output()
+            .stdout,
+    )
+    .expect("Job JSON valide");
+    assert_eq!(finished["state"], "partial");
+    let capture_id = finished["capture_id"]
+        .as_str()
+        .expect("une Capture partielle reste inspectable");
+
+    let capture: Value = serde_json::from_slice(
+        &env.command()
+            .args(["capture", "inspect", capture_id])
+            .assert()
+            .success()
+            .get_output()
+            .stdout,
+    )
+    .expect("Capture JSON valide");
+    assert_eq!(capture["manifest"]["proof"]["path"], "proofs/source");
+    assert_eq!(capture["manifest"]["proof"]["mime"], "audio/mp4");
+    assert!(
+        capture["manifest"]["extractions"]
+            .as_array()
+            .is_some_and(|extractions| {
+                extractions
+                    .iter()
+                    .any(|extraction| extraction["artifact_id"] == "extraction-frame-0000")
+            })
+    );
+    assert!(
+        capture["manifest"]["capabilities"]
+            .as_array()
+            .is_some_and(|capabilities| capabilities.iter().any(|capability| {
+                capability["name"] == "transcription"
+                    && capability["state"] == "failed"
+                    && capability["error"]["code"] == "capability_failed"
+                    && capability["error"]["message"]
+                        .as_str()
+                        .is_some_and(|message| message.contains("fake whisper-cli failure"))
+            }))
+    );
+}
+
+#[test]
+fn local_pdf_publishes_a_traced_text_extraction_and_capability() {
+    let env = TestEnv::new("capture-pdf");
+    env.install_binary("pdfinfo", FAKE_PDFINFO);
+    env.install_binary("pdftotext", FAKE_PDFTOTEXT);
+    let source = env.work_dir.join("contract.pdf");
+    fs::write(&source, b"original pdf bytes").expect("écriture du PDF");
+    let job_id = "job-42";
+    let job_path = write_capture_worker_job(&env, job_id, &source, &["pdftotext", "pdfinfo"], 30);
+
+    env.command()
+        .args(["capture-worker", "--job-id", job_id])
+        .assert()
+        .success();
+
+    let job: Value = serde_json::from_slice(&fs::read(&job_path).expect("lecture du Job"))
+        .expect("Job JSON valide");
+    assert_eq!(job["state"], "succeeded");
+    let capture_id = job["capture_id"].as_str().expect("identifiant de Capture");
+    let capture: Value = serde_json::from_slice(
+        &env.command()
+            .args(["capture", "inspect", capture_id])
+            .assert()
+            .success()
+            .get_output()
+            .stdout,
+    )
+    .expect("Capture JSON valide");
+
+    assert_eq!(capture["manifest"]["proof"]["mime"], "application/pdf");
+    assert!(capture["manifest"]["proof"]["created_at"].is_u64());
+    assert!(
+        capture["manifest"]["proof"]["created_at"]
+            .as_u64()
+            .is_some_and(|proof_created_at| {
+                capture["manifest"]["extractions"][0]["created_at"]
+                    .as_u64()
+                    .is_some_and(|extraction_created_at| proof_created_at <= extraction_created_at)
+            }),
+        "la preuve est horodatée lors de sa copie, avant l'extraction"
+    );
+    assert_eq!(
+        capture["manifest"]["extractions"][0]["provider"]["name"],
+        "pdftotext"
+    );
+    assert_eq!(
+        capture["manifest"]["extractions"][0]["provider"]["parameters"],
+        serde_json::json!({ "arguments": ["-layout"] })
+    );
+    assert_eq!(
+        capture["manifest"]["extractions"][0]["locator"]["kind"],
+        "pdf-pages"
+    );
+    assert_eq!(
+        capture["manifest"]["extractions"][0]["locator"]["last_page"],
+        2
+    );
+    assert_eq!(
+        capture["manifest"]["extractions"][0]["locator_provider"]["name"],
+        "pdfinfo"
+    );
+    assert!(
+        capture["manifest"]["capabilities"]
+            .as_array()
+            .is_some_and(|capabilities| capabilities.iter().any(|capability| {
+                capability["name"] == "pdf-text-extraction" && capability["state"] == "succeeded"
+            }))
+    );
+}
+
+#[test]
+fn document_provider_refusal_is_a_not_attempted_capability() {
+    let env = TestEnv::new("capture-pdf-policy");
+    let marker = env.work_dir.join("pdftotext-invoked");
+    env.install_binary(
+        "pdftotext",
+        &format!("#!/bin/sh\nprintf invoked > '{}'\n", marker.display()),
+    );
+    let source = env.work_dir.join("contract.pdf");
+    fs::write(&source, b"original pdf bytes").expect("écriture du PDF");
+    let job_id = "job-43";
+    let job_path = write_capture_worker_job(&env, job_id, &source, &[], 30);
+
+    env.command()
+        .args(["capture-worker", "--job-id", job_id])
+        .assert()
+        .success();
+
+    assert!(
+        !marker.exists(),
+        "un Provider refusé ne doit pas être invoqué"
+    );
+    let job: Value = serde_json::from_slice(&fs::read(job_path).expect("lecture du Job"))
+        .expect("Job JSON valide");
+    assert_eq!(job["state"], "partial");
+    let capture_id = job["capture_id"].as_str().expect("identifiant de Capture");
+    let capture: Value = serde_json::from_slice(
+        &env.command()
+            .args(["capture", "inspect", capture_id])
+            .assert()
+            .success()
+            .get_output()
+            .stdout,
+    )
+    .expect("Capture JSON valide");
+    assert!(
+        capture["manifest"]["capabilities"]
+            .as_array()
+            .is_some_and(|capabilities| capabilities.iter().any(|capability| {
+                capability["name"] == "pdf-text-extraction"
+                    && capability["state"] == "not_attempted"
+                    && capability["error"]["code"] == "provider_not_allowed"
+                    && capability["provider"]["name"] == "pdftotext"
+            }))
+    );
+}
+
+#[test]
+fn local_image_ocr_keeps_typed_regions_and_capability_failures() {
+    let env = TestEnv::new("capture-image-ocr");
+    env.install_binary("tesseract", FAKE_TESSERACT);
+    let source = env.work_dir.join("receipt.png");
+    fs::write(&source, b"original image bytes").expect("écriture de l'image");
+    let job_id = "job-44";
+    let job_path = write_capture_worker_job(&env, job_id, &source, &["tesseract"], 30);
+
+    env.command()
+        .args(["capture-worker", "--job-id", job_id])
+        .assert()
+        .success();
+
+    let job: Value = serde_json::from_slice(&fs::read(&job_path).expect("lecture du Job"))
+        .expect("Job JSON valide");
+    assert_eq!(job["state"], "succeeded");
+    let capture_id = job["capture_id"].as_str().expect("identifiant de Capture");
+    let capture: Value = serde_json::from_slice(
+        &env.command()
+            .args(["capture", "inspect", capture_id])
+            .assert()
+            .success()
+            .get_output()
+            .stdout,
+    )
+    .expect("Capture JSON valide");
+    assert_eq!(
+        capture["manifest"]["extractions"][0]["locator"]["kind"],
+        "image-regions"
+    );
+    assert_eq!(
+        capture["manifest"]["extractions"][0]["locator"]["regions"][0]["left"],
+        12
+    );
+    assert!(
+        capture["manifest"]["capabilities"]
+            .as_array()
+            .is_some_and(|capabilities| capabilities.iter().any(|capability| {
+                capability["name"] == "image-ocr" && capability["state"] == "succeeded"
+            }))
+    );
+
+    env.install_binary("tesseract", FAKE_TESSERACT_FAILURE);
+    let failed_source = env.work_dir.join("failed-receipt.png");
+    fs::write(&failed_source, b"other image bytes").expect("écriture de l'image");
+    let failed_job_id = "job-45";
+    let failed_job_path =
+        write_capture_worker_job(&env, failed_job_id, &failed_source, &["tesseract"], 30);
+    env.command()
+        .args(["capture-worker", "--job-id", failed_job_id])
+        .assert()
+        .success();
+    let failed_job: Value =
+        serde_json::from_slice(&fs::read(failed_job_path).expect("lecture du Job"))
+            .expect("Job JSON valide");
+    assert_eq!(failed_job["state"], "partial");
+    let failed_capture_id = failed_job["capture_id"]
+        .as_str()
+        .expect("identifiant de Capture");
+    let failed_capture: Value = serde_json::from_slice(
+        &env.command()
+            .args(["capture", "inspect", failed_capture_id])
+            .assert()
+            .success()
+            .get_output()
+            .stdout,
+    )
+    .expect("Capture JSON valide");
+    assert!(
+        failed_capture["manifest"]["capabilities"]
+            .as_array()
+            .is_some_and(|capabilities| capabilities.iter().any(|capability| {
+                capability["name"] == "image-ocr"
+                    && capability["state"] == "failed"
+                    && capability["error"]["code"] == "extraction_failed"
+            }))
     );
 }
 

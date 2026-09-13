@@ -3,6 +3,7 @@
 //! Sortie, puis relance ce même binaire en mode Worker détaché (cf.
 //! `worker.rs`) avant de rendre la main.
 
+mod agent;
 mod artifacts;
 mod audio;
 mod binary;
@@ -12,8 +13,10 @@ mod download;
 mod frames;
 mod notify;
 mod output;
+mod resource;
 mod transcribe;
 mod unique_id;
+mod web;
 mod worker;
 
 use std::fs::{self, File};
@@ -28,13 +31,17 @@ use cli::{Args, Source, detect_source};
 use config::Config;
 
 fn main() -> ExitCode {
-    let args = Args::parse();
-
-    let result = if args.worker {
-        args.into_worker_params()
-            .and_then(|params| worker::run(&params))
+    let arguments = std::env::args_os().collect::<Vec<_>>();
+    let result = if agent::is_agent_command(&arguments) {
+        agent::run(arguments)
     } else {
-        launch(&args)
+        let args = Args::parse_from(arguments);
+        if args.worker {
+            args.into_worker_params()
+                .and_then(|params| worker::run(&params))
+        } else {
+            launch(&args)
+        }
     };
 
     match result {

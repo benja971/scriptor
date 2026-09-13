@@ -36,7 +36,7 @@ fn send(message: &str) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use std::env;
-    use std::fs;
+    use std::fs::{self, File};
     use std::os::unix::fs::PermissionsExt;
     use std::path::{Path, PathBuf};
     use std::sync::Mutex;
@@ -100,6 +100,10 @@ mod tests {
             .permissions();
         perms.set_mode(0o755);
         fs::set_permissions(&script_path, perms).context("making fake notify-send executable")?;
+        File::open(&script_path)
+            .context("opening fake notify-send for synchronization")?
+            .sync_all()
+            .context("synchronizing fake notify-send")?;
         Ok(capture_path)
     }
 
