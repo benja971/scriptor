@@ -114,6 +114,7 @@ fn list_has_stable_pages_and_verifiable_references() {
     for capture in first_captures {
         assert_eq!(capture["reference"]["capture_id"], capture["capture_id"]);
         assert_eq!(capture["reference"]["artifact_id"], "proof-source");
+        assert_eq!(capture["reference"]["locator"]["kind"], "file");
         assert_eq!(
             capture["reference"]["sha256"].as_str().map(str::len),
             Some(64)

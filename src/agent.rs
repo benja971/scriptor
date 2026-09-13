@@ -277,7 +277,7 @@ struct Reference {
     capture_id: String,
     artifact_id: String,
     sha256: String,
-    locator: Option<String>,
+    locator: Option<Locator>,
 }
 
 #[derive(Serialize)]
@@ -317,9 +317,24 @@ struct AgentError {
 
 #[derive(Serialize)]
 struct ReadArtifact {
-    artifact: Proof,
+    artifact: ArtifactMetadata,
     reference: Reference,
     content: ReadContent,
+}
+
+#[derive(Serialize)]
+struct ArtifactMetadata {
+    artifact_id: String,
+    path: String,
+    mime: String,
+    sha256: String,
+    size_bytes: u64,
+    locator: Option<Locator>,
+    created_at: u64,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    provider: Option<Provider>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    proof_artifact_id: Option<String>,
 }
 
 #[derive(Serialize)]
@@ -1959,17 +1974,16 @@ fn read_artifact(
     }
     let directory = captures_dir()?.join(&request.capture_id);
     let manifest: Manifest = read_json(&directory.join("manifest.json"))?;
-    if request.artifact_id != manifest.proof.artifact_id {
-        bail!("unknown artifact identifier");
-    }
-    if !is_text_mime(&manifest.proof.mime) {
+    let artifact =
+        artifact_for(&manifest, &request.artifact_id).context("unknown artifact identifier")?;
+    if !is_text_mime(&artifact.mime) {
         bail!("binary artifacts cannot be read on stdout");
     }
-    let path = directory.join(&manifest.proof.path);
-    if sha256_file(&path)? != manifest.proof.sha256
+    let path = directory.join(&artifact.path);
+    if sha256_file(&path)? != artifact.sha256
         || request
             .expected_sha256
-            .is_some_and(|expected| expected != manifest.proof.sha256)
+            .is_some_and(|expected| expected != artifact.sha256)
     {
         bail!("artifact hash does not match its Reference");
     }
@@ -2013,9 +2027,10 @@ fn read_artifact(
         Err(error) => return Err(error).context("artifact text is not valid UTF-8"),
     };
     let text_length = text.len();
+    let reference = reference_for_artifact(&manifest.capture_id, &artifact);
     print_json(&ReadArtifact {
-        artifact: manifest.proof.clone(),
-        reference: reference_for(&manifest),
+        artifact,
+        reference,
         content: ReadContent {
             offset,
             offset_unit: "bytes",
@@ -2277,11 +2292,65 @@ fn summary_for(manifest: &Manifest) -> CaptureSummary {
 }
 
 fn reference_for(manifest: &Manifest) -> Reference {
+    reference_for_proof(&manifest.capture_id, &manifest.proof)
+}
+
+fn artifact_for(manifest: &Manifest, artifact_id: &str) -> Option<ArtifactMetadata> {
+    if manifest.proof.artifact_id == artifact_id {
+        return Some(artifact_from_proof(&manifest.proof));
+    }
+    if let Some(proof) = manifest
+        .artifacts
+        .iter()
+        .find(|proof| proof.artifact_id == artifact_id)
+    {
+        return Some(artifact_from_proof(proof));
+    }
+    manifest
+        .extractions
+        .iter()
+        .find(|extraction| extraction.artifact_id == artifact_id)
+        .map(artifact_from_extraction)
+}
+
+fn artifact_from_proof(proof: &Proof) -> ArtifactMetadata {
+    ArtifactMetadata {
+        artifact_id: proof.artifact_id.clone(),
+        path: proof.path.clone(),
+        mime: proof.mime.clone(),
+        sha256: proof.sha256.clone(),
+        size_bytes: proof.size_bytes,
+        locator: Some(proof.locator.clone()),
+        created_at: proof.created_at,
+        provider: None,
+        proof_artifact_id: None,
+    }
+}
+
+fn artifact_from_extraction(extraction: &Extraction) -> ArtifactMetadata {
+    ArtifactMetadata {
+        artifact_id: extraction.artifact_id.clone(),
+        path: extraction.path.clone(),
+        mime: extraction.mime.clone(),
+        sha256: extraction.sha256.clone(),
+        size_bytes: extraction.size_bytes,
+        locator: extraction.locator.clone(),
+        created_at: extraction.created_at,
+        provider: Some(extraction.provider.clone()),
+        proof_artifact_id: Some(extraction.proof_artifact_id.clone()),
+    }
+}
+
+fn reference_for_proof(capture_id: &str, proof: &Proof) -> Reference {
+    reference_for_artifact(capture_id, &artifact_from_proof(proof))
+}
+
+fn reference_for_artifact(capture_id: &str, artifact: &ArtifactMetadata) -> Reference {
     Reference {
-        capture_id: manifest.capture_id.clone(),
-        artifact_id: manifest.proof.artifact_id.clone(),
-        sha256: manifest.proof.sha256.clone(),
-        locator: None,
+        capture_id: capture_id.to_string(),
+        artifact_id: artifact.artifact_id.clone(),
+        sha256: artifact.sha256.clone(),
+        locator: artifact.locator.clone(),
     }
 }
 

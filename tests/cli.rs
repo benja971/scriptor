@@ -315,6 +315,37 @@ fn wait_for_file(path: &Path, timeout: Duration) -> bool {
     has_content(path)
 }
 
+fn assert_readable_transcription(env: &TestEnv, capture_id: &str, capture: &Value) {
+    let transcription = capture["manifest"]["extractions"]
+        .as_array()
+        .and_then(|extractions| {
+            extractions
+                .iter()
+                .find(|extraction| extraction["artifact_id"] == "extraction-transcription")
+        })
+        .expect("Extraction de transcription");
+    let reference = serde_json::json!({
+        "capture_id": capture_id,
+        "artifact_id": transcription["artifact_id"],
+        "sha256": transcription["sha256"],
+        "locator": transcription["locator"],
+    })
+    .to_string();
+    let read: Value = serde_json::from_slice(
+        &env.command()
+            .args(["capture", "read", "--reference", &reference])
+            .assert()
+            .success()
+            .get_output()
+            .stdout,
+    )
+    .expect("lecture JSON valide");
+    assert_eq!(read["artifact"]["artifact_id"], "extraction-transcription");
+    assert_eq!(read["artifact"]["provider"]["name"], "whisper-cli");
+    assert_eq!(read["reference"]["locator"], Value::Null);
+    assert_eq!(read["content"]["text"], "faux contenu transcrit\n");
+}
+
 #[test]
 fn local_source_happy_path_produces_output_next_to_source() {
     let env = TestEnv::new("happy");
@@ -1025,6 +1056,8 @@ fn capture_local_media_publishes_proof_and_located_extractions() {
                     && extraction["provider"]["dependencies"][0]["name"] == "ffprobe"
             }))
     );
+
+    assert_readable_transcription(&env, capture_id, &capture);
 }
 
 #[test]
