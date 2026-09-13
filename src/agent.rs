@@ -1,6 +1,7 @@
 use std::ffi::OsString;
+use std::fmt::Write as FmtWrite;
 use std::fs::{self, File, OpenOptions};
-use std::io::{BufReader, Read, Write};
+use std::io::{BufReader, Read, Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 use std::thread;
@@ -15,6 +16,10 @@ use sha2::{Digest, Sha256};
 use crate::unique_id::unique_id;
 
 const POLICY_NAME: &str = "safe-local@1";
+const DEFAULT_PAGE_LIMIT: usize = 20;
+const MAX_PAGE_LIMIT: usize = 100;
+const DEFAULT_READ_LENGTH: usize = 8 * 1024;
+const MAX_READ_LENGTH: usize = 1024 * 1024;
 
 #[derive(Parser)]
 #[command(name = "scriptor")]
@@ -46,7 +51,44 @@ struct CaptureCommand {
 #[derive(Subcommand)]
 enum CaptureSubcommand {
     #[command(alias = "get")]
-    Inspect { capture_id: String },
+    Inspect {
+        capture_id: String,
+    },
+    List {
+        #[arg(long)]
+        cursor: Option<String>,
+        #[arg(long, default_value_t = DEFAULT_PAGE_LIMIT)]
+        limit: usize,
+    },
+    Search {
+        query: String,
+        #[arg(long)]
+        cursor: Option<String>,
+        #[arg(long, default_value_t = DEFAULT_PAGE_LIMIT)]
+        limit: usize,
+    },
+    Read {
+        capture_id: Option<String>,
+        artifact_id: Option<String>,
+        #[arg(long, conflicts_with_all = ["capture_id", "artifact_id"])]
+        reference: Option<String>,
+        #[arg(long, default_value_t = 0)]
+        offset: u64,
+        #[arg(long)]
+        length: Option<usize>,
+    },
+    Index(IndexCommand),
+}
+
+#[derive(Args)]
+struct IndexCommand {
+    #[command(subcommand)]
+    command: IndexSubcommand,
+}
+
+#[derive(Subcommand)]
+enum IndexSubcommand {
+    Rebuild,
 }
 
 #[derive(Args)]
@@ -127,7 +169,7 @@ struct CreatedJob<'a> {
     job: &'a Job,
 }
 
-#[derive(Debug, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 struct Manifest {
     capture_id: String,
     source: SourceIdentity,
@@ -136,13 +178,13 @@ struct Manifest {
     proof: Proof,
 }
 
-#[derive(Debug, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 struct SourceIdentity {
     locator: String,
     sha256: String,
 }
 
-#[derive(Debug, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 struct Proof {
     artifact_id: String,
     path: String,
@@ -164,6 +206,93 @@ struct LedgerEvent {
     job_id: String,
 }
 
+#[derive(Clone, Deserialize, Serialize)]
+struct Reference {
+    capture_id: String,
+    artifact_id: String,
+    sha256: String,
+    locator: Option<String>,
+}
+
+#[derive(Serialize)]
+struct CaptureSummary {
+    capture_id: String,
+    source: SourceIdentity,
+    published_at: u64,
+    reference: Reference,
+}
+
+#[derive(Serialize)]
+struct CapturePage {
+    captures: Vec<CaptureSummary>,
+    next_cursor: Option<String>,
+}
+
+#[derive(Serialize, Deserialize)]
+struct SearchIndex {
+    version: u8,
+    captures: Vec<IndexedCapture>,
+}
+
+#[derive(Serialize, Deserialize)]
+struct IndexedCapture {
+    capture_id: String,
+    source: SourceIdentity,
+    policy: Policy,
+    published_at: u64,
+    proof: Proof,
+    search_text: String,
+}
+
+#[derive(Deserialize, Serialize)]
+struct AgentError {
+    error: StructuredError,
+}
+
+#[derive(Serialize)]
+struct ReadArtifact {
+    artifact: Proof,
+    reference: Reference,
+    content: ReadContent,
+}
+
+#[derive(Serialize)]
+struct ReadContent {
+    offset: u64,
+    offset_unit: &'static str,
+    length: usize,
+    text: String,
+    truncated: bool,
+}
+
+#[derive(Deserialize, Serialize)]
+struct Cursor {
+    version: u8,
+    operation: String,
+    query: Option<String>,
+    snapshot: String,
+    index_version: Option<u8>,
+    capture_id: String,
+}
+
+struct CursorBinding {
+    operation: &'static str,
+    query: Option<String>,
+    snapshot: String,
+    index_version: Option<u8>,
+}
+
+#[derive(Serialize)]
+struct RebuiltSearchIndex {
+    captures: usize,
+}
+
+struct ReadRequest {
+    capture_id: String,
+    artifact_id: String,
+    expected_sha256: Option<String>,
+}
+
 enum Publication {
     Published(String),
     Cancelled,
@@ -179,17 +308,90 @@ pub fn is_agent_command(arguments: &[OsString]) -> bool {
 }
 
 pub fn run(arguments: Vec<OsString>) -> Result<()> {
-    let cli = AgentCli::parse_from(arguments);
-    match cli.command {
+    let cli = match AgentCli::try_parse_from(arguments) {
+        Ok(cli) => cli,
+        Err(error) => return print_agent_error("invalid_command", error.to_string()),
+    };
+    let result = match cli.command {
         AgentCommand::Capture(command) => run_capture_command(command),
         AgentCommand::Job(command) => run_job_command(command),
         AgentCommand::CaptureWorker { job_id } => run_worker(&job_id),
+    };
+    match result {
+        Ok(()) => Ok(()),
+        Err(error) => print_json(&AgentError {
+            error: agent_error(&error),
+        }),
+    }
+}
+
+fn print_agent_error(code: &str, message: String) -> Result<()> {
+    print_json(&AgentError {
+        error: StructuredError {
+            code: code.to_string(),
+            message,
+        },
+    })
+}
+
+fn agent_error(error: &anyhow::Error) -> StructuredError {
+    let message = format!("{error:#}");
+    let code = if message.contains("pagination cursor") {
+        "invalid_cursor"
+    } else if message.contains("requires --policy") {
+        "policy_required"
+    } else if message.contains("limit must") {
+        "invalid_pagination"
+    } else if message.contains("length must") || message.contains("UTF-8 character boundary") {
+        "invalid_range"
+    } else if message.contains("binary artifacts") {
+        "binary_artifact"
+    } else if message.contains("unknown artifact") {
+        "artifact_not_found"
+    } else if message.contains("does not match its Reference") {
+        "reference_mismatch"
+    } else if message.contains("invalid Reference") {
+        "invalid_reference"
+    } else if message.contains("invalid capture identifier")
+        || message.contains("invalid job identifier")
+    {
+        "invalid_identifier"
+    } else if message.contains("manifest.json") {
+        "capture_not_found"
+    } else if message.contains(".json") && message.contains("opening") {
+        "job_not_found"
+    } else {
+        "agent_command_failed"
+    };
+    StructuredError {
+        code: code.to_string(),
+        message,
     }
 }
 
 fn run_capture_command(command: CaptureCommand) -> Result<()> {
     match command.command {
         Some(CaptureSubcommand::Inspect { capture_id }) => inspect_capture(&capture_id),
+        Some(CaptureSubcommand::List { cursor, limit }) => list_captures(cursor.as_deref(), limit),
+        Some(CaptureSubcommand::Search {
+            query,
+            cursor,
+            limit,
+        }) => search_captures(&query, cursor.as_deref(), limit),
+        Some(CaptureSubcommand::Read {
+            capture_id,
+            artifact_id,
+            reference,
+            offset,
+            length,
+        }) => read_artifact(
+            capture_id.as_deref(),
+            artifact_id.as_deref(),
+            reference.as_deref(),
+            offset,
+            length,
+        ),
+        Some(CaptureSubcommand::Index(command)) => run_index_command(&command),
         None => create_capture_job(
             command
                 .source
@@ -329,7 +531,7 @@ fn publish_capture(job: &Job) -> Result<Publication> {
         proof: Proof {
             artifact_id: "proof-source".to_string(),
             path: "proofs/source".to_string(),
-            mime: "application/octet-stream".to_string(),
+            mime: mime_for_source(source).to_string(),
             sha256: sha256_file(&proof_path)?,
             size_bytes: proof_size,
         },
@@ -344,6 +546,9 @@ fn publish_capture(job: &Job) -> Result<Publication> {
         },
     )?;
     fs::rename(&staging, &final_dir).with_context(|| format!("publishing Capture {capture_id}"))?;
+    if let Err(error) = rebuild_search_index() {
+        record_index_degradation(&error);
+    }
     Ok(Publication::Published(capture_id))
 }
 
@@ -458,6 +663,466 @@ fn inspect_capture(capture_id: &str) -> Result<()> {
     let manifest: Manifest = read_json(&directory.join("manifest.json"))?;
     let ledger = read_json_lines(&directory.join("ledger.jsonl"))?;
     print_json(&InspectedCapture { manifest, ledger })
+}
+
+fn run_index_command(command: &IndexCommand) -> Result<()> {
+    match &command.command {
+        IndexSubcommand::Rebuild => print_json(&RebuiltSearchIndex {
+            captures: rebuild_search_index()?,
+        }),
+    }
+}
+
+fn list_captures(cursor: Option<&str>, limit: usize) -> Result<()> {
+    let manifests = list_manifests()?;
+    let binding = CursorBinding {
+        operation: "list",
+        query: None,
+        snapshot: snapshot_for(&manifests)?,
+        index_version: None,
+    };
+    print_json(&capture_page(manifests, cursor, limit, &binding)?)
+}
+
+fn search_captures(query: &str, cursor: Option<&str>, limit: usize) -> Result<()> {
+    validate_page_limit(limit)?;
+    if let Some(error) = read_index_degradation()? {
+        return print_json(&AgentError { error });
+    }
+    let index: SearchIndex = match read_json(&search_index_path()?) {
+        Ok(index) => index,
+        Err(error) => {
+            return print_json(&AgentError {
+                error: StructuredError {
+                    code: "index_unavailable".to_string(),
+                    message: format!("search Index is unavailable: {error:#}"),
+                },
+            });
+        }
+    };
+    if index.version != 1 {
+        return print_json(&AgentError {
+            error: StructuredError {
+                code: "index_unavailable".to_string(),
+                message: "search Index version is unsupported".to_string(),
+            },
+        });
+    }
+    let normalized_query = query.to_lowercase();
+    let binding = CursorBinding {
+        operation: "search",
+        query: Some(normalized_query.clone()),
+        snapshot: sha256_bytes(
+            &serde_json::to_vec(&index).context("serializing search Index snapshot")?,
+        ),
+        index_version: Some(index.version),
+    };
+    let manifests = index
+        .captures
+        .into_iter()
+        .filter(|capture| {
+            capture
+                .source
+                .locator
+                .to_lowercase()
+                .contains(&normalized_query)
+                || capture
+                    .search_text
+                    .to_lowercase()
+                    .contains(&normalized_query)
+        })
+        .map(|capture| Manifest {
+            capture_id: capture.capture_id,
+            source: capture.source,
+            policy: capture.policy,
+            published_at: capture.published_at,
+            proof: capture.proof,
+        })
+        .collect();
+    print_json(&capture_page(manifests, cursor, limit, &binding)?)
+}
+
+fn read_artifact(
+    capture_id: Option<&str>,
+    artifact_id: Option<&str>,
+    reference: Option<&str>,
+    offset: u64,
+    requested_length: Option<usize>,
+) -> Result<()> {
+    let request = resolve_read_request(capture_id, artifact_id, reference)?;
+    validate_id(&request.capture_id, "capture")?;
+    let length = requested_length.unwrap_or(DEFAULT_READ_LENGTH);
+    if length > MAX_READ_LENGTH {
+        bail!("length must not exceed {MAX_READ_LENGTH}");
+    }
+    let directory = captures_dir()?.join(&request.capture_id);
+    let manifest: Manifest = read_json(&directory.join("manifest.json"))?;
+    if request.artifact_id != manifest.proof.artifact_id {
+        bail!("unknown artifact identifier");
+    }
+    if !is_text_mime(&manifest.proof.mime) {
+        bail!("binary artifacts cannot be read on stdout");
+    }
+    let path = directory.join(&manifest.proof.path);
+    if sha256_file(&path)? != manifest.proof.sha256
+        || request
+            .expected_sha256
+            .is_some_and(|expected| expected != manifest.proof.sha256)
+    {
+        bail!("artifact hash does not match its Reference");
+    }
+    let size = fs::metadata(&path)
+        .with_context(|| format!("reading artifact metadata {}", path.display()))?
+        .len();
+    let remaining = size.saturating_sub(offset);
+    let amount =
+        usize::try_from(remaining.min(u64::try_from(length).context("converting read length")?))
+            .context("converting bounded artifact length")?;
+    let mut file =
+        File::open(&path).with_context(|| format!("opening artifact {}", path.display()))?;
+    if offset < size {
+        file.seek(SeekFrom::Start(offset))
+            .with_context(|| format!("checking artifact offset {}", path.display()))?;
+        let mut current = [0_u8; 1];
+        file.read_exact(&mut current)
+            .with_context(|| format!("checking artifact offset {}", path.display()))?;
+        if current.first().context("reading artifact offset byte")? & 0b1100_0000 == 0b1000_0000 {
+            bail!("offset must align to a UTF-8 character boundary");
+        }
+    }
+    file.seek(SeekFrom::Start(offset))
+        .with_context(|| format!("seeking artifact {}", path.display()))?;
+    let mut bytes = vec![0; amount];
+    file.read_exact(&mut bytes)
+        .with_context(|| format!("reading artifact {}", path.display()))?;
+    let text = match String::from_utf8(bytes) {
+        Ok(text) => text,
+        Err(error) if error.utf8_error().error_len().is_none() => {
+            let valid = error.utf8_error().valid_up_to();
+            let bytes = error.into_bytes();
+            String::from_utf8(
+                bytes
+                    .get(..valid)
+                    .context("trimming bounded artifact text")?
+                    .to_vec(),
+            )
+            .context("trimming bounded artifact text")?
+        }
+        Err(error) => return Err(error).context("artifact text is not valid UTF-8"),
+    };
+    let text_length = text.len();
+    print_json(&ReadArtifact {
+        artifact: manifest.proof.clone(),
+        reference: reference_for(&manifest),
+        content: ReadContent {
+            offset,
+            offset_unit: "bytes",
+            length: text_length,
+            text,
+            truncated: u64::try_from(text_length).context("converting read result length")?
+                < remaining,
+        },
+    })
+}
+
+fn resolve_read_request(
+    capture_id: Option<&str>,
+    artifact_id: Option<&str>,
+    reference: Option<&str>,
+) -> Result<ReadRequest> {
+    if let Some(reference) = reference {
+        let reference: Reference =
+            serde_json::from_str(reference).context("invalid Reference JSON")?;
+        return Ok(ReadRequest {
+            capture_id: reference.capture_id,
+            artifact_id: reference.artifact_id,
+            expected_sha256: Some(reference.sha256),
+        });
+    }
+    Ok(ReadRequest {
+        capture_id: capture_id
+            .context("invalid Reference: capture_id is required")?
+            .to_string(),
+        artifact_id: artifact_id
+            .context("invalid Reference: artifact_id is required")?
+            .to_string(),
+        expected_sha256: None,
+    })
+}
+
+fn capture_page(
+    manifests: Vec<Manifest>,
+    cursor: Option<&str>,
+    limit: usize,
+    binding: &CursorBinding,
+) -> Result<CapturePage> {
+    validate_page_limit(limit)?;
+    let after = cursor.map(decode_cursor).transpose()?;
+    if let Some(cursor) = &after
+        && (cursor.version != 1
+            || cursor.operation != binding.operation
+            || cursor.query != binding.query
+            || cursor.snapshot != binding.snapshot
+            || cursor.index_version != binding.index_version)
+    {
+        bail!("pagination cursor does not match this operation or snapshot");
+    }
+    let start = after.as_ref().map_or(0, |cursor| {
+        let capture_id = cursor.capture_id.as_str();
+        manifests.partition_point(|manifest| manifest.capture_id.as_str() <= capture_id)
+    });
+    let mut captures = manifests
+        .into_iter()
+        .skip(start)
+        .take(limit.saturating_add(1))
+        .collect::<Vec<_>>();
+    let has_next = captures.len() > limit;
+    if has_next {
+        captures.pop();
+    }
+    let next_cursor = if has_next {
+        captures
+            .last()
+            .map(|manifest| {
+                encode_cursor(&Cursor {
+                    version: 1,
+                    operation: binding.operation.to_string(),
+                    query: binding.query.clone(),
+                    snapshot: binding.snapshot.clone(),
+                    index_version: binding.index_version,
+                    capture_id: manifest.capture_id.clone(),
+                })
+            })
+            .transpose()?
+    } else {
+        None
+    };
+    Ok(CapturePage {
+        captures: captures.iter().map(summary_for).collect(),
+        next_cursor,
+    })
+}
+
+fn validate_page_limit(limit: usize) -> Result<()> {
+    if limit == 0 {
+        bail!("limit must be at least 1");
+    }
+    if limit > MAX_PAGE_LIMIT {
+        bail!("limit must not exceed {MAX_PAGE_LIMIT}");
+    }
+    Ok(())
+}
+
+fn list_manifests() -> Result<Vec<Manifest>> {
+    let mut manifests: Vec<Manifest> = Vec::new();
+    for entry in fs::read_dir(captures_dir()?).context("listing Captures")? {
+        let entry = entry.context("reading Capture directory entry")?;
+        if entry.file_name().to_string_lossy().starts_with('.') {
+            continue;
+        }
+        if !entry
+            .file_type()
+            .context("reading Capture entry type")?
+            .is_dir()
+        {
+            continue;
+        }
+        let manifest_path = entry.path().join("manifest.json");
+        if manifest_path
+            .try_exists()
+            .with_context(|| format!("checking Capture manifest {}", manifest_path.display()))?
+        {
+            manifests.push(read_json(&manifest_path)?);
+        }
+    }
+    manifests.sort_unstable_by(|left, right| left.capture_id.cmp(&right.capture_id));
+    Ok(manifests)
+}
+
+fn rebuild_search_index() -> Result<usize> {
+    let lock = lock_search_index()?;
+    let captures: Vec<IndexedCapture> = list_manifests()?
+        .into_iter()
+        .map(|manifest| {
+            let search_text = search_text_for(&manifest)?;
+            Ok(IndexedCapture {
+                capture_id: manifest.capture_id,
+                source: manifest.source,
+                policy: manifest.policy,
+                published_at: manifest.published_at,
+                proof: manifest.proof,
+                search_text,
+            })
+        })
+        .collect::<Result<_>>()?;
+    let count = captures.len();
+    write_search_index(&SearchIndex {
+        version: 1,
+        captures,
+    })?;
+    clear_index_degradation()?;
+    unlock_search_index(&lock)?;
+    Ok(count)
+}
+
+fn search_index_path() -> Result<PathBuf> {
+    Ok(repository_dir()?.join("index.json"))
+}
+
+fn lock_search_index() -> Result<File> {
+    let directory = repository_dir()?;
+    fs::create_dir_all(&directory)
+        .with_context(|| format!("creating search Index directory {}", directory.display()))?;
+    let path = directory.join("index.lock");
+    let file = OpenOptions::new()
+        .create(true)
+        .truncate(false)
+        .write(true)
+        .open(&path)
+        .with_context(|| format!("opening search Index lock {}", path.display()))?;
+    file.lock_exclusive().context("locking search Index")?;
+    Ok(file)
+}
+
+fn unlock_search_index(file: &File) -> Result<()> {
+    FileExt::unlock(file).context("unlocking search Index")
+}
+
+fn write_search_index(index: &SearchIndex) -> Result<()> {
+    let path = search_index_path()?;
+    let temporary = path.with_file_name(format!(".index-{}.tmp", unique_id()));
+    let data = serde_json::to_vec_pretty(index).context("serializing search Index")?;
+    fs::write(&temporary, data)
+        .with_context(|| format!("writing search Index {}", temporary.display()))?;
+    fs::rename(&temporary, &path)
+        .with_context(|| format!("publishing search Index {}", path.display()))
+}
+
+fn record_index_degradation(error: &anyhow::Error) {
+    let result = (|| -> Result<()> {
+        let directory = repository_dir()?;
+        fs::create_dir_all(&directory)
+            .with_context(|| format!("creating Index status directory {}", directory.display()))?;
+        write_json(
+            &index_status_path()?,
+            &AgentError {
+                error: StructuredError {
+                    code: "index_degraded".to_string(),
+                    message: format!("{error:#}"),
+                },
+            },
+        )
+    })();
+    drop(result);
+}
+
+fn clear_index_degradation() -> Result<()> {
+    let path = index_status_path()?;
+    if path
+        .try_exists()
+        .with_context(|| format!("checking Index status {}", path.display()))?
+    {
+        fs::remove_file(&path)
+            .with_context(|| format!("clearing Index status {}", path.display()))?;
+    }
+    Ok(())
+}
+
+fn read_index_degradation() -> Result<Option<StructuredError>> {
+    let path = index_status_path()?;
+    if !path
+        .try_exists()
+        .with_context(|| format!("checking Index status {}", path.display()))?
+    {
+        return Ok(None);
+    }
+    let status: AgentError = read_json(&path)?;
+    Ok(Some(status.error))
+}
+
+fn index_status_path() -> Result<PathBuf> {
+    Ok(repository_dir()?.join("index-status.json"))
+}
+
+fn snapshot_for(manifests: &[Manifest]) -> Result<String> {
+    let data = serde_json::to_vec(manifests).context("serializing Capture snapshot")?;
+    Ok(sha256_bytes(&data))
+}
+
+fn search_text_for(manifest: &Manifest) -> Result<String> {
+    if !is_text_mime(&manifest.proof.mime) {
+        return Ok(String::new());
+    }
+    let path = captures_dir()?
+        .join(&manifest.capture_id)
+        .join(&manifest.proof.path);
+    let file =
+        File::open(&path).with_context(|| format!("opening text artifact {}", path.display()))?;
+    let mut bytes = Vec::new();
+    file.take(u64::try_from(MAX_READ_LENGTH).context("converting Index text limit")?)
+        .read_to_end(&mut bytes)
+        .with_context(|| format!("reading text artifact {}", path.display()))?;
+    Ok(String::from_utf8(bytes).unwrap_or_default())
+}
+
+fn summary_for(manifest: &Manifest) -> CaptureSummary {
+    CaptureSummary {
+        capture_id: manifest.capture_id.clone(),
+        source: manifest.source.clone(),
+        published_at: manifest.published_at,
+        reference: reference_for(manifest),
+    }
+}
+
+fn reference_for(manifest: &Manifest) -> Reference {
+    Reference {
+        capture_id: manifest.capture_id.clone(),
+        artifact_id: manifest.proof.artifact_id.clone(),
+        sha256: manifest.proof.sha256.clone(),
+        locator: None,
+    }
+}
+
+fn encode_cursor(cursor: &Cursor) -> Result<String> {
+    let encoded = serde_json::to_vec(cursor).context("serializing pagination cursor")?;
+    let mut hex = String::with_capacity(encoded.len().saturating_mul(2));
+    for byte in encoded {
+        FmtWrite::write_fmt(&mut hex, format_args!("{byte:02x}"))
+            .context("encoding pagination cursor")?;
+    }
+    Ok(format!("v1-{hex}"))
+}
+
+fn decode_cursor(cursor: &str) -> Result<Cursor> {
+    let encoded = cursor
+        .strip_prefix("v1-")
+        .context("invalid pagination cursor")?;
+    if encoded.is_empty() || encoded.len() % 2 != 0 {
+        bail!("invalid pagination cursor");
+    }
+    let bytes = encoded
+        .as_bytes()
+        .chunks_exact(2)
+        .map(|pair| {
+            std::str::from_utf8(pair)
+                .context("invalid pagination cursor")
+                .and_then(|hex| u8::from_str_radix(hex, 16).context("invalid pagination cursor"))
+        })
+        .collect::<Result<Vec<_>>>()?;
+    serde_json::from_slice(&bytes).context("invalid pagination cursor")
+}
+
+fn is_text_mime(mime: &str) -> bool {
+    mime.starts_with("text/") || matches!(mime, "application/json" | "application/xml")
+}
+
+fn mime_for_source(source: &Path) -> &'static str {
+    match source.extension().and_then(|extension| extension.to_str()) {
+        Some("txt" | "md" | "csv" | "log") => "text/plain",
+        Some("json") => "application/json",
+        Some("xml") => "application/xml",
+        _ => "application/octet-stream",
+    }
 }
 
 fn reconcile_interrupted(mut job: Job) -> Result<Job> {
