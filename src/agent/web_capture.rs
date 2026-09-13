@@ -2,8 +2,11 @@ use std::fs;
 use std::path::Path;
 use std::time::{Duration, UNIX_EPOCH};
 
-use anyhow::{Context, Result};
+use anyhow::{Context, Result, bail};
 use serde_json::json;
+use url::Url;
+
+pub(super) const FINAL_URL_CYCLE: &str = "web_final_url_cycle";
 
 use super::{
     Acquisition, AcquisitionResult, Discovery, Extraction, Job, Locator, Manifest, PreparedCapture,
@@ -14,6 +17,7 @@ use super::{
 pub(super) struct WebAcquisition<'a> {
     pub(super) job: &'a Job,
     pub(super) url: &'a str,
+    pub(super) forbidden_final_urls: &'a [String],
 }
 
 impl Acquisition for WebAcquisition<'_> {
@@ -49,6 +53,16 @@ impl Acquisition for WebAcquisition<'_> {
             crate::web::Capture::Completed(provenance) => provenance,
             crate::web::Capture::Cancelled => return Ok(AcquisitionResult::Cancelled),
         };
+        let mut final_url =
+            Url::parse(&provenance.final_url).context("parsing rendered final URL")?;
+        final_url.set_fragment(None);
+        if self
+            .forbidden_final_urls
+            .iter()
+            .any(|ancestor| ancestor == final_url.as_str())
+        {
+            bail!(FINAL_URL_CYCLE);
+        }
         if read_job(&self.job.id)?.state == "cancelled" {
             return Ok(AcquisitionResult::Cancelled);
         }
@@ -84,12 +98,20 @@ impl Acquisition for WebAcquisition<'_> {
             artifacts,
             discoveries,
             remote_provenance: Some(RemoteProvenance {
-                requested_url: self.url.to_string(),
+                requested_url: if provenance.initial_url.is_empty() {
+                    self.url.to_string()
+                } else {
+                    provenance.initial_url.clone()
+                },
                 final_url: provenance.final_url.clone(),
                 mime: "text/html".to_string(),
                 sha256: proof_hash,
                 size_bytes: proof_size,
-                redirect_chain: vec![self.url.to_string(), provenance.final_url],
+                redirect_chain: if provenance.redirect_chain.is_empty() {
+                    vec![self.url.to_string(), provenance.final_url]
+                } else {
+                    provenance.redirect_chain
+                },
             }),
         };
         Ok(AcquisitionResult::Ready(PreparedCapture::new(

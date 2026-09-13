@@ -20,7 +20,11 @@ use crate::resource::directory_size;
 
 #[derive(Debug, Deserialize)]
 pub struct Provenance {
+    #[serde(default)]
+    pub initial_url: String,
     pub final_url: String,
+    #[serde(default)]
+    pub redirect_chain: Vec<String>,
 }
 
 pub enum Capture {

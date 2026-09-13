@@ -986,6 +986,13 @@ fn safe_web_publishes_a_portable_capture() {
         "proof-dom"
     );
     assert_eq!(capture["manifest"]["discoveries"][0]["order"], 0);
+    let provenance = &capture["manifest"]["remote_provenance"];
+    assert_eq!(provenance["requested_url"], "https://93.184.216.34/");
+    assert_eq!(provenance["final_url"], "https://93.184.216.34/");
+    assert_eq!(provenance["mime"], "text/html");
+    assert!(provenance["sha256"].is_string());
+    assert!(provenance["size_bytes"].is_u64());
+    assert!(provenance["redirect_chain"].is_array());
     env.command()
         .args(["capture", "search", "preuve"])
         .assert()

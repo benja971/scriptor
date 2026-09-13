@@ -113,7 +113,7 @@ export const render = async (args, dependencies = {}) => {
     browser = await launchBrowser(browserName, proxy.address);
     const context = await browser.newContext({ serviceWorkers: "block", viewport: { width: 1280, height: 720 }, permissions: [] });
     const routeRejection = await protectContext(context, assertPublicUrl); const page = await context.newPage();
-    try { await page.goto(initialUrl, { waitUntil: "networkidle", timeout: 30_000 }); } catch (error) {
+    let navigation; try { navigation = await page.goto(initialUrl, { waitUntil: "networkidle", timeout: 30_000 }); } catch (error) {
       const rejection = routeRejection() ?? proxy.failure();
       if (rejection) throw rejection;
       throw error;
@@ -126,7 +126,7 @@ export const render = async (args, dependencies = {}) => {
       const findings = []; for (const node of document.querySelectorAll("img,audio,video,source,iframe,embed,object,a[href]")) { const attributes = node.tagName === "A" ? [node.getAttribute("href")] : [node.getAttribute("src"), node.getAttribute("data"), ...(node.getAttribute("srcset") ?? "").split(",").map((entry) => entry.trim().split(/\s+/)[0])]; for (const raw of attributes.filter(Boolean)) { const url = new URL(raw, document.baseURI).href; if (node.tagName !== "A" || extensions.test(new URL(url).pathname)) findings.push({ parent_locator: { kind: "url", value: document.baseURI }, locator: { kind: "css-selector", value: cssPath(node) }, url, order: findings.length, status: "inventoried", reason: node.tagName === "A" ? "linked_document" : "embedded_content", ...(node.tagName === "IFRAME" ? { kind: "web" } : {}) }); } } return [document.documentElement.outerHTML, text, findings];
     });
     await writeBudgeted(join(outputDir, "proofs/dom.html"), dom); await writeBudgeted(join(outputDir, "extractions/page.md"), markdown); await writeBudgeted(join(outputDir, "discoveries.json"), JSON.stringify(discoveries));
-    await writeBudgeted(join(outputDir, "proofs/screenshot.png"), await page.screenshot({ type: "png" })); await writeBudgeted(join(outputDir, "provenance.json"), JSON.stringify({ initial_url: initialUrl, final_url: page.url(), browser: browserName }));
+    const redirects = []; for (let request = navigation?.request(); request; request = request.redirectedFrom()) redirects.unshift(request.url()); await writeBudgeted(join(outputDir, "proofs/screenshot.png"), await page.screenshot({ type: "png" })); await writeBudgeted(join(outputDir, "provenance.json"), JSON.stringify({ initial_url: initialUrl, final_url: page.url(), redirect_chain: redirects, browser: browserName }));
   } finally { if (browser) await browser.close(); await new Promise((resolve) => proxy.server.close(resolve)); }
 };
 if (process.argv[1] && fileURLToPath(import.meta.url) === process.argv[1]) { try { await render(process.argv.slice(2)); } catch (error) { process.stderr.write(`${error instanceof Error ? error.message : String(error)}\n`); process.exitCode = 1; } }

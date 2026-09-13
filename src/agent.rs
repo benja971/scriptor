@@ -787,7 +787,16 @@ fn resolve_discoveries(job: &Job, parent_capture_id: &str) -> Result<()> {
             ))
             .context("calculating discovery resolution deadline")?;
         if discovery.kind.as_deref() == Some("web") {
-            match publish_web_discovery(job, &discovery, &mut checkpoint.queue)? {
+            let publication = match publish_web_discovery(job, &discovery, &mut checkpoint.queue)? {
+                WebDiscoveryPublication::Published(publication) => publication,
+                WebDiscoveryPublication::Cycle => {
+                    append_discovery_event(parent_capture_id, &job.id, &discovery, "cycle", None)?;
+                    partial = true;
+                    persist_resolution_progress(&job.id, &mut checkpoint, &discovery, None)?;
+                    continue;
+                }
+            };
+            match publication {
                 Publication::Published {
                     capture_id,
                     partial: child_partial,
@@ -885,11 +894,29 @@ fn resolve_discoveries(job: &Job, parent_capture_id: &str) -> Result<()> {
                     )?;
                     cleanup_binary_staging(&staging)?;
                     match publication {
-                        Publication::Published {
+                        WebDiscoveryPublication::Cycle => {
+                            append_discovery_event(
+                                parent_capture_id,
+                                &job.id,
+                                &discovery,
+                                "cycle",
+                                Some(
+                                    json!({"requested_url": discovery.source, "final_url": acquired.final_url}),
+                                ),
+                            )?;
+                            partial = true;
+                            persist_resolution_progress(
+                                &job.id,
+                                &mut checkpoint,
+                                &discovery,
+                                None,
+                            )?;
+                        }
+                        WebDiscoveryPublication::Published(Publication::Published {
                             capture_id,
                             partial: child_partial,
                             reused,
-                        } => {
+                        }) => {
                             append_discovery_event(
                                 parent_capture_id,
                                 &job.id,
@@ -914,7 +941,7 @@ fn resolve_discoveries(job: &Job, parent_capture_id: &str) -> Result<()> {
                             )?;
                             partial |= child_partial;
                         }
-                        Publication::Cancelled => return Ok(()),
+                        WebDiscoveryPublication::Published(Publication::Cancelled) => return Ok(()),
                     }
                     sort_resolution_queue(&mut checkpoint.queue);
                     write_checkpoint(&job.id, &checkpoint)?;
@@ -930,7 +957,7 @@ fn resolve_discoveries(job: &Job, parent_capture_id: &str) -> Result<()> {
                             json!({"requested_url": discovery.source, "final_url": acquired.final_url, "mime": acquired.mime, "sha256": acquired.sha256, "size_bytes": acquired.size_bytes, "redirect_chain": acquired.redirect_chain}),
                         ),
                     )?;
-                    let _ = fs::remove_dir_all(staging.join("binary-acquisition"));
+                    cleanup_binary_staging(&staging)?;
                     partial = true;
                     persist_resolution_progress(&job.id, &mut checkpoint, &discovery, None)?;
                     continue;
@@ -1008,18 +1035,30 @@ fn resolve_discoveries(job: &Job, parent_capture_id: &str) -> Result<()> {
     complete_continuation_job(&job.id, child_capture_ids, partial)
 }
 
+enum WebDiscoveryPublication {
+    Published(Publication),
+    Cycle,
+}
+
 fn publish_web_discovery(
     job: &Job,
     discovery: &QueuedDiscovery,
     queue: &mut Vec<QueuedDiscovery>,
-) -> Result<Publication> {
-    let publication = publication::publish(
+) -> Result<WebDiscoveryPublication> {
+    let publication = match publication::publish(
         job,
         &web_capture::WebAcquisition {
             job,
             url: &discovery.source,
+            forbidden_final_urls: &discovery.ancestors,
         },
-    )?;
+    ) {
+        Ok(publication) => publication,
+        Err(error) if format!("{error:#}").contains(web_capture::FINAL_URL_CYCLE) => {
+            return Ok(WebDiscoveryPublication::Cycle);
+        }
+        Err(error) => return Err(error),
+    };
     if let Publication::Published { capture_id, .. } = &publication {
         let child: Manifest = read_json(&captures_dir()?.join(capture_id).join("manifest.json"))?;
         let mut ancestors = discovery.ancestors.clone();
@@ -1037,7 +1076,7 @@ fn publish_web_discovery(
             )
         }));
     }
-    Ok(publication)
+    Ok(WebDiscoveryPublication::Published(publication))
 }
 
 fn sort_resolution_queue(queue: &mut [QueuedDiscovery]) {
@@ -1219,9 +1258,14 @@ fn publish_capture(job: &Job) -> Result<Publication> {
                 source: &source,
             },
         ),
-        admission::Source::Web(url) => {
-            publication::publish(job, &web_capture::WebAcquisition { job, url: &url })
-        }
+        admission::Source::Web(url) => publication::publish(
+            job,
+            &web_capture::WebAcquisition {
+                job,
+                url: &url,
+                forbidden_final_urls: &[],
+            },
+        ),
     }
 }
 
@@ -3353,7 +3397,7 @@ fn print_json<T: Serialize>(value: &T) -> Result<()> {
 
 #[cfg(test)]
 mod continuation_tests {
-    use super::{binary_extension, unique_id};
+    use super::{QueuedDiscovery, binary_extension, sort_resolution_queue, unique_id};
     use std::fs;
 
     #[test]
@@ -3366,5 +3410,52 @@ mod continuation_tests {
             Some(Some("pdf"))
         );
         let _ = fs::remove_file(path);
+    }
+
+    #[test]
+    fn rejects_media_declared_only_by_content_type() {
+        let path = std::env::temp_dir().join(format!("scriptor-media-lie-{}", unique_id()));
+        assert!(fs::write(&path, b"not a media container").is_ok());
+        assert_eq!(binary_extension(&path, "video/mp4").ok(), Some(None));
+        assert_eq!(binary_extension(&path, "audio/mpeg").ok(), Some(None));
+        let _ = fs::remove_file(path);
+    }
+
+    #[test]
+    fn orders_nested_discoveries_breadth_first() {
+        let mut queue = vec![
+            QueuedDiscovery {
+                discovery_id: "deep".to_string(),
+                source: "https://example.test/deep".to_string(),
+                depth: 2,
+                order: 0,
+                ancestors: Vec::new(),
+                kind: None,
+            },
+            QueuedDiscovery {
+                discovery_id: "second".to_string(),
+                source: "https://example.test/second".to_string(),
+                depth: 1,
+                order: 1,
+                ancestors: Vec::new(),
+                kind: None,
+            },
+            QueuedDiscovery {
+                discovery_id: "first".to_string(),
+                source: "https://example.test/first".to_string(),
+                depth: 1,
+                order: 0,
+                ancestors: Vec::new(),
+                kind: None,
+            },
+        ];
+        sort_resolution_queue(&mut queue);
+        assert_eq!(
+            queue
+                .iter()
+                .map(|item| item.discovery_id.as_str())
+                .collect::<Vec<_>>(),
+            vec!["first", "second", "deep"]
+        );
     }
 }
