@@ -1,6 +1,5 @@
 use std::ffi::OsString;
 use std::fmt::Write as FmtWrite;
-use std::fmt::{Display, Formatter};
 use std::fs::{self, File, OpenOptions};
 use std::io::{BufReader, Read, Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
@@ -16,11 +15,18 @@ use serde_json::{Value, json};
 use sha2::{Digest, Sha256};
 
 use crate::config::Config;
-use crate::resource::{CaptureBudget, directory_size};
+use crate::resource::CaptureBudget;
 use crate::unique_id::unique_id;
 use crate::{audio, frames, transcribe};
 
+mod admission;
+mod error;
+mod publication;
 mod web_capture;
+
+use error::CodedError;
+pub use error::{AgentErrorCode, coded_error};
+use publication::{Acquisition, AcquisitionResult, PreparedCapture, Publication};
 
 const POLICY_NAME: &str = "safe-local@1";
 const DEFAULT_PAGE_LIMIT: usize = 20;
@@ -169,28 +175,6 @@ struct Job {
 struct StructuredError {
     code: String,
     message: String,
-}
-
-#[derive(Debug)]
-pub struct CodedError {
-    code: &'static str,
-    message: String,
-}
-
-impl Display for CodedError {
-    fn fmt(&self, formatter: &mut Formatter<'_>) -> std::fmt::Result {
-        formatter.write_str(&self.message)
-    }
-}
-
-impl std::error::Error for CodedError {}
-
-pub fn coded_error(code: &'static str, message: impl Into<String>) -> anyhow::Error {
-    CodedError {
-        code,
-        message: message.into(),
-    }
-    .into()
 }
 
 #[derive(Serialize)]
@@ -423,37 +407,6 @@ struct ReadRequest {
     expected_sha256: Option<String>,
 }
 
-enum Publication {
-    Published { capture_id: String, partial: bool },
-    Cancelled,
-}
-
-struct StagingGuard {
-    path: PathBuf,
-    published: bool,
-}
-
-impl StagingGuard {
-    const fn new(path: PathBuf) -> Self {
-        Self {
-            path,
-            published: false,
-        }
-    }
-
-    const fn publish(&mut self) {
-        self.published = true;
-    }
-}
-
-impl Drop for StagingGuard {
-    fn drop(&mut self) {
-        if !self.published {
-            let _ = fs::remove_dir_all(&self.path);
-        }
-    }
-}
-
 pub fn is_agent_command(arguments: &[OsString]) -> bool {
     arguments.get(1).is_some_and(|argument| {
         matches!(
@@ -574,22 +527,7 @@ fn run_job_command(command: JobCommand) -> Result<()> {
 
 fn create_capture_job(source: &Path, policy_name: &str) -> Result<()> {
     let policy = policy_for(policy_name)?;
-    if policy.snapshot.allows_remote_calls {
-        crate::binary::ensure_present("scriptor-page-renderer")
-            .context("safe-web@1 requires the Nix PageRenderer runtime")?;
-    }
-    let source = if policy.snapshot.allows_remote_calls {
-        let url = source.to_str().context("Web Source must be valid UTF-8")?;
-        url.to_string()
-    } else {
-        let source = source
-            .canonicalize()
-            .with_context(|| format!("resolving local Source {}", source.display()))?;
-        if !source.is_file() {
-            bail!("local Source must be a regular file: {}", source.display());
-        }
-        source.to_string_lossy().into_owned()
-    };
+    let source = admission::admit(source, &policy)?.into_job_source();
 
     let now = now_secs();
     let job = Job {
@@ -645,109 +583,141 @@ fn run_worker(job_id: &str) -> Result<()> {
 }
 
 fn publish_capture(job: &Job) -> Result<Publication> {
-    if job.policy.snapshot.allows_remote_calls {
-        return web_capture::publish(job);
+    match admission::admit_job(job)? {
+        admission::Source::Local(source) => publication::publish(
+            job,
+            &LocalAcquisition {
+                job,
+                source: &source,
+            },
+        ),
+        admission::Source::Web(url) => {
+            publication::publish(job, &web_capture::WebAcquisition { job, url: &url })
+        }
     }
-    let source = Path::new(&job.source);
-    validate_local_acquisition(job)?;
-    let metadata = fs::metadata(source)
-        .with_context(|| format!("reading local Source metadata {}", source.display()))?;
-    if metadata.len() > job.policy.snapshot.limits.disk_byte_limit {
-        bail!("local Source exceeds safe-local@1 disk budget");
-    }
-    let capture_id = format!("capture-{}", unique_id());
-    let captures = captures_dir()?;
-    let staging = captures.join(format!(".{capture_id}"));
-    let final_dir = captures.join(&capture_id);
-    fs::create_dir_all(staging.join("proofs"))
-        .with_context(|| format!("creating Capture staging directory {}", staging.display()))?;
-    let mut staging_guard = StagingGuard::new(staging.clone());
-    let is_cancelled = || Ok(read_job(&job.id)?.state == "cancelled");
-    let budget = CaptureBudget::new(
-        &staging,
-        job.created_at,
-        job.policy.snapshot.limits.duration_limit_secs,
-        job.policy.snapshot.limits.disk_byte_limit,
-    )
-    .with_cancellation(&is_cancelled);
-    let source_hash = sha256_file_limited(source, &budget)?;
-    let _capture_lock = lock_capture_key(&source_hash)?;
-    if job.policy.snapshot.duplicate_mode == "reuse"
-        && let Some(capture_id) = find_capture_by_source_hash(&source_hash)?
-    {
-        fs::remove_dir_all(&staging).context("discarding duplicate Capture staging directory")?;
-        return Ok(Publication::Published {
-            capture_id,
-            partial: false,
-        });
-    }
-    let proof_path = staging.join("proofs").join("source");
-    copy_file_limited(source, &proof_path, &budget)
-        .with_context(|| format!("copying local Source {}", source.display()))?;
-    let proof_created_at = now_secs();
-    if read_job(&job.id)?.state == "cancelled" {
-        fs::remove_dir_all(&staging).context("discarding cancelled Capture staging directory")?;
-        return Ok(Publication::Cancelled);
-    }
-    let proof_size = fs::metadata(&proof_path)
-        .context("reading copied Proof metadata")?
-        .len();
-    let mut manifest = Manifest {
-        capture_id: capture_id.clone(),
-        source: SourceIdentity {
-            locator: job.source.clone(),
-            sha256: source_hash,
-        },
-        policy: job.policy.clone(),
-        published_at: now_secs(),
-        proof: Proof {
-            artifact_id: "proof-source".to_string(),
-            path: "proofs/source".to_string(),
-            mime: mime_for_source(source).to_string(),
-            sha256: sha256_file_limited(&proof_path, &budget)?,
-            size_bytes: proof_size,
-            locator: Locator::File,
-            created_at: proof_created_at,
-        },
-        extractions: Vec::new(),
-        capabilities: Vec::new(),
-        artifacts: Vec::new(),
-        discoveries: Vec::new(),
-    };
-    if is_media_source(source) {
-        capture_local_media(job, &proof_path, &staging, &mut manifest, &budget);
-    } else if is_document_source(source) {
-        capture_local_document(job, &proof_path, &staging, &mut manifest, &budget);
-    }
-    if budget.is_cancelled()? {
-        return Ok(Publication::Cancelled);
-    }
-    let ledger_event = LedgerEvent {
-        event: "capture_published".to_string(),
-        at: now_secs(),
-        job_id: job.id.clone(),
-    };
-    write_capture_metadata(&staging, &manifest, &ledger_event, &budget)?;
-    fs::rename(&staging, &final_dir).with_context(|| format!("publishing Capture {capture_id}"))?;
-    staging_guard.publish();
-    if let Err(error) = rebuild_search_index() {
-        record_index_degradation(&error);
-    }
-    Ok(Publication::Published {
-        capture_id,
-        partial: manifest
-            .capabilities
-            .iter()
-            .any(|capability| capability.state != "succeeded"),
-    })
 }
 
-fn validate_local_acquisition(job: &Job) -> Result<()> {
-    let limits = &job.policy.snapshot.limits;
-    if 1 > limits.source_limit {
-        bail!("local Source exceeds safe-local@1 acquisition budget");
+struct LocalAcquisition<'a> {
+    job: &'a Job,
+    source: &'a Path,
+}
+
+impl LocalAcquisition<'_> {
+    fn cancelled<T>(budget: &CaptureBudget<'_>, result: Result<T>) -> Result<AcquisitionResult<T>> {
+        match result {
+            Ok(value) => Ok(AcquisitionResult::Ready(value)),
+            Err(_error) if budget.is_cancelled()? => Ok(AcquisitionResult::Cancelled),
+            Err(error) => Err(error),
+        }
     }
-    Ok(())
+}
+
+impl Acquisition for LocalAcquisition<'_> {
+    fn source_hash(&self, staging: &Path) -> Result<AcquisitionResult<String>> {
+        if 1 > self.job.policy.snapshot.limits.source_limit {
+            bail!("local Source exceeds safe-local@1 acquisition budget");
+        }
+        let metadata = fs::metadata(self.source)
+            .with_context(|| format!("reading local Source metadata {}", self.source.display()))?;
+        if metadata.len() > self.job.policy.snapshot.limits.disk_byte_limit {
+            bail!("local Source exceeds safe-local@1 disk budget");
+        }
+        let is_cancelled = || Ok(read_job(&self.job.id)?.state == "cancelled");
+        let budget = CaptureBudget::new(
+            staging,
+            self.job.created_at,
+            self.job.policy.snapshot.limits.duration_limit_secs,
+            self.job.policy.snapshot.limits.disk_byte_limit,
+        )
+        .with_cancellation(&is_cancelled);
+        Self::cancelled(&budget, sha256_file_limited(self.source, &budget))
+    }
+
+    fn acquire(
+        &self,
+        capture: &publication::StagedCapture,
+        source_hash: &str,
+    ) -> Result<AcquisitionResult<PreparedCapture>> {
+        fs::create_dir_all(capture.staging().join("proofs")).with_context(|| {
+            format!(
+                "creating Capture staging directory {}",
+                capture.staging().display()
+            )
+        })?;
+        let is_cancelled = || Ok(read_job(&self.job.id)?.state == "cancelled");
+        let budget = CaptureBudget::new(
+            capture.staging(),
+            self.job.created_at,
+            self.job.policy.snapshot.limits.duration_limit_secs,
+            self.job.policy.snapshot.limits.disk_byte_limit,
+        )
+        .with_cancellation(&is_cancelled);
+        let proof_path = capture.staging().join("proofs/source");
+        let copy = copy_file_limited(self.source, &proof_path, &budget)
+            .with_context(|| format!("copying local Source {}", self.source.display()));
+        match Self::cancelled(&budget, copy)? {
+            AcquisitionResult::Ready(()) => {}
+            AcquisitionResult::Cancelled => return Ok(AcquisitionResult::Cancelled),
+        }
+        let proof_created_at = now_secs();
+        let proof_size = fs::metadata(&proof_path)
+            .context("reading copied Proof metadata")?
+            .len();
+        let proof_hash = match Self::cancelled(&budget, sha256_file_limited(&proof_path, &budget))?
+        {
+            AcquisitionResult::Ready(hash) => hash,
+            AcquisitionResult::Cancelled => return Ok(AcquisitionResult::Cancelled),
+        };
+        let mut manifest = Manifest {
+            capture_id: capture.capture_id().to_string(),
+            source: SourceIdentity {
+                locator: self.job.source.clone(),
+                sha256: source_hash.to_string(),
+            },
+            policy: self.job.policy.clone(),
+            published_at: now_secs(),
+            proof: Proof {
+                artifact_id: "proof-source".to_string(),
+                path: "proofs/source".to_string(),
+                mime: mime_for_source(self.source).to_string(),
+                sha256: proof_hash,
+                size_bytes: proof_size,
+                locator: Locator::File,
+                created_at: proof_created_at,
+            },
+            extractions: Vec::new(),
+            capabilities: Vec::new(),
+            artifacts: Vec::new(),
+            discoveries: Vec::new(),
+        };
+        if is_media_source(self.source) {
+            capture_local_media(
+                self.job,
+                &proof_path,
+                capture.staging(),
+                &mut manifest,
+                &budget,
+            );
+        } else if is_document_source(self.source) {
+            capture_local_document(
+                self.job,
+                &proof_path,
+                capture.staging(),
+                &mut manifest,
+                &budget,
+            );
+        }
+        if budget.is_cancelled()? {
+            return Ok(AcquisitionResult::Cancelled);
+        }
+        let partial = manifest
+            .capabilities
+            .iter()
+            .any(|capability| capability.state != "succeeded");
+        Ok(AcquisitionResult::Ready(PreparedCapture::new(
+            manifest, partial,
+        )))
+    }
 }
 
 fn is_media_source(source: &Path) -> bool {
@@ -1774,7 +1744,11 @@ fn fail_job(job_id: &str, error: &anyhow::Error) -> Result<()> {
 fn error_code(error: &anyhow::Error) -> String {
     error
         .chain()
-        .find_map(|cause| cause.downcast_ref::<CodedError>().map(|error| error.code))
+        .find_map(|cause| {
+            cause
+                .downcast_ref::<CodedError>()
+                .map(|error| error.code.as_str())
+        })
         .unwrap_or("capture_failed")
         .to_string()
 }
@@ -2565,26 +2539,6 @@ fn write_json<T: Serialize>(path: &Path, value: &T) -> Result<()> {
     let data = serde_json::to_vec_pretty(value).context("serializing JSON")?;
     fs::write(&temporary, data).with_context(|| format!("writing {}", temporary.display()))?;
     fs::rename(&temporary, path).with_context(|| format!("publishing JSON {}", path.display()))
-}
-
-fn write_capture_metadata(
-    staging: &Path,
-    manifest: &Manifest,
-    ledger_event: &LedgerEvent,
-    budget: &CaptureBudget<'_>,
-) -> Result<()> {
-    let manifest_data =
-        serde_json::to_vec_pretty(manifest).context("serializing Capture manifest")?;
-    let mut ledger_data = serde_json::to_vec(ledger_event).context("serializing Capture ledger")?;
-    ledger_data.push(b'\n');
-    let metadata_bytes = u64::try_from(manifest_data.len())
-        .context("converting Capture manifest size")?
-        .checked_add(u64::try_from(ledger_data.len()).context("converting Capture ledger size")?)
-        .context("summing Capture metadata size")?;
-    budget.check_disk_capacity_without_duration(metadata_bytes)?;
-    fs::write(staging.join("manifest.json"), manifest_data).context("writing Capture manifest")?;
-    fs::write(staging.join("ledger.jsonl"), ledger_data).context("writing Capture ledger")?;
-    budget.check_disk_capacity_without_duration(0)
 }
 
 fn read_json<T: for<'de> Deserialize<'de>>(path: &Path) -> Result<T> {

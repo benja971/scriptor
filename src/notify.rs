@@ -21,7 +21,11 @@ pub fn notify_failure(source: &str, log_path: &Path) -> Result<()> {
 
 /// Envoie une notification desktop native via `notify-send`.
 fn send(message: &str) -> Result<()> {
-    let status = Command::new("notify-send")
+    send_with(&mut Command::new("notify-send"), message)
+}
+
+fn send_with(command: &mut Command, message: &str) -> Result<()> {
+    let status = command
         .arg(message)
         .status()
         .context("failed to launch notify-send")?;
@@ -35,59 +39,16 @@ fn send(message: &str) -> Result<()> {
 
 #[cfg(test)]
 mod tests {
-    use std::env;
-    use std::fs::{self, File};
-    use std::os::unix::fs::PermissionsExt;
+    use std::fs;
     use std::path::{Path, PathBuf};
-    use std::sync::Mutex;
+    use std::process::Command;
 
     use anyhow::{Context, Result};
     use assert_fs::TempDir;
 
-    use super::{notify_failure, notify_success};
+    use super::send_with;
 
-    /// Empêche les tests de cette table de modifier `PATH` en parallèle : la
-    /// mutation de variables d'environnement de process n'est pas
-    /// thread-safe, donc un seul test à la fois peut la faire.
-    static ENV_LOCK: Mutex<()> = Mutex::new(());
-
-    /// Restaure la valeur d'origine de `PATH` à la fin du test, y compris en
-    /// cas d'échec d'assertion.
-    struct PathOverrideGuard {
-        original: Option<String>,
-    }
-
-    impl PathOverrideGuard {
-        /// Remplace `PATH` par exactement `dir`, sans repli sur le `PATH`
-        /// d'origine : garantit qu'un `notify-send` réel installé ailleurs
-        /// sur la machine ne peut pas être trouvé pendant le test.
-        fn isolated_to(dir: &Path) -> Self {
-            let original = env::var("PATH").ok();
-            // SAFETY: protégé par ENV_LOCK (un seul test à la fois modifie
-            // PATH pour la durée de ce guard).
-            unsafe {
-                env::set_var("PATH", dir);
-            }
-            Self { original }
-        }
-    }
-
-    impl Drop for PathOverrideGuard {
-        fn drop(&mut self) {
-            // SAFETY: protégé par ENV_LOCK (un seul test à la fois modifie
-            // PATH pour la durée de ce guard).
-            unsafe {
-                match &self.original {
-                    Some(value) => env::set_var("PATH", value),
-                    None => env::remove_var("PATH"),
-                }
-            }
-        }
-    }
-
-    /// Installe un faux `notify-send` dans un dossier temporaire, qui écrit
-    /// les arguments reçus dans `captured-args.txt` (un argument par ligne).
-    fn install_fake_notify_send(dir: &TempDir) -> Result<PathBuf> {
+    fn install_fake_notify_send(dir: &TempDir) -> Result<(PathBuf, PathBuf)> {
         let script_path = dir.path().join("notify-send");
         let capture_path = dir.path().join("captured-args.txt");
         let script = format!(
@@ -95,29 +56,29 @@ mod tests {
             capture_path.display()
         );
         fs::write(&script_path, script).context("writing fake notify-send")?;
-        let mut perms = fs::metadata(&script_path)
-            .context("reading fake notify-send permissions")?
-            .permissions();
-        perms.set_mode(0o755);
-        fs::set_permissions(&script_path, perms).context("making fake notify-send executable")?;
-        File::open(&script_path)
-            .context("opening fake notify-send for synchronization")?
-            .sync_all()
-            .context("synchronizing fake notify-send")?;
-        Ok(capture_path)
+        Ok((script_path, capture_path))
+    }
+
+    fn fake_notify_send(script_path: &Path) -> Command {
+        let mut command = Command::new("sh");
+        command.arg(script_path);
+        command
     }
 
     #[test]
     #[allow(clippy::panic_in_result_fn)]
     fn notify_success_envoie_le_message_attendu() -> Result<()> {
-        let _lock = ENV_LOCK
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
         let dir = TempDir::new().context("creating temporary directory")?;
-        let capture_path = install_fake_notify_send(&dir)?;
-        let _guard = PathOverrideGuard::isolated_to(dir.path());
+        let (script_path, capture_path) = install_fake_notify_send(&dir)?;
+        let mut command = fake_notify_send(&script_path);
 
-        notify_success(Path::new("/home/user/video.txt"))?;
+        send_with(
+            &mut command,
+            &format!(
+                "Transcription terminée : {}",
+                Path::new("/home/user/video.txt").display()
+            ),
+        )?;
 
         let captured = fs::read_to_string(&capture_path).context("reading captured arguments")?;
         assert_eq!(
@@ -130,16 +91,16 @@ mod tests {
     #[test]
     #[allow(clippy::panic_in_result_fn)]
     fn notify_failure_envoie_le_message_attendu() -> Result<()> {
-        let _lock = ENV_LOCK
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
         let dir = TempDir::new().context("creating temporary directory")?;
-        let capture_path = install_fake_notify_send(&dir)?;
-        let _guard = PathOverrideGuard::isolated_to(dir.path());
+        let (script_path, capture_path) = install_fake_notify_send(&dir)?;
+        let mut command = fake_notify_send(&script_path);
 
-        notify_failure(
-            "https://example.com/video",
-            Path::new("/home/user/.cache/scriptor/logs/2026-09-06.log"),
+        send_with(
+            &mut command,
+            &format!(
+                "Échec transcription https://example.com/video : voir {}",
+                Path::new("/home/user/.cache/scriptor/logs/2026-09-06.log").display()
+            ),
         )?;
 
         let captured = fs::read_to_string(&capture_path).context("reading captured arguments")?;
@@ -153,13 +114,10 @@ mod tests {
     #[test]
     #[allow(clippy::panic_in_result_fn)]
     fn notify_success_echoue_si_notify_send_absent() -> Result<()> {
-        let _lock = ENV_LOCK
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
         let dir = TempDir::new().context("creating temporary directory")?;
-        let _guard = PathOverrideGuard::isolated_to(dir.path());
+        let mut command = Command::new(dir.path().join("notify-send-absent"));
 
-        let result = notify_success(Path::new("/home/user/video.txt"));
+        let result = send_with(&mut command, "message");
 
         assert!(result.is_err());
         Ok(())

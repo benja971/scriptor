@@ -13,6 +13,7 @@ use nix::unistd::Pid;
 use serde::Deserialize;
 use url::Url;
 
+use crate::agent::AgentErrorCode;
 use crate::resource::directory_size;
 
 #[derive(Debug, Deserialize)]
@@ -110,20 +111,11 @@ where
     Ok(Capture::Completed(provenance))
 }
 
-fn renderer_error_code(stderr: &str) -> Option<&'static str> {
-    [
-        "web_download_budget_exceeded",
-        "web_disk_budget_exceeded",
-        "web_port_refused",
-        "web_private_target_refused",
-        "web_renderer_firefox_unavailable",
-        "web_renderer_unknown",
-        "web_url_credentials_refused",
-        "web_url_scheme_refused",
-        "web_websocket_refused",
-    ]
-    .into_iter()
-    .find(|code| stderr.lines().any(|line| line.starts_with(code)))
+fn renderer_error_code(stderr: &str) -> Option<AgentErrorCode> {
+    stderr.lines().find_map(|line| {
+        let code = line.split_once(':').map_or(line, |(code, _)| code).trim();
+        AgentErrorCode::from_renderer_code(code)
+    })
 }
 
 fn terminate_process_group(child: &Child) -> Result<()> {
@@ -138,29 +130,29 @@ pub fn validate_public_url(value: &str) -> Result<()> {
     let url = Url::parse(value).with_context(|| format!("parsing Web URL `{value}`"))?;
     if !matches!(url.scheme(), "http" | "https") {
         return Err(crate::agent::coded_error(
-            "web_url_scheme_refused",
+            AgentErrorCode::UrlSchemeRefused,
             "only HTTP(S) URLs are permitted",
         ));
     }
     if !url.username().is_empty() || url.password().is_some() {
         return Err(crate::agent::coded_error(
-            "web_url_credentials_refused",
+            AgentErrorCode::UrlCredentialsRefused,
             "URLs with credentials are not permitted",
         ));
     }
-    let host = url
-        .host_str()
-        .ok_or_else(|| crate::agent::coded_error("web_url_host_refused", "URL has no host"))?;
+    let host = url.host_str().ok_or_else(|| {
+        crate::agent::coded_error(AgentErrorCode::UrlHostRefused, "URL has no host")
+    })?;
     if host.eq_ignore_ascii_case("localhost") || host.ends_with(".localhost") {
         return Err(crate::agent::coded_error(
-            "web_private_target_refused",
+            AgentErrorCode::PrivateTargetRefused,
             "localhost is not a public target",
         ));
     }
     if let Ok(ip) = host.parse::<IpAddr>() {
         if is_private_ip(ip) {
             return Err(crate::agent::coded_error(
-                "web_private_target_refused",
+                AgentErrorCode::PrivateTargetRefused,
                 format!("{ip} is not public"),
             ));
         }
@@ -170,21 +162,21 @@ pub fn validate_public_url(value: &str) -> Result<()> {
         .port_or_known_default()
         .context("resolving Web URL port")?;
     let addresses = (host, port).to_socket_addrs().map_err(|error| {
-        crate::agent::coded_error("web_dns_resolution_failed", error.to_string())
+        crate::agent::coded_error(AgentErrorCode::DnsResolutionFailed, error.to_string())
     })?;
     let mut found = false;
     for address in addresses {
         found = true;
         if is_private_ip(address.ip()) {
             return Err(crate::agent::coded_error(
-                "web_private_target_refused",
+                AgentErrorCode::PrivateTargetRefused,
                 format!("{host} resolves to a non-public address"),
             ));
         }
     }
     if !found {
         return Err(crate::agent::coded_error(
-            "web_dns_resolution_failed",
+            AgentErrorCode::DnsResolutionFailed,
             format!("{host} has no address"),
         ));
     }
@@ -236,6 +228,8 @@ fn ipv6_embedded_private(ip: Ipv6Addr) -> bool {
 mod tests {
     #![allow(clippy::expect_used)]
 
+    use crate::agent::AgentErrorCode;
+
     use super::{renderer_error_code, validate_public_url};
 
     #[test]
@@ -261,7 +255,11 @@ mod tests {
     fn preserves_machine_readable_renderer_refusals() {
         assert_eq!(
             renderer_error_code("web_private_target_refused\n"),
-            Some("web_private_target_refused")
+            Some(AgentErrorCode::PrivateTargetRefused)
+        );
+        assert_eq!(
+            renderer_error_code("web_renderer_chromium_unavailable: browser missing\n"),
+            Some(AgentErrorCode::RendererChromiumUnavailable)
         );
     }
 }
