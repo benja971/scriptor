@@ -888,6 +888,74 @@ fn web_capture_preserves_renderer_route_rejection_code() {
 }
 
 #[test]
+fn web_capture_concurrency_error_names_the_active_policy() {
+    let env = TestEnv::new("safe-web-concurrency");
+    write_executable(&env.bin_dir, "scriptor-page-renderer", SLOW_PAGE_RENDERER);
+
+    let create_job = || {
+        let output = env
+            .command()
+            .args([
+                "capture",
+                "https://93.184.216.34/",
+                "--policy",
+                "safe-web@1",
+            ])
+            .assert()
+            .success()
+            .get_output()
+            .stdout
+            .clone();
+        serde_json::from_slice::<Value>(&output).expect("Job JSON valide")["job"]["job_id"]
+            .as_str()
+            .expect("identifiant de Job")
+            .to_string()
+    };
+
+    let first_job = create_job();
+    let child_pid_path = env.xdg_data.join("scriptor-renderer-child.pid");
+    assert!(
+        wait_for_file(&child_pid_path, Duration::from_secs(5)),
+        "le premier renderer n'a pas démarré"
+    );
+    let second_job = create_job();
+    let second: Value = serde_json::from_slice(
+        &env.command()
+            .args(["job", "wait", &second_job, "--timeout-secs", "1"])
+            .assert()
+            .success()
+            .get_output()
+            .stdout,
+    )
+    .expect("Job JSON valide");
+    assert_eq!(second["state"], "running");
+
+    let rejected_job = create_job();
+    let rejected: Value = serde_json::from_slice(
+        &env.command()
+            .args(["job", "wait", &rejected_job, "--timeout-secs", "5"])
+            .assert()
+            .success()
+            .get_output()
+            .stdout,
+    )
+    .expect("Job JSON valide");
+    assert_eq!(rejected["state"], "failed");
+    assert_eq!(rejected["error"]["code"], "concurrency_limit_exceeded");
+    assert_eq!(
+        rejected["error"]["message"],
+        "safe-web@1 concurrency budget exceeded"
+    );
+
+    for job_id in [first_job, second_job] {
+        env.command()
+            .args(["job", "cancel", &job_id])
+            .assert()
+            .success();
+    }
+}
+
+#[test]
 fn cancelling_web_capture_stops_the_renderer_process_group() {
     let env = TestEnv::new("safe-web-cancel");
     write_executable(&env.bin_dir, "scriptor-page-renderer", SLOW_PAGE_RENDERER);

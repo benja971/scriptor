@@ -500,7 +500,10 @@ fn start_job(job_id: &str) -> Result<Option<Job>> {
         job.updated_at = now_secs();
         job.error = Some(StructuredError {
             code: "concurrency_limit_exceeded".to_string(),
-            message: "safe-local@1 concurrency budget exceeded".to_string(),
+            message: format!(
+                "{}@{} concurrency budget exceeded",
+                job.policy.id, job.policy.version
+            ),
         });
         write_job(&job)?;
         append_job_event(job_id, "failed")?;
