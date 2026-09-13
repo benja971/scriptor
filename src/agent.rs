@@ -399,15 +399,12 @@ fn publish_capture(job: &Job) -> Result<Publication> {
     if is_media_source(source) {
         capture_local_media(job, &proof_path, &staging, &mut manifest, &budget);
     }
-    write_json(&staging.join("manifest.json"), &manifest)?;
-    append_json_line(
-        &staging.join("ledger.jsonl"),
-        &LedgerEvent {
-            event: "capture_published".to_string(),
-            at: now_secs(),
-            job_id: job.id.clone(),
-        },
-    )?;
+    let ledger_event = LedgerEvent {
+        event: "capture_published".to_string(),
+        at: now_secs(),
+        job_id: job.id.clone(),
+    };
+    write_capture_metadata(&staging, &manifest, &ledger_event, &budget)?;
     fs::rename(&staging, &final_dir).with_context(|| format!("publishing Capture {capture_id}"))?;
     Ok(Publication::Published {
         capture_id,
@@ -1307,6 +1304,26 @@ fn write_json<T: Serialize>(path: &Path, value: &T) -> Result<()> {
     let data = serde_json::to_vec_pretty(value).context("serializing JSON")?;
     fs::write(&temporary, data).with_context(|| format!("writing {}", temporary.display()))?;
     fs::rename(&temporary, path).with_context(|| format!("publishing JSON {}", path.display()))
+}
+
+fn write_capture_metadata(
+    staging: &Path,
+    manifest: &Manifest,
+    ledger_event: &LedgerEvent,
+    budget: &CaptureBudget<'_>,
+) -> Result<()> {
+    let manifest_data =
+        serde_json::to_vec_pretty(manifest).context("serializing Capture manifest")?;
+    let mut ledger_data = serde_json::to_vec(ledger_event).context("serializing Capture ledger")?;
+    ledger_data.push(b'\n');
+    let metadata_bytes = u64::try_from(manifest_data.len())
+        .context("converting Capture manifest size")?
+        .checked_add(u64::try_from(ledger_data.len()).context("converting Capture ledger size")?)
+        .context("summing Capture metadata size")?;
+    budget.check_disk_capacity_without_duration(metadata_bytes)?;
+    fs::write(staging.join("manifest.json"), manifest_data).context("writing Capture manifest")?;
+    fs::write(staging.join("ledger.jsonl"), ledger_data).context("writing Capture ledger")?;
+    budget.check_disk_capacity_without_duration(0)
 }
 
 fn read_json<T: for<'de> Deserialize<'de>>(path: &Path) -> Result<T> {

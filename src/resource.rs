@@ -48,6 +48,10 @@ impl<'a> CaptureBudget<'a> {
 
     pub fn check_disk_capacity(&self, additional_bytes: u64) -> Result<()> {
         self.check()?;
+        self.check_disk_capacity_without_duration(additional_bytes)
+    }
+
+    pub fn check_disk_capacity_without_duration(&self, additional_bytes: u64) -> Result<()> {
         let used_bytes = directory_size(self.root)?;
         let total_bytes = used_bytes
             .checked_add(additional_bytes)

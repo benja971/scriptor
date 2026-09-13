@@ -782,6 +782,38 @@ fn capture_budget_failure_is_reported_as_a_structured_job_error() {
 }
 
 #[test]
+fn capture_rejects_a_proof_that_leaves_no_disk_budget_for_its_metadata() {
+    let env = TestEnv::new("capture-metadata-budget");
+    let source = env.work_dir.join("source.bin");
+    fs::write(&source, b"x").expect("écriture de la Source");
+    let job_id = "job-2";
+    let job_path = write_capture_worker_job(&env, job_id, &source, &[], 30);
+    let mut job: Value = serde_json::from_slice(&fs::read(&job_path).expect("lecture du Job"))
+        .expect("Job JSON valide");
+    job["policy"]["snapshot"]["limits"]["max_disk_bytes"] = Value::from(1_u64);
+    fs::write(
+        &job_path,
+        serde_json::to_vec(&job).expect("sérialisation du Job modifié"),
+    )
+    .expect("écriture du Job modifié");
+
+    env.command()
+        .args(["capture-worker", "--job-id", job_id])
+        .assert()
+        .success();
+
+    let finished: Value =
+        serde_json::from_slice(&fs::read(job_path).expect("lecture du Job terminé"))
+            .expect("Job JSON valide");
+    assert_eq!(finished["state"], "failed");
+    assert!(
+        finished["error"]["message"]
+            .as_str()
+            .is_some_and(|message| message.contains("disk budget"))
+    );
+}
+
+#[test]
 fn capture_stops_a_running_provider_at_its_duration_budget_before_starting_frames() {
     let env = TestEnv::new("capture-provider-duration-budget");
     env.write_config(&env.work_dir.join("out"));
