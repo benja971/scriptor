@@ -1,5 +1,6 @@
 use std::ffi::OsString;
 use std::fmt::Write as FmtWrite;
+use std::fmt::{Display, Formatter};
 use std::fs::{self, File, OpenOptions};
 use std::io::{BufReader, Read, Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
@@ -168,6 +169,28 @@ struct StructuredError {
     message: String,
 }
 
+#[derive(Debug)]
+pub struct CodedError {
+    code: &'static str,
+    message: String,
+}
+
+impl Display for CodedError {
+    fn fmt(&self, formatter: &mut Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str(&self.message)
+    }
+}
+
+impl std::error::Error for CodedError {}
+
+pub fn coded_error(code: &'static str, message: impl Into<String>) -> anyhow::Error {
+    CodedError {
+        code,
+        message: message.into(),
+    }
+    .into()
+}
+
 #[derive(Serialize)]
 struct CreatedJob<'a> {
     job: &'a Job,
@@ -246,6 +269,7 @@ struct ProviderDependency {
 #[serde(tag = "kind", rename_all = "kebab-case")]
 enum Locator {
     File,
+    Url { value: String },
     MediaTimestamp { timestamps_secs: Vec<f64> },
     PdfPages { first_page: u32, last_page: u32 },
     ImageRegions { regions: Vec<ImageRegion> },
@@ -1653,23 +1677,15 @@ fn publish_web_capture(job: &Job) -> Result<Publication> {
         return Ok(Publication::Cancelled);
     }
     let artifacts = [
-        ("proof-dom", "proofs/dom.html", "text/html"),
         ("proof-screenshot", "proofs/screenshot.png", "image/png"),
-        (
-            "extraction-markdown",
-            "extractions/page.md",
-            "text/markdown",
-        ),
         ("discoveries", "discoveries.json", "application/json"),
         ("provenance", "provenance.json", "application/json"),
     ]
     .into_iter()
     .map(|(artifact_id, path, mime)| proof_for(&staging, artifact_id, path, mime))
     .collect::<Result<Vec<_>>>()?;
-    let proof = artifacts
-        .first()
-        .cloned()
-        .context("page renderer produced no DOM Proof")?;
+    let proof = proof_for(&staging, "proof-dom", "proofs/dom.html", "text/html")?;
+    let extraction = web_markdown_extraction(&staging, &proof, &provenance.final_url)?;
     let manifest = Manifest {
         capture_id: capture_id.clone(),
         source: SourceIdentity {
@@ -1679,7 +1695,7 @@ fn publish_web_capture(job: &Job) -> Result<Publication> {
         policy: job.policy.clone(),
         published_at: now_secs(),
         proof,
-        extractions: Vec::new(),
+        extractions: vec![extraction],
         capabilities: Vec::new(),
         artifacts,
     };
@@ -1699,6 +1715,31 @@ fn publish_web_capture(job: &Job) -> Result<Publication> {
     Ok(Publication::Published {
         capture_id,
         partial: false,
+    })
+}
+
+fn web_markdown_extraction(staging: &Path, proof: &Proof, final_url: &str) -> Result<Extraction> {
+    let path = staging.join("extractions/page.md");
+    Ok(Extraction {
+        artifact_id: "extraction-markdown".to_string(),
+        path: "extractions/page.md".to_string(),
+        mime: "text/markdown".to_string(),
+        sha256: sha256_file(&path)?,
+        size_bytes: fs::metadata(&path)
+            .context("reading Markdown Extraction metadata")?
+            .len(),
+        locator: Some(Locator::Url {
+            value: final_url.to_string(),
+        }),
+        locator_provider: None,
+        provider: Provider {
+            name: "page-renderer".to_string(),
+            version: "1".to_string(),
+            parameters: json!({ "browser": "firefox" }),
+            dependencies: Vec::new(),
+        },
+        proof_artifact_id: proof.artifact_id.clone(),
+        created_at: now_secs(),
     })
 }
 
@@ -1820,25 +1861,11 @@ fn fail_job(job_id: &str, error: &anyhow::Error) -> Result<()> {
 }
 
 fn error_code(error: &anyhow::Error) -> String {
-    let message = format!("{error:#}");
-    [
-        "web_url_scheme_refused",
-        "web_url_credentials_refused",
-        "web_url_host_refused",
-        "web_private_target_refused",
-        "web_dns_resolution_failed",
-        "web_port_refused",
-        "web_websocket_refused",
-        "web_download_budget_exceeded",
-        "web_disk_budget_exceeded",
-        "web_renderer_firefox_unavailable",
-        "web_renderer_chromium_unavailable",
-        "web_renderer_unknown",
-    ]
-    .into_iter()
-    .find(|code| message.contains(code))
-    .unwrap_or("capture_failed")
-    .to_string()
+    error
+        .chain()
+        .find_map(|cause| cause.downcast_ref::<CodedError>().map(|error| error.code))
+        .unwrap_or("capture_failed")
+        .to_string()
 }
 
 fn print_job(job_id: &str) -> Result<()> {

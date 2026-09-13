@@ -135,38 +135,56 @@ fn directory_size(path: &Path) -> Result<u64> {
 pub fn validate_public_url(value: &str) -> Result<()> {
     let url = Url::parse(value).with_context(|| format!("parsing Web URL `{value}`"))?;
     if !matches!(url.scheme(), "http" | "https") {
-        bail!("web_url_scheme_refused: only HTTP(S) URLs are permitted");
+        return Err(crate::agent::coded_error(
+            "web_url_scheme_refused",
+            "only HTTP(S) URLs are permitted",
+        ));
     }
     if !url.username().is_empty() || url.password().is_some() {
-        bail!("web_url_credentials_refused: URLs with credentials are not permitted");
+        return Err(crate::agent::coded_error(
+            "web_url_credentials_refused",
+            "URLs with credentials are not permitted",
+        ));
     }
     let host = url
         .host_str()
-        .context("web_url_host_refused: URL has no host")?;
+        .ok_or_else(|| crate::agent::coded_error("web_url_host_refused", "URL has no host"))?;
     if host.eq_ignore_ascii_case("localhost") || host.ends_with(".localhost") {
-        bail!("web_private_target_refused: localhost is not a public target");
+        return Err(crate::agent::coded_error(
+            "web_private_target_refused",
+            "localhost is not a public target",
+        ));
     }
     if let Ok(ip) = host.parse::<IpAddr>() {
         if is_private_ip(ip) {
-            bail!("web_private_target_refused: {ip} is not public");
+            return Err(crate::agent::coded_error(
+                "web_private_target_refused",
+                format!("{ip} is not public"),
+            ));
         }
         return Ok(());
     }
     let port = url
         .port_or_known_default()
         .context("resolving Web URL port")?;
-    let addresses = (host, port)
-        .to_socket_addrs()
-        .with_context(|| format!("web_dns_resolution_failed: resolving {host}"))?;
+    let addresses = (host, port).to_socket_addrs().map_err(|error| {
+        crate::agent::coded_error("web_dns_resolution_failed", error.to_string())
+    })?;
     let mut found = false;
     for address in addresses {
         found = true;
         if is_private_ip(address.ip()) {
-            bail!("web_private_target_refused: {host} resolves to a non-public address");
+            return Err(crate::agent::coded_error(
+                "web_private_target_refused",
+                format!("{host} resolves to a non-public address"),
+            ));
         }
     }
     if !found {
-        bail!("web_dns_resolution_failed: {host} has no address");
+        return Err(crate::agent::coded_error(
+            "web_dns_resolution_failed",
+            format!("{host} has no address"),
+        ));
     }
     Ok(())
 }
