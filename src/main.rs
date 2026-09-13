@@ -13,6 +13,7 @@ mod download;
 mod frames;
 mod notify;
 mod output;
+mod resource;
 mod transcribe;
 mod unique_id;
 mod worker;

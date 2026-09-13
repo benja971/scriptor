@@ -11,9 +11,13 @@ use anyhow::{Context, Result, bail};
 use clap::{Args, Parser, Subcommand};
 use fs2::FileExt;
 use serde::{Deserialize, Serialize};
+use serde_json::{Value, json};
 use sha2::{Digest, Sha256};
 
+use crate::config::Config;
+use crate::resource::CaptureBudget;
 use crate::unique_id::unique_id;
+use crate::{audio, frames, transcribe};
 
 const POLICY_NAME: &str = "safe-local@1";
 const DEFAULT_PAGE_LIMIT: usize = 20;
@@ -176,6 +180,10 @@ struct Manifest {
     policy: Policy,
     published_at: u64,
     proof: Proof,
+    #[serde(default)]
+    extractions: Vec<Extraction>,
+    #[serde(default)]
+    capabilities: Vec<Capability>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -191,6 +199,48 @@ struct Proof {
     mime: String,
     sha256: String,
     size_bytes: u64,
+    locator: Locator,
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+struct Extraction {
+    artifact_id: String,
+    path: String,
+    mime: String,
+    sha256: String,
+    size_bytes: u64,
+    locator: Option<Locator>,
+    provider: Provider,
+    proof_artifact_id: String,
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+struct Capability {
+    name: String,
+    state: String,
+    provider: Provider,
+    error: Option<StructuredError>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct Provider {
+    name: String,
+    version: String,
+    parameters: Value,
+    dependencies: Vec<ProviderDependency>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct ProviderDependency {
+    name: String,
+    version: String,
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+struct Locator {
+    kind: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    timestamps_secs: Option<Vec<f64>>,
 }
 
 #[derive(Serialize)]
@@ -294,7 +344,7 @@ struct ReadRequest {
 }
 
 enum Publication {
-    Published(String),
+    Published { capture_id: String, partial: bool },
     Cancelled,
 }
 
@@ -469,7 +519,10 @@ fn run_worker(job_id: &str) -> Result<()> {
     };
 
     match publish_capture(&job) {
-        Ok(Publication::Published(capture_id)) => complete_job(job_id, capture_id),
+        Ok(Publication::Published {
+            capture_id,
+            partial,
+        }) => complete_job(job_id, capture_id, partial),
         Ok(Publication::Cancelled) => Ok(()),
         Err(error) => fail_job(job_id, &error),
     }
@@ -491,28 +544,31 @@ fn publish_capture(job: &Job) -> Result<Publication> {
     if metadata.len() > job.policy.snapshot.limits.disk_byte_limit {
         bail!("local Source exceeds safe-local@1 disk budget");
     }
-    let source_hash = sha256_file(source)?;
-    if now_secs().saturating_sub(job.created_at) > job.policy.snapshot.limits.duration_limit_secs {
-        bail!("Capture exceeds safe-local@1 duration budget");
-    }
-    if job.policy.snapshot.duplicate_mode == "reuse"
-        && let Some(capture_id) = find_capture_by_source_hash(&source_hash)?
-    {
-        return Ok(Publication::Published(capture_id));
-    }
-
     let capture_id = format!("capture-{}", unique_id());
     let captures = captures_dir()?;
     let staging = captures.join(format!(".{capture_id}"));
     let final_dir = captures.join(&capture_id);
     fs::create_dir_all(staging.join("proofs"))
         .with_context(|| format!("creating Capture staging directory {}", staging.display()))?;
-    let proof_path = staging.join("proofs").join("source");
-    fs::copy(source, &proof_path)
-        .with_context(|| format!("copying local Source {}", source.display()))?;
-    if now_secs().saturating_sub(job.created_at) > job.policy.snapshot.limits.duration_limit_secs {
-        bail!("Capture exceeds safe-local@1 duration budget");
+    let budget = CaptureBudget::new(
+        &staging,
+        job.created_at,
+        job.policy.snapshot.limits.duration_limit_secs,
+        job.policy.snapshot.limits.disk_byte_limit,
+    );
+    let source_hash = sha256_file_limited(source, &budget)?;
+    if job.policy.snapshot.duplicate_mode == "reuse"
+        && let Some(capture_id) = find_capture_by_source_hash(&source_hash)?
+    {
+        fs::remove_dir_all(&staging).context("discarding duplicate Capture staging directory")?;
+        return Ok(Publication::Published {
+            capture_id,
+            partial: false,
+        });
     }
+    let proof_path = staging.join("proofs").join("source");
+    copy_file_limited(source, &proof_path, &budget)
+        .with_context(|| format!("copying local Source {}", source.display()))?;
     if read_job(&job.id)?.state == "cancelled" {
         fs::remove_dir_all(&staging).context("discarding cancelled Capture staging directory")?;
         return Ok(Publication::Cancelled);
@@ -520,7 +576,7 @@ fn publish_capture(job: &Job) -> Result<Publication> {
     let proof_size = fs::metadata(&proof_path)
         .context("reading copied Proof metadata")?
         .len();
-    let manifest = Manifest {
+    let mut manifest = Manifest {
         capture_id: capture_id.clone(),
         source: SourceIdentity {
             locator: job.source.clone(),
@@ -532,24 +588,639 @@ fn publish_capture(job: &Job) -> Result<Publication> {
             artifact_id: "proof-source".to_string(),
             path: "proofs/source".to_string(),
             mime: mime_for_source(source).to_string(),
-            sha256: sha256_file(&proof_path)?,
+            sha256: sha256_file_limited(&proof_path, &budget)?,
             size_bytes: proof_size,
+            locator: Locator {
+                kind: "file".to_string(),
+                timestamps_secs: None,
+            },
         },
+        extractions: Vec::new(),
+        capabilities: Vec::new(),
     };
-    write_json(&staging.join("manifest.json"), &manifest)?;
-    append_json_line(
-        &staging.join("ledger.jsonl"),
-        &LedgerEvent {
-            event: "capture_published".to_string(),
-            at: now_secs(),
-            job_id: job.id.clone(),
-        },
-    )?;
+    if is_media_source(source) {
+        capture_local_media(job, &proof_path, &staging, &mut manifest, &budget);
+    }
+    let ledger_event = LedgerEvent {
+        event: "capture_published".to_string(),
+        at: now_secs(),
+        job_id: job.id.clone(),
+    };
+    write_capture_metadata(&staging, &manifest, &ledger_event, &budget)?;
     fs::rename(&staging, &final_dir).with_context(|| format!("publishing Capture {capture_id}"))?;
     if let Err(error) = rebuild_search_index() {
         record_index_degradation(&error);
     }
-    Ok(Publication::Published(capture_id))
+    Ok(Publication::Published {
+        capture_id,
+        partial: manifest
+            .capabilities
+            .iter()
+            .any(|capability| capability.state != "succeeded"),
+    })
+}
+
+fn is_media_source(source: &Path) -> bool {
+    source.extension().is_some_and(|extension| {
+        matches!(
+            extension.to_string_lossy().to_ascii_lowercase().as_str(),
+            "aac"
+                | "avi"
+                | "flac"
+                | "m4a"
+                | "m4v"
+                | "mkv"
+                | "mov"
+                | "mp3"
+                | "mp4"
+                | "mpeg"
+                | "mpg"
+                | "ogg"
+                | "opus"
+                | "wav"
+                | "webm"
+        )
+    })
+}
+
+fn capture_local_media(
+    job: &Job,
+    proof_path: &Path,
+    staging: &Path,
+    manifest: &mut Manifest,
+    budget: &CaptureBudget<'_>,
+) {
+    let config = match Config::load().context("loading configuration for local media Capture") {
+        Ok(config) => config,
+        Err(error) => {
+            record_media_setup_failure(manifest, &error);
+            return;
+        }
+    };
+    let work_dir = staging.join("work");
+    if let Err(error) = fs::create_dir_all(&work_dir)
+        .with_context(|| format!("creating media work directory {}", work_dir.display()))
+    {
+        record_media_setup_failure(manifest, &error);
+        return;
+    }
+    let audio_allowed = policy_allows(&job.policy, "ffmpeg");
+    let transcription_allowed = audio_allowed && policy_allows(&job.policy, "whisper-cli");
+    if audio_allowed {
+        if let Err(error) = capture_transcription(
+            proof_path,
+            staging,
+            manifest,
+            &work_dir,
+            &config,
+            budget,
+            transcription_allowed,
+        ) {
+            cleanup_media_extraction(staging, "transcription", manifest);
+            record_capability_failure(manifest, "transcription", &error);
+        }
+    } else {
+        let error = denied_provider_error("ffmpeg");
+        manifest.capabilities.push(blocked_capability(
+            "audio-extraction",
+            unresolved_provider("ffmpeg"),
+            &error,
+        ));
+        manifest.capabilities.push(blocked_capability(
+            "transcription",
+            unresolved_provider("ffmpeg"),
+            &error,
+        ));
+    }
+    if !enforce_media_limits(budget, staging, manifest, "transcription") {
+        cleanup_work_dir(&work_dir, manifest);
+        return;
+    }
+    if let Some(provider) = first_denied_provider(&job.policy, &["ffmpeg", "ffprobe"]) {
+        let error = denied_provider_error(provider);
+        manifest.capabilities.push(blocked_capability(
+            "frames",
+            unresolved_provider(provider),
+            &error,
+        ));
+    } else if let Err(error) =
+        capture_frames(proof_path, staging, manifest, &work_dir, &config, budget)
+    {
+        cleanup_media_extraction(staging, "frames", manifest);
+        record_capability_failure(manifest, "frames", &error);
+    }
+    enforce_media_limits(budget, staging, manifest, "frames");
+    cleanup_work_dir(&work_dir, manifest);
+}
+
+fn cleanup_work_dir(work_dir: &Path, manifest: &mut Manifest) {
+    if let Err(error) = fs::remove_dir_all(work_dir)
+        .with_context(|| format!("removing media work directory {}", work_dir.display()))
+    {
+        manifest.capabilities.push(failed_capability(
+            "media-work-cleanup",
+            unresolved_provider("filesystem"),
+            &error,
+        ));
+    }
+}
+
+fn cleanup_media_extraction(staging: &Path, capability: &str, manifest: &mut Manifest) {
+    let path = if capability == "frames" {
+        staging.join("extractions").join("frames")
+    } else {
+        staging.join("extractions").join("transcription.txt")
+    };
+    let result = if capability == "frames" {
+        fs::remove_dir_all(&path)
+    } else {
+        fs::remove_file(&path)
+    };
+    match result {
+        Ok(()) => {}
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+        Err(error) => {
+            let error = anyhow::Error::from(error)
+                .context(format!("discarding invalid {capability} Extraction"));
+            manifest.capabilities.push(failed_capability(
+                &format!("{capability}-cleanup"),
+                unresolved_provider("filesystem"),
+                &error,
+            ));
+        }
+    }
+}
+
+fn capture_transcription(
+    proof_path: &Path,
+    staging: &Path,
+    manifest: &mut Manifest,
+    work_dir: &Path,
+    config: &Config,
+    budget: &CaptureBudget<'_>,
+    transcription_allowed: bool,
+) -> Result<()> {
+    let audio_path = work_dir.join("audio.wav");
+    let audio_parameters = json!({
+        "format": "pcm_s16le",
+        "sample_rate_hz": 16_000,
+        "channels": 1,
+    });
+    let audio_provider = match provider("ffmpeg", audio_parameters, &[], budget) {
+        Ok(provider) => provider,
+        Err(error) => {
+            manifest.capabilities.push(failed_capability(
+                "audio-extraction",
+                unresolved_provider_for(&error, "ffmpeg"),
+                &error,
+            ));
+            manifest.capabilities.push(blocked_capability(
+                "transcription",
+                unresolved_provider("whisper-cli"),
+                &error,
+            ));
+            return Ok(());
+        }
+    };
+    match audio::extract_audio_limited(proof_path, &audio_path, budget) {
+        Ok(()) => {
+            manifest.capabilities.push(Capability {
+                name: "audio-extraction".to_string(),
+                state: "succeeded".to_string(),
+                provider: audio_provider.clone(),
+                error: None,
+            });
+            if transcription_allowed {
+                capture_transcription_text(
+                    staging,
+                    manifest,
+                    &audio_path,
+                    work_dir,
+                    config,
+                    budget,
+                    &audio_provider,
+                )?;
+            } else {
+                let error = denied_provider_error("whisper-cli");
+                manifest.capabilities.push(blocked_capability(
+                    "transcription",
+                    unresolved_provider("whisper-cli"),
+                    &error,
+                ));
+            }
+        }
+        Err(error) => {
+            manifest.capabilities.push(failed_capability(
+                "audio-extraction",
+                audio_provider,
+                &error,
+            ));
+            manifest.capabilities.push(blocked_capability(
+                "transcription",
+                unresolved_provider("whisper-cli"),
+                &error,
+            ));
+        }
+    }
+    Ok(())
+}
+
+fn capture_transcription_text(
+    staging: &Path,
+    manifest: &mut Manifest,
+    audio_path: &Path,
+    work_dir: &Path,
+    config: &Config,
+    budget: &CaptureBudget<'_>,
+    audio_provider: &Provider,
+) -> Result<()> {
+    let transcription_provider = match transcription_parameters(config, audio_provider, budget)
+        .and_then(|parameters| provider("whisper-cli", parameters, &[], budget))
+    {
+        Ok(provider) => provider,
+        Err(error) => {
+            manifest.capabilities.push(failed_capability(
+                "transcription",
+                unresolved_provider("whisper-cli"),
+                &error,
+            ));
+            return Ok(());
+        }
+    };
+    match transcribe::transcribe_limited(
+        &config.model_path(),
+        audio_path,
+        &config.language,
+        u32::try_from(config.threads).context("converting transcription thread count")?,
+        &work_dir.join("transcription"),
+        budget,
+    ) {
+        Ok(transcription_path) => {
+            let destination = staging.join("extractions").join("transcription.txt");
+            copy_extraction(&transcription_path, &destination, budget)?;
+            manifest.extractions.push(extraction(
+                "extraction-transcription",
+                "extractions/transcription.txt",
+                "text/plain",
+                &destination,
+                None,
+                transcription_provider.clone(),
+                budget,
+            )?);
+            manifest.capabilities.push(Capability {
+                name: "transcription".to_string(),
+                state: "succeeded".to_string(),
+                provider: transcription_provider,
+                error: None,
+            });
+        }
+        Err(error) => manifest.capabilities.push(failed_capability(
+            "transcription",
+            transcription_provider,
+            &error,
+        )),
+    }
+    Ok(())
+}
+
+fn capture_frames(
+    proof_path: &Path,
+    staging: &Path,
+    manifest: &mut Manifest,
+    work_dir: &Path,
+    config: &Config,
+    budget: &CaptureBudget<'_>,
+) -> Result<()> {
+    let frames_dir = work_dir.join("frames");
+    let frames_provider = match provider(
+        "ffmpeg",
+        json!({
+            "interval_secs": config.frame_interval_secs,
+            "scene_threshold": config.frame_scene_threshold,
+            "dedup_window_secs": config.frame_dedup_window_secs,
+        }),
+        &["ffprobe"],
+        budget,
+    ) {
+        Ok(provider) => provider,
+        Err(error) => {
+            manifest.capabilities.push(failed_capability(
+                "frames",
+                unresolved_provider("ffmpeg"),
+                &error,
+            ));
+            return Ok(());
+        }
+    };
+    let frame_params = frames::FrameExtractionParams {
+        interval_secs: config.frame_interval_secs,
+        scene_threshold: config.frame_scene_threshold,
+        dedup_window_secs: config.frame_dedup_window_secs,
+    };
+    match frames::extract_frames_limited(proof_path, work_dir, &frames_dir, frame_params, budget) {
+        Ok(frame_count) => {
+            let destination = staging.join("extractions").join("frames");
+            if frame_count > 0 {
+                budget.check()?;
+                fs::create_dir_all(&destination).with_context(|| {
+                    format!(
+                        "creating Frames Extraction directory {}",
+                        destination.display()
+                    )
+                })?;
+                let mut frames = fs::read_dir(&frames_dir)
+                    .with_context(|| format!("reading Frames {}", frames_dir.display()))?
+                    .map(|entry| entry.map(|entry| entry.path()))
+                    .collect::<std::io::Result<Vec<_>>>()
+                    .context("reading Frame paths")?;
+                frames.sort();
+                for (index, frame) in frames.iter().enumerate() {
+                    budget.check()?;
+                    let filename = frame.file_name().context("reading Frame filename")?;
+                    let filename = filename.to_string_lossy();
+                    let timestamp = frame_timestamp(&filename)?;
+                    let extraction_path = destination.join(filename.as_ref());
+                    copy_extraction(frame, &extraction_path, budget)?;
+                    budget.check()?;
+                    let artifact_id = format!("extraction-frame-{index:04}");
+                    let path = format!("extractions/frames/{filename}");
+                    manifest.extractions.push(extraction(
+                        &artifact_id,
+                        &path,
+                        "image/jpeg",
+                        &extraction_path,
+                        Some(Locator {
+                            kind: "media-timestamp".to_string(),
+                            timestamps_secs: Some(vec![timestamp]),
+                        }),
+                        frames_provider.clone(),
+                        budget,
+                    )?);
+                    budget.check()?;
+                }
+            }
+            manifest.capabilities.push(Capability {
+                name: "frames".to_string(),
+                state: "succeeded".to_string(),
+                provider: frames_provider,
+                error: None,
+            });
+        }
+        Err(error) => {
+            manifest
+                .capabilities
+                .push(failed_capability("frames", frames_provider, &error));
+        }
+    }
+    Ok(())
+}
+
+fn failed_capability(name: &str, provider: Provider, error: &anyhow::Error) -> Capability {
+    Capability {
+        name: name.to_string(),
+        state: "failed".to_string(),
+        provider,
+        error: Some(StructuredError {
+            code: "capability_failed".to_string(),
+            message: format!("{error:#}"),
+        }),
+    }
+}
+
+fn blocked_capability(name: &str, provider: Provider, error: &anyhow::Error) -> Capability {
+    Capability {
+        name: name.to_string(),
+        state: "not_attempted".to_string(),
+        provider,
+        error: Some(StructuredError {
+            code: "capability_blocked".to_string(),
+            message: format!("required capability failed: {error:#}"),
+        }),
+    }
+}
+
+fn record_media_setup_failure(manifest: &mut Manifest, error: &anyhow::Error) {
+    for capability in ["audio-extraction", "transcription", "frames"] {
+        record_capability_failure(manifest, capability, error);
+    }
+}
+
+fn policy_allows(policy: &Policy, provider: &str) -> bool {
+    policy
+        .snapshot
+        .allowed_providers
+        .iter()
+        .any(|allowed| allowed == provider)
+}
+
+fn first_denied_provider<'a>(policy: &Policy, providers: &[&'a str]) -> Option<&'a str> {
+    providers
+        .iter()
+        .copied()
+        .find(|provider| !policy_allows(policy, provider))
+}
+
+fn denied_provider_error(provider: &str) -> anyhow::Error {
+    anyhow::anyhow!("Provider `{provider}` is not allowed by Policy")
+}
+
+fn record_capability_failure(manifest: &mut Manifest, name: &str, error: &anyhow::Error) {
+    if let Some(capability) = manifest
+        .capabilities
+        .iter_mut()
+        .find(|capability| capability.name == name)
+    {
+        capability.state = "failed".to_string();
+        capability.error = Some(StructuredError {
+            code: "capability_failed".to_string(),
+            message: format!("{error:#}"),
+        });
+    } else {
+        manifest.capabilities.push(failed_capability(
+            name,
+            unresolved_provider("unknown"),
+            error,
+        ));
+    }
+}
+
+fn enforce_media_limits(
+    budget: &CaptureBudget<'_>,
+    staging: &Path,
+    manifest: &mut Manifest,
+    capability: &str,
+) -> bool {
+    let result = budget.check();
+    if let Err(error) = result {
+        manifest.extractions.retain(|extraction| {
+            let affected = match capability {
+                "transcription" => extraction.artifact_id == "extraction-transcription",
+                "frames" => extraction.artifact_id.starts_with("extraction-frame-"),
+                _ => false,
+            };
+            !affected
+        });
+        cleanup_media_extraction(staging, capability, manifest);
+        if manifest
+            .capabilities
+            .iter()
+            .all(|existing| existing.name != capability || existing.state != "not_attempted")
+        {
+            record_capability_failure(manifest, capability, &error);
+        }
+        return false;
+    }
+    true
+}
+
+fn copy_extraction(source: &Path, destination: &Path, budget: &CaptureBudget<'_>) -> Result<()> {
+    let parent = destination
+        .parent()
+        .context("resolving Extraction directory")?;
+    fs::create_dir_all(parent)
+        .with_context(|| format!("creating Extraction directory {}", parent.display()))?;
+    copy_file_limited(source, destination, budget).with_context(|| {
+        format!(
+            "copying Extraction {} to {}",
+            source.display(),
+            destination.display()
+        )
+    })
+}
+
+fn extraction(
+    artifact_id: &str,
+    path: &str,
+    mime: &str,
+    file: &Path,
+    locator: Option<Locator>,
+    provider: Provider,
+    budget: &CaptureBudget<'_>,
+) -> Result<Extraction> {
+    Ok(Extraction {
+        artifact_id: artifact_id.to_string(),
+        path: path.to_string(),
+        mime: mime.to_string(),
+        sha256: sha256_file_limited(file, budget)?,
+        size_bytes: file_size(file)?,
+        locator,
+        provider,
+        proof_artifact_id: "proof-source".to_string(),
+    })
+}
+
+fn file_size(path: &Path) -> Result<u64> {
+    Ok(fs::metadata(path)
+        .with_context(|| format!("reading artifact metadata {}", path.display()))?
+        .len())
+}
+
+fn frame_timestamp(filename: &str) -> Result<f64> {
+    filename
+        .rsplit_once('-')
+        .context("parsing Frame filename")?
+        .1
+        .strip_suffix("s.jpg")
+        .context("parsing Frame timestamp suffix")?
+        .parse::<f64>()
+        .context("parsing Frame timestamp")
+}
+
+fn media_mime(source: &Path) -> &'static str {
+    match source
+        .extension()
+        .and_then(|extension| extension.to_str())
+        .map(str::to_ascii_lowercase)
+        .as_deref()
+    {
+        Some("aac") => "audio/aac",
+        Some("avi") => "video/x-msvideo",
+        Some("m4a") => "audio/mp4",
+        Some("mkv") => "video/x-matroska",
+        Some("mp4" | "m4v") => "video/mp4",
+        Some("mpeg" | "mpg") => "video/mpeg",
+        Some("webm") => "video/webm",
+        Some("mov") => "video/quicktime",
+        Some("mp3") => "audio/mpeg",
+        Some("wav") => "audio/wav",
+        Some("ogg") => "audio/ogg",
+        Some("opus") => "audio/opus",
+        Some("flac") => "audio/flac",
+        _ => "application/octet-stream",
+    }
+}
+
+fn transcription_parameters(
+    config: &Config,
+    audio_provider: &Provider,
+    budget: &CaptureBudget<'_>,
+) -> Result<Value> {
+    let model_path = config.model_path();
+    Ok(json!({
+        "language": config.language,
+        "threads": config.threads,
+        "model": {
+            "path": model_path,
+            "sha256": sha256_file_limited(&model_path, budget)?,
+        },
+        "input": {
+            "proof_artifact_id": "proof-source",
+            "audio_extraction_provider": audio_provider,
+        },
+    }))
+}
+
+fn provider(
+    name: &str,
+    parameters: Value,
+    dependencies: &[&str],
+    budget: &CaptureBudget<'_>,
+) -> Result<Provider> {
+    let path = provider_path(name)?;
+    let dependencies = dependencies
+        .iter()
+        .map(|dependency| {
+            let path = provider_path(dependency)?;
+            Ok(ProviderDependency {
+                name: (*dependency).to_string(),
+                version: format!("sha256:{}", sha256_file_limited(&path, budget)?),
+            })
+        })
+        .collect::<Result<Vec<_>>>()?;
+    Ok(Provider {
+        name: name.to_string(),
+        version: format!("sha256:{}", sha256_file_limited(&path, budget)?),
+        parameters,
+        dependencies,
+    })
+}
+
+fn provider_path(name: &str) -> Result<PathBuf> {
+    std::env::var_os("PATH")
+        .and_then(|path| {
+            std::env::split_paths(&path)
+                .map(|directory| directory.join(name))
+                .find(|candidate| candidate.is_file())
+        })
+        .with_context(|| format!("resolving Provider binary `{name}`"))
+}
+
+fn unresolved_provider(name: &str) -> Provider {
+    Provider {
+        name: name.to_string(),
+        version: "unresolved".to_string(),
+        parameters: Value::Null,
+        dependencies: Vec::new(),
+    }
+}
+
+fn unresolved_provider_for(error: &anyhow::Error, fallback: &str) -> Provider {
+    let name = if format!("{error:#}").contains("`ffprobe`") {
+        "ffprobe"
+    } else {
+        fallback
+    };
+    unresolved_provider(name)
 }
 
 fn start_job(job_id: &str) -> Result<Option<Job>> {
@@ -580,16 +1251,20 @@ fn start_job(job_id: &str) -> Result<Option<Job>> {
     Ok(Some(job))
 }
 
-fn complete_job(job_id: &str, capture_id: String) -> Result<()> {
+fn complete_job(job_id: &str, capture_id: String, partial: bool) -> Result<()> {
     let lock = lock_job(job_id)?;
     let mut job = read_job(job_id)?;
     if job.state != "cancelled" {
-        job.state = "succeeded".to_string();
+        job.state = if partial {
+            "partial".to_string()
+        } else {
+            "succeeded".to_string()
+        };
         job.updated_at = now_secs();
         job.capture_id = Some(capture_id);
         job.worker_pid = None;
         write_job(&job)?;
-        append_job_event(job_id, "succeeded")?;
+        append_job_event(job_id, &job.state)?;
     }
     unlock_job(&lock)
 }
@@ -1156,7 +1831,11 @@ fn safe_local_policy(name: &str) -> Result<Policy> {
         duplicate_mode: "reuse".to_string(),
         limits,
         allows_remote_calls: false,
-        allowed_providers: Vec::new(),
+        allowed_providers: vec![
+            "ffmpeg".to_string(),
+            "ffprobe".to_string(),
+            "whisper-cli".to_string(),
+        ],
     };
     let canonical_snapshot =
         serde_json::to_value(&snapshot).context("normalizing Policy snapshot")?;
@@ -1292,6 +1971,26 @@ fn write_json<T: Serialize>(path: &Path, value: &T) -> Result<()> {
     fs::rename(&temporary, path).with_context(|| format!("publishing JSON {}", path.display()))
 }
 
+fn write_capture_metadata(
+    staging: &Path,
+    manifest: &Manifest,
+    ledger_event: &LedgerEvent,
+    budget: &CaptureBudget<'_>,
+) -> Result<()> {
+    let manifest_data =
+        serde_json::to_vec_pretty(manifest).context("serializing Capture manifest")?;
+    let mut ledger_data = serde_json::to_vec(ledger_event).context("serializing Capture ledger")?;
+    ledger_data.push(b'\n');
+    let metadata_bytes = u64::try_from(manifest_data.len())
+        .context("converting Capture manifest size")?
+        .checked_add(u64::try_from(ledger_data.len()).context("converting Capture ledger size")?)
+        .context("summing Capture metadata size")?;
+    budget.check_disk_capacity_without_duration(metadata_bytes)?;
+    fs::write(staging.join("manifest.json"), manifest_data).context("writing Capture manifest")?;
+    fs::write(staging.join("ledger.jsonl"), ledger_data).context("writing Capture ledger")?;
+    budget.check_disk_capacity_without_duration(0)
+}
+
 fn read_json<T: for<'de> Deserialize<'de>>(path: &Path) -> Result<T> {
     let file = File::open(path).with_context(|| format!("opening {}", path.display()))?;
     serde_json::from_reader(BufReader::new(file))
@@ -1317,11 +2016,12 @@ fn read_json_lines<T: for<'de> Deserialize<'de>>(path: &Path) -> Result<Vec<T>> 
         .collect()
 }
 
-fn sha256_file(path: &Path) -> Result<String> {
+fn sha256_file_limited(path: &Path, budget: &CaptureBudget<'_>) -> Result<String> {
     let mut file = File::open(path).with_context(|| format!("opening {}", path.display()))?;
     let mut hash = Sha256::new();
     let mut buffer = [0_u8; 8192];
     loop {
+        budget.check()?;
         let read = file
             .read(&mut buffer)
             .with_context(|| format!("reading {}", path.display()))?;
@@ -1329,8 +2029,33 @@ fn sha256_file(path: &Path) -> Result<String> {
             break;
         }
         hash.update(buffer.get(..read).context("reading hash buffer")?);
+        budget.check()?;
     }
     Ok(format!("{:x}", hash.finalize()))
+}
+
+fn copy_file_limited(source: &Path, destination: &Path, budget: &CaptureBudget<'_>) -> Result<()> {
+    let mut input = File::open(source).with_context(|| format!("opening {}", source.display()))?;
+    let mut output =
+        File::create(destination).with_context(|| format!("creating {}", destination.display()))?;
+    let mut buffer = [0_u8; 8192];
+    loop {
+        budget.check()?;
+        let read = input
+            .read(&mut buffer)
+            .with_context(|| format!("reading {}", source.display()))?;
+        if read == 0 {
+            break;
+        }
+        output
+            .write_all(buffer.get(..read).context("reading copy buffer")?)
+            .with_context(|| format!("writing {}", destination.display()))?;
+        budget.check()?;
+    }
+    output
+        .sync_all()
+        .with_context(|| format!("syncing {}", destination.display()))?;
+    budget.check()
 }
 
 fn sha256_bytes(bytes: &[u8]) -> String {
