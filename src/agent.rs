@@ -249,13 +249,13 @@ impl RecipeKind {
     }
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 struct Recipe {
     kind: RecipeKind,
     target: RecipeTarget,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(tag = "kind", rename_all = "snake_case")]
 enum RecipeTarget {
     Capture { capture_id: String },
@@ -617,18 +617,25 @@ fn run_derive_command(command: DeriveCommand) -> Result<()> {
         &target,
         &policy,
     )?;
+    let recipe = Recipe {
+        kind: command.recipe,
+        target,
+    };
     if let Some(retry_of) = command.retry_of.as_deref() {
-        derive::admit_retry(retry_of, &command.capture_id, command.recipe)?;
+        derive::admit_retry(
+            retry_of,
+            &command.capture_id,
+            &recipe,
+            &command.provider,
+            &parameters,
+        )?;
     }
     create_job(
         command.capture_id.clone(),
         policy,
         JobOperation::Derive {
             capture_id: command.capture_id,
-            recipe: Recipe {
-                kind: command.recipe,
-                target,
-            },
+            recipe,
             provider: command.provider,
             parameters,
         },
@@ -2595,7 +2602,10 @@ fn start_job(job_id: &str) -> Result<Option<Job>> {
                 "{}@{} concurrency budget exceeded",
                 job.policy.id, job.policy.version
             ),
-            capability: None,
+            capability: match &job.operation {
+                JobOperation::Derive { recipe, .. } => Some(recipe.kind.as_str().to_string()),
+                _ => None,
+            },
         });
         write_job(&job)?;
         append_job_event(job_id, "failed")?;

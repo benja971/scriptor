@@ -2616,6 +2616,30 @@ fn rerunning_a_recipe_creates_distinct_immutable_derivatives() {
         .join(&first_derive)
         .join("content");
     let first_bytes = fs::read(&first_path).expect("premier Derive lisible");
+    let mismatched_retry: Value = serde_json::from_slice(
+        &env.command()
+            .args([
+                "derive",
+                &capture_id,
+                "--recipe",
+                "markdown-note",
+                "--provider",
+                "scriptor-local-derive",
+                "--policy",
+                "safe-local@1",
+                "--whole-capture",
+                "--parameters",
+                r#"{"style":"different"}"#,
+                "--retry-of",
+                &first_job,
+            ])
+            .assert()
+            .success()
+            .get_output()
+            .stdout,
+    )
+    .expect("refus de relance JSON valide");
+    assert_eq!(mismatched_retry["error"]["code"], "invalid_retry");
     let (second_job, second_derive) = run(Some(&first_job));
 
     assert_ne!(first_job, second_job);
@@ -2720,7 +2744,7 @@ fn derive_never_persists_parameters_marked_as_sensitive() {
                 "safe-local@1",
                 "--whole-capture",
                 "--parameters",
-                r#"{"api_token":"secret"}"#,
+                r#"{"header":"Bearer secret"}"#,
             ])
             .assert()
             .success()
@@ -2807,6 +2831,50 @@ fn cancelling_a_running_derive_never_publishes_it() {
             .as_array()
             .is_some_and(Vec::is_empty)
     );
+}
+
+#[test]
+fn derive_concurrency_failure_keeps_the_recipe_capability() {
+    let env = TestEnv::new("derive-concurrency");
+    env.install_binary("scriptor-local-derive", FAKE_LOCAL_DERIVE_PROVIDER);
+    let capture_id = create_text_capture(&env);
+    let blocker_source = env.work_dir.join("blocker.txt");
+    fs::write(&blocker_source, "blocker").expect("ecriture de la Source de blocage");
+    for job_id in ["job-9001", "job-9002"] {
+        let path = write_capture_worker_job(&env, job_id, &blocker_source, &[], 30);
+        let mut job: Value = serde_json::from_slice(&fs::read(&path).expect("lecture du Job"))
+            .expect("Job JSON valide");
+        job["state"] = Value::String("running".to_string());
+        fs::write(
+            path,
+            serde_json::to_vec(&job).expect("serialisation du Job"),
+        )
+        .expect("ecriture du Job concurrent");
+    }
+    let created: Value = serde_json::from_slice(
+        &env.command()
+            .args([
+                "derive",
+                &capture_id,
+                "--recipe",
+                "checklist",
+                "--provider",
+                "scriptor-local-derive",
+                "--policy",
+                "safe-local@1",
+                "--whole-capture",
+            ])
+            .assert()
+            .success()
+            .get_output()
+            .stdout,
+    )
+    .expect("Job de Derive JSON valide");
+    let job_id = created["job"]["job_id"].as_str().expect("Job de Derive");
+    let failed = wait_for_agent_job(&env, job_id);
+    assert_eq!(failed["state"], "failed", "{failed}");
+    assert_eq!(failed["error"]["code"], "concurrency_limit_exceeded");
+    assert_eq!(failed["error"]["capability"], "checklist");
 }
 
 /// Test end-to-end avec les **vrais** binaires (`ffmpeg`, `whisper-cli`,

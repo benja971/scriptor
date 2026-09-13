@@ -14,7 +14,7 @@ use super::{
     now_secs, provider_path, read_job, read_json, reference_for_artifact, sha256_file, unique_id,
     unlock_job, write_job, write_json,
 };
-use crate::resource::CaptureBudget;
+use crate::resource::CaptureBudget as JobBudget;
 
 #[derive(Debug, Deserialize, Serialize)]
 pub(super) struct Derivative {
@@ -98,12 +98,19 @@ pub(super) fn admit(
     resolve_inputs(capture_id, &manifest, target).map(drop)
 }
 
-pub(super) fn admit_retry(job_id: &str, capture_id: &str, recipe: RecipeKind) -> Result<()> {
+pub(super) fn admit_retry(
+    job_id: &str,
+    capture_id: &str,
+    recipe: &Recipe,
+    provider: &str,
+    parameters: &Value,
+) -> Result<()> {
     let previous = read_job(job_id).context("reading retried Derive Job")?;
     let JobOperation::Derive {
         capture_id: previous_capture,
         recipe: previous_recipe,
-        ..
+        provider: previous_provider,
+        parameters: previous_parameters,
     } = previous.operation
     else {
         return Err(coded_error(
@@ -111,7 +118,11 @@ pub(super) fn admit_retry(job_id: &str, capture_id: &str, recipe: RecipeKind) ->
             "retry target is not a Derive Job",
         ));
     };
-    if previous_capture != capture_id || previous_recipe.kind != recipe {
+    if previous_capture != capture_id
+        || previous_recipe != *recipe
+        || previous_provider != provider
+        || previous_parameters != *parameters
+    {
         return Err(coded_error(
             AgentErrorCode::InvalidRetry,
             "retry target does not match the Derive request",
@@ -320,7 +331,7 @@ fn invoke_provider(
     staging: &Path,
 ) -> Result<ProviderResponse> {
     let is_cancelled = || Ok(read_job(&job.id)?.state == "cancelled");
-    let budget = CaptureBudget::new(
+    let budget = JobBudget::new(
         staging,
         job.created_at,
         job.policy.snapshot.limits.duration_limit_secs,
@@ -346,59 +357,27 @@ fn invoke_provider(
 }
 
 pub(super) fn validate_parameters(parameters: &Value) -> Result<()> {
-    if !parameters.is_object() {
+    let Some(fields) = parameters.as_object() else {
         return Err(coded_error(
             AgentErrorCode::SensitiveParameters,
-            "Derive parameters must be a JSON object without secrets",
+            "Derive parameters must follow the non-secret Provider schema",
         ));
-    }
-    reject_sensitive_keys(parameters)
-}
-
-fn reject_sensitive_keys(value: &Value) -> Result<()> {
-    match value {
-        Value::Object(fields) => {
-            for (name, nested) in fields {
-                let normalized = name
-                    .chars()
-                    .filter(char::is_ascii_alphanumeric)
-                    .flat_map(char::to_lowercase)
-                    .collect::<String>();
-                let sensitive = matches!(
-                    normalized.as_str(),
-                    "apikey"
-                        | "apitoken"
-                        | "authorization"
-                        | "cookie"
-                        | "credential"
-                        | "credentials"
-                        | "password"
-                        | "privatekey"
-                        | "secret"
-                        | "secretkey"
-                        | "clientsecret"
-                        | "token"
-                        | "accesstoken"
-                        | "refreshtoken"
-                ) || normalized.ends_with("token")
-                    || normalized.ends_with("secret")
-                    || normalized.ends_with("password")
-                    || normalized.ends_with("credential")
-                    || normalized.ends_with("cookie")
-                    || normalized.ends_with("privatekey");
-                if sensitive {
-                    return Err(coded_error(
-                        AgentErrorCode::SensitiveParameters,
-                        format!("Derive parameters contain sensitive field `{name}`"),
-                    ));
-                }
-                reject_sensitive_keys(nested)?;
-            }
-            Ok(())
+    };
+    for (name, value) in fields {
+        let valid = match name.as_str() {
+            "language" | "model" | "model_sha256" | "style" => value.is_string(),
+            "max_tokens" | "seed" => value.as_u64().is_some(),
+            "temperature" | "top_p" => value.is_number(),
+            _ => false,
+        };
+        if !valid {
+            return Err(coded_error(
+                AgentErrorCode::SensitiveParameters,
+                format!("Derive parameter `{name}` is not allowed by the Provider schema"),
+            ));
         }
-        Value::Array(values) => values.iter().try_for_each(reject_sensitive_keys),
-        _ => Ok(()),
     }
+    Ok(())
 }
 
 pub(super) fn list(capture_id: &str) -> Result<Vec<Derivative>> {

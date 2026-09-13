@@ -55,10 +55,11 @@ Recette. Scriptor borne la durée, l'espace disque et les sorties diagnostiques,
 calcule la version du Provider depuis le hash de son binaire, puis publie le
 Dérivé dans `captures/<capture_id>/derivatives/<derive_id>/`.
 
-Les paramètres demandés et effectifs doivent être des objets JSON sans champ de
-secret, jeton, mot de passe, cookie, autorisation, clé privée ni identifiant
-d'accès.
-Scriptor refuse ces champs avant toute persistance.
+Les paramètres demandés et effectifs suivent un schéma fermé. Les champs texte
+autorisés sont `language`, `model`, `model_sha256` et `style`. `max_tokens` et
+`seed` sont des entiers positifs ; `temperature` et `top_p` sont des nombres.
+Tout autre champ, objet imbriqué ou type est refusé avant persistance. Ce schéma
+exclut notamment secrets, jetons, mots de passe, cookies et autorisations.
 
 Le moteur local derrière `scriptor-local-derive` n'est pas distribué par ce
 projet. Il doit respecter cette interface et être présent dans `PATH`.
