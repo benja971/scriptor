@@ -128,6 +128,16 @@ printf '[{"order":0,"locator":"img","url":"https://cdn.example/image.png","statu
 printf '{"initial_url":"https://93.184.216.34/","final_url":"https://93.184.216.34/final","browser":"firefox"}' > "$out/provenance.json"
 "#;
 
+const SLOW_PAGE_RENDERER: &str = r#"#!/bin/sh
+set -eu
+if [ "${1:-}" = "child" ]; then
+  while :; do :; done
+fi
+"$0" child &
+printf '%s' "$!" > "$XDG_DATA_HOME/scriptor-renderer-child.pid"
+while :; do :; done
+"#;
+
 const FAKE_WHISPER_CLI_FAILURE: &str = r#"#!/bin/sh
 echo "boom: fake whisper-cli failure" >&2
 exit 1
@@ -831,6 +841,63 @@ fn web_capture_requires_safe_web_policy_and_publishes_renderer_artifacts() {
     assert_eq!(
         capture["manifest"]["artifacts"].as_array().map(Vec::len),
         Some(5)
+    );
+}
+
+#[test]
+fn cancelling_web_capture_stops_the_renderer_process_group() {
+    let env = TestEnv::new("safe-web-cancel");
+    write_executable(&env.bin_dir, "scriptor-page-renderer", SLOW_PAGE_RENDERER);
+    let output = env
+        .command()
+        .args([
+            "capture",
+            "https://93.184.216.34/",
+            "--policy",
+            "safe-web@1",
+        ])
+        .assert()
+        .success()
+        .get_output()
+        .stdout
+        .clone();
+    let job_id =
+        serde_json::from_slice::<Value>(&output).expect("Job JSON valide")["job"]["job_id"]
+            .as_str()
+            .expect("identifiant de Job")
+            .to_string();
+    let child_pid_path = env.xdg_data.join("scriptor-renderer-child.pid");
+    assert!(
+        wait_for_file(&child_pid_path, Duration::from_secs(5)),
+        "le renderer n'a pas lancé son enfant"
+    );
+    let child_pid = fs::read_to_string(&child_pid_path)
+        .expect("lecture PID enfant")
+        .parse::<u32>()
+        .expect("PID enfant valide");
+
+    env.command()
+        .args(["job", "cancel", &job_id])
+        .assert()
+        .success();
+    let finished: Value = serde_json::from_slice(
+        &env.command()
+            .args(["job", "wait", &job_id, "--timeout-secs", "5"])
+            .assert()
+            .success()
+            .get_output()
+            .stdout,
+    )
+    .expect("Job JSON valide");
+    assert_eq!(finished["state"], "cancelled", "{finished}");
+    let child_process = Path::new("/proc").join(child_pid.to_string());
+    let deadline = Instant::now() + Duration::from_secs(2);
+    while child_process.exists() && Instant::now() < deadline {
+        std::thread::sleep(Duration::from_millis(20));
+    }
+    assert!(
+        !child_process.exists(),
+        "l'enfant du renderer doit mourir avec son groupe de processus"
     );
 }
 

@@ -18,13 +18,22 @@ pub struct Provenance {
     pub final_url: String,
 }
 
-pub fn capture(
+pub enum Capture {
+    Completed(Provenance),
+    Cancelled,
+}
+
+pub fn capture<F>(
     url: &str,
     staging: &Path,
     deadline: SystemTime,
     disk_byte_limit: u64,
     download_byte_limit: u64,
-) -> Result<Provenance> {
+    is_cancelled: F,
+) -> Result<Capture>
+where
+    F: Fn() -> Result<bool>,
+{
     validate_public_url(url)?;
     let mut command = Command::new("scriptor-page-renderer");
     command
@@ -43,6 +52,11 @@ pub fn capture(
         .spawn()
         .context("launching Playwright page renderer")?;
     loop {
+        if is_cancelled()? {
+            terminate_process_group(&child)?;
+            let _ = child.wait();
+            return Ok(Capture::Cancelled);
+        }
         if SystemTime::now() >= deadline {
             terminate_process_group(&child)?;
             let _ = child.wait();
@@ -87,7 +101,7 @@ pub fn capture(
             bail!("page renderer did not produce {}", path.display());
         }
     }
-    Ok(provenance)
+    Ok(Capture::Completed(provenance))
 }
 
 fn terminate_process_group(child: &Child) -> Result<()> {

@@ -387,13 +387,22 @@ fn publish_web_capture(job: &Job) -> Result<Publication> {
                 .saturating_add(job.policy.snapshot.limits.duration_limit_secs),
         ))
         .context("calculating safe-web Policy deadline")?;
-    let provenance = crate::web::capture(
+    let renderer_capture = crate::web::capture(
         &job.source,
         &staging,
         deadline,
         job.policy.snapshot.limits.disk_byte_limit,
         job.policy.snapshot.limits.download_byte_limit,
+        || Ok(read_job(&job.id)?.state == "cancelled"),
     )?;
+    let provenance = match renderer_capture {
+        crate::web::Capture::Completed(provenance) => provenance,
+        crate::web::Capture::Cancelled => {
+            fs::remove_dir_all(&staging)
+                .context("discarding cancelled Capture staging directory")?;
+            return Ok(Publication::Cancelled);
+        }
+    };
     if directory_size(&staging)? > job.policy.snapshot.limits.disk_byte_limit {
         bail!("Capture exceeds safe-web@1 disk budget");
     }

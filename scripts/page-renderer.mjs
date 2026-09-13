@@ -81,15 +81,21 @@ const createPinnedProxy = async () => {
   return { server, address: `http://127.0.0.1:${address.port}` };
 };
 let artifactBytes = 0;
-const reserveArtifact = async (path) => { artifactBytes += (await stat(path)).size; if (artifactBytes > maxOutputBytes) throw new Error("web_disk_budget_exceeded"); };
-const writeBudgeted = async (path, value) => { await writeFile(path, value); await reserveArtifact(path); };
+const writeBudgeted = async (path, value) => {
+  const bytes = Buffer.byteLength(value);
+  if (artifactBytes + bytes > maxOutputBytes) throw new Error("web_disk_budget_exceeded");
+  await writeFile(path, value);
+  artifactBytes += bytes;
+  if ((await stat(path)).size !== bytes) throw new Error("web_disk_budget_exceeded");
+};
 try {
   await assertPublic(initialUrl); await mkdir(join(outputDir, "proofs"), { recursive: true }); await mkdir(join(outputDir, "extractions"), { recursive: true });
   const proxy = await createPinnedProxy(); let browser; let browserName = "firefox";
   try { browser = await firefox.launch({ headless: true, proxy: { server: proxy.address } }); } catch { browserName = "chromium"; browser = await chromium.launch({ headless: true, proxy: { server: proxy.address } }); }
   try {
-    const context = await browser.newContext({ serviceWorkers: "block" });
+    const context = await browser.newContext({ serviceWorkers: "block", viewport: { width: 1280, height: 720 } });
     await context.route("**/*", async (route) => { try { await assertPublic(route.request().url()); await route.continue(); } catch { await route.abort("blockedbyclient"); } });
+    await context.routeWebSocket("**/*", async (webSocket) => { await webSocket.close({ code: 1008, reason: "WebSocket capture is disabled" }); });
     const page = await context.newPage(); await page.goto(initialUrl, { waitUntil: "networkidle", timeout: 30_000 }); await assertPublic(page.url());
     const [dom, markdown, discoveries] = await page.evaluate(() => {
       const extensions = /\.(pdf|docx?|odt|rtf)$/i;
@@ -98,6 +104,6 @@ try {
       const findings = []; for (const node of document.querySelectorAll("img,audio,video,source,iframe,embed,object,a[href]")) { const attributes = node.tagName === "A" ? [node.getAttribute("href")] : [node.getAttribute("src"), node.getAttribute("data"), ...(node.getAttribute("srcset") ?? "").split(",").map((entry) => entry.trim().split(/\s+/)[0])]; for (const raw of attributes.filter(Boolean)) { const url = new URL(raw, document.baseURI).href; if (node.tagName !== "A" || extensions.test(new URL(url).pathname)) findings.push({ type: node.tagName.toLowerCase(), parent_locator: { type: "url", value: document.baseURI }, locator: { type: "css", value: cssPath(node) }, url, status: "inventoried", reason: node.tagName === "A" ? "linked_document" : "embedded_content" }); } }
       return [document.documentElement.outerHTML, text, findings];
     });
-    await writeBudgeted(join(outputDir, "proofs/dom.html"), dom); await writeBudgeted(join(outputDir, "extractions/page.md"), markdown); await writeBudgeted(join(outputDir, "discoveries.json"), JSON.stringify(discoveries)); await page.screenshot({ path: join(outputDir, "proofs/screenshot.png"), fullPage: true }); await reserveArtifact(join(outputDir, "proofs/screenshot.png")); await writeBudgeted(join(outputDir, "provenance.json"), JSON.stringify({ initial_url: initialUrl, final_url: page.url(), browser: browserName }));
+    await writeBudgeted(join(outputDir, "proofs/dom.html"), dom); await writeBudgeted(join(outputDir, "extractions/page.md"), markdown); await writeBudgeted(join(outputDir, "discoveries.json"), JSON.stringify(discoveries)); const screenshot = await page.screenshot({ type: "png" }); await writeBudgeted(join(outputDir, "proofs/screenshot.png"), screenshot); await writeBudgeted(join(outputDir, "provenance.json"), JSON.stringify({ initial_url: initialUrl, final_url: page.url(), browser: browserName }));
   } finally { await browser.close(); await new Promise((resolve) => proxy.server.close(resolve)); }
 } catch (error) { process.stderr.write(`${error.message}\n`); process.exitCode = 1; }
