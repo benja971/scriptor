@@ -68,6 +68,7 @@ impl Acquisition for SocialAcquisition<'_> {
         let version = String::from_utf8_lossy(&version.stdout).trim().to_string();
         let output = Command::new("yt-dlp")
             .args([
+                "--skip-download",
                 "--dump-single-json",
                 "--ignore-no-formats-error",
                 "--no-playlist",
@@ -86,7 +87,7 @@ impl Acquisition for SocialAcquisition<'_> {
         let provider = Provider {
             name: "instagram-provider".to_string(),
             version: "1".to_string(),
-            parameters: json!({"yt_dlp_version":version, "dump_single_json":true, "ignore_no_formats_error":true}),
+            parameters: json!({"yt_dlp_version":version, "skip_download":true, "dump_single_json":true, "ignore_no_formats_error":true}),
             dependencies: vec![ProviderDependency {
                 name: "yt-dlp".to_string(),
                 version,
@@ -129,7 +130,7 @@ impl Acquisition for SocialAcquisition<'_> {
             proof_artifact_id: metadata_proof.artifact_id.clone(),
             created_at: now_secs(),
         };
-        let image_url = image_url(&metadata).context("Instagram metadata has no photo URL")?;
+        let media_urls = instagram_media_urls(&metadata)?;
         let deadline = UNIX_EPOCH
             .checked_add(Duration::from_secs(
                 self.job
@@ -137,24 +138,44 @@ impl Acquisition for SocialAcquisition<'_> {
                     .saturating_add(self.job.policy.snapshot.limits.duration_limit_secs),
             ))
             .context("calculating Instagram acquisition deadline")?;
-        let acquired = crate::web::acquire_binary(
-            image_url,
-            capture.staging(),
-            deadline,
-            self.job.policy.snapshot.limits.disk_byte_limit,
-            self.job.policy.snapshot.limits.download_byte_limit,
-            || Ok(read_job(&self.job.id)?.state == "cancelled"),
-        )?;
-        let media_relative = format!("proofs/media-0.{}", extension(&acquired.mime));
-        fs::copy(&acquired.path, capture.staging().join(&media_relative))
-            .context("materializing Instagram photo")?;
-        let media = proof(
-            capture.staging(),
-            "media-0",
-            &media_relative,
-            &acquired.mime,
-            Some(0),
-        )?;
+        let mut artifacts = Vec::new();
+        let mut media_provenance = Vec::new();
+        let mut capabilities = vec![
+            success("metadata", provider.clone()),
+            success("caption", provider.clone()),
+        ];
+        for (index, media_url) in media_urls.iter().enumerate() {
+            let order = u32::try_from(index).context("converting Instagram media order")?;
+            let acquisition_staging = capture.staging().join(format!("media-acquisition-{order}"));
+            let acquired = crate::web::acquire_binary(
+                media_url,
+                &acquisition_staging,
+                deadline,
+                self.job.policy.snapshot.limits.disk_byte_limit,
+                self.job.policy.snapshot.limits.download_byte_limit,
+                || Ok(read_job(&self.job.id)?.state == "cancelled"),
+            )?;
+            let media_relative = format!("proofs/media-{order}.{}", extension(&acquired.mime));
+            fs::copy(&acquired.path, capture.staging().join(&media_relative))
+                .context("materializing Instagram media")?;
+            artifacts.push(proof(
+                capture.staging(),
+                &format!("media-{order}"),
+                &media_relative,
+                &acquired.mime,
+                Some(order),
+            )?);
+            capabilities.push(success(&format!("media-{order}"), provider.clone()));
+            media_provenance.push(RemoteMediaProvenance {
+                order,
+                requested_url: acquired.requested_url,
+                final_url: acquired.final_url,
+                mime: acquired.mime,
+                sha256: acquired.sha256,
+                size_bytes: acquired.size_bytes,
+                redirect_chain: acquired.redirect_chain,
+            });
+        }
         let canonical_url = metadata
             .get("webpage_url")
             .and_then(Value::as_str)
@@ -172,12 +193,8 @@ impl Acquisition for SocialAcquisition<'_> {
             published_at: now_secs(),
             proof: metadata_proof.clone(),
             extractions: vec![caption_extraction],
-            capabilities: vec![
-                success("metadata", provider.clone()),
-                success("caption", provider.clone()),
-                success("media-0", provider),
-            ],
-            artifacts: vec![media],
+            capabilities,
+            artifacts,
             discoveries: Vec::new(),
             remote_provenance: Some(RemoteProvenance {
                 requested_url: self.url.to_string(),
@@ -200,15 +217,7 @@ impl Acquisition for SocialAcquisition<'_> {
                     .get("upload_date")
                     .and_then(Value::as_str)
                     .map(str::to_string),
-                media: vec![RemoteMediaProvenance {
-                    order: 0,
-                    requested_url: acquired.requested_url,
-                    final_url: acquired.final_url,
-                    mime: acquired.mime,
-                    sha256: acquired.sha256,
-                    size_bytes: acquired.size_bytes,
-                    redirect_chain: acquired.redirect_chain,
-                }],
+                media: media_provenance,
             }),
         };
         Ok(AcquisitionResult::Ready(PreparedCapture::new(
@@ -429,21 +438,44 @@ fn json_name(value: &Value) -> Option<&str> {
     }
 }
 
-fn image_url(metadata: &Value) -> Option<&str> {
-    metadata.get("url").and_then(Value::as_str).or_else(|| {
-        metadata
-            .get("thumbnails")
-            .and_then(Value::as_array)?
-            .last()?
-            .get("url")?
-            .as_str()
-    })
+fn instagram_media_urls(metadata: &Value) -> Result<Vec<&str>> {
+    let entries = metadata.get("entries").and_then(Value::as_array);
+    let values = entries.map_or_else(|| vec![metadata], |entries| entries.iter().collect());
+    values
+        .into_iter()
+        .map(instagram_media_url)
+        .collect::<Option<Vec<_>>>()
+        .context("Instagram metadata has no media URL")
+}
+
+fn instagram_media_url(metadata: &Value) -> Option<&str> {
+    metadata
+        .get("url")
+        .and_then(Value::as_str)
+        .or_else(|| {
+            metadata
+                .get("formats")
+                .and_then(Value::as_array)?
+                .iter()
+                .find(|format| format.get("vcodec").and_then(Value::as_str) != Some("none"))?
+                .get("url")?
+                .as_str()
+        })
+        .or_else(|| {
+            metadata
+                .get("thumbnails")
+                .and_then(Value::as_array)?
+                .last()?
+                .get("url")?
+                .as_str()
+        })
 }
 fn extension(mime: &str) -> &'static str {
     match mime {
         "image/jpeg" => "jpg",
         "image/png" => "png",
         "image/webp" => "webp",
+        "video/mp4" => "mp4",
         _ => "bin",
     }
 }

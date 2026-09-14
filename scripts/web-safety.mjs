@@ -55,6 +55,7 @@ export const createPinnedProxy = async (limit, resolveTarget = resolvedTarget) =
       const upstream = connect({ host: await resolveTarget(host, port), port });
       upstream.once("connect", () => { client.write("HTTP/1.1 200 Connection Established\r\n\r\n"); if (head.length) upstream.write(head); for (const stream of [client, upstream]) stream.on("data", (chunk) => { try { reserve(chunk.length); } catch (error) { recordFailure(error); client.destroy(); upstream.destroy(); } }); client.pipe(upstream); upstream.pipe(client); });
       upstream.on("error", () => client.destroy());
+      client.on("error", () => upstream.destroy());
     } catch (error) { recordFailure(error); client.destroy(); }
   });
   await new Promise((resolve, reject) => { server.once("error", reject); server.listen(0, "127.0.0.1", resolve); });
