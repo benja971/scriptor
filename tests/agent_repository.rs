@@ -231,7 +231,7 @@ fn search_uses_its_projection_and_reports_when_it_is_unavailable() {
         .success()
         .stdout(predicate::str::contains("\"code\":\"invalid_cursor\""));
 
-    fs::remove_file(repository.repository_path().join("index.json"))
+    fs::remove_dir_all(repository.repository_path().join("index"))
         .expect("suppression de la projection de recherche");
     let unavailable: Value = serde_json::from_slice(
         &repository
@@ -456,8 +456,12 @@ fn agent_commands_return_structured_json_for_runtime_and_clap_errors() {
 #[test]
 fn index_failure_after_publication_does_not_fail_the_capture_job() {
     let repository = TestRepository::new("index-degradation");
-    fs::create_dir_all(repository.repository_path().join("index.json"))
-        .expect("création d'une cible d'Index invalide");
+    fs::create_dir_all(repository.repository_path()).expect("création du Référentiel");
+    fs::write(
+        repository.repository_path().join("index"),
+        b"not a directory",
+    )
+    .expect("création d'une cible d'Index invalide");
 
     let finished = repository.capture("published.txt", b"published despite Index failure");
     assert_eq!(finished["state"], "succeeded");

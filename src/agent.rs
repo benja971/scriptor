@@ -13,6 +13,10 @@ use fs2::FileExt;
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use sha2::{Digest, Sha256};
+use tantivy::collector::TopDocs;
+use tantivy::query::QueryParser;
+use tantivy::schema::{STORED, STRING, Schema, TEXT, Value as TantivyValue};
+use tantivy::{Index, TantivyDocument, doc};
 use url::Url;
 
 use crate::config::Config;
@@ -491,22 +495,6 @@ struct CaptureSummary {
 struct CapturePage {
     captures: Vec<CaptureSummary>,
     next_cursor: Option<String>,
-}
-
-#[derive(Serialize, Deserialize)]
-struct SearchIndex {
-    version: u8,
-    captures: Vec<IndexedCapture>,
-}
-
-#[derive(Serialize, Deserialize)]
-struct IndexedCapture {
-    capture_id: String,
-    source: SourceIdentity,
-    policy: Policy,
-    published_at: u64,
-    proof: Proof,
-    search_text: String,
 }
 
 #[derive(Deserialize, Serialize)]
@@ -2932,63 +2920,63 @@ fn search_captures(query: &str, cursor: Option<&str>, limit: usize) -> Result<()
     if let Some(error) = read_index_degradation()? {
         return print_json(&AgentError { error });
     }
-    let index: SearchIndex = match read_json(&search_index_path()?) {
+    let index = match Index::open_in_dir(search_index_path()?) {
         Ok(index) => index,
         Err(error) => {
             return print_json(&AgentError {
                 error: StructuredError {
                     code: "index_unavailable".to_string(),
-                    message: format!("search Index is unavailable: {error:#}"),
+                    message: format!("search Index is unavailable: {error}"),
                     capability: None,
                 },
             });
         }
     };
-    if index.version != 1 {
-        return print_json(&AgentError {
-            error: StructuredError {
-                code: "index_unavailable".to_string(),
-                message: "search Index version is unsupported".to_string(),
-                capability: None,
-            },
-        });
-    }
-    let normalized_query = query.to_lowercase();
+    let schema = index.schema();
+    let capture_id = schema
+        .get_field("capture_id")
+        .context("reading capture_id Search field")?;
+    let source = schema
+        .get_field("source")
+        .context("reading source Search field")?;
+    let text = schema
+        .get_field("text")
+        .context("reading text Search field")?;
+    let mut parser = QueryParser::for_index(&index, vec![source, text]);
+    parser.set_conjunction_by_default();
+    let parsed = parser
+        .parse_query(query)
+        .map_err(|error| anyhow::anyhow!(error))
+        .context("parsing Search query")?;
+    let reader = index
+        .reader()
+        .map_err(|error| anyhow::anyhow!(error))
+        .context("opening Search reader")?;
+    let searcher = reader.searcher();
+    let max_hits =
+        usize::try_from(searcher.num_docs()).context("converting Search result limit")?;
+    let hits = searcher
+        .search(&parsed, &TopDocs::with_limit(max_hits).order_by_score())
+        .map_err(|error| anyhow::anyhow!(error))
+        .context("searching Captures")?;
+    let mut manifests_by_id = list_manifests()?
+        .into_iter()
+        .map(|manifest| (manifest.capture_id.clone(), manifest))
+        .collect::<std::collections::BTreeMap<_, _>>();
+    let manifests = hits
+        .into_iter()
+        .filter_map(|(_, address)| {
+            let document: TantivyDocument = searcher.doc(address).ok()?;
+            let capture_id = document.get_first(capture_id)?.as_str()?;
+            manifests_by_id.remove(capture_id)
+        })
+        .collect::<Vec<_>>();
     let binding = CursorBinding {
         operation: "search",
-        query: Some(normalized_query.clone()),
-        snapshot: sha256_bytes(
-            &serde_json::to_vec(&index).context("serializing search Index snapshot")?,
-        ),
-        index_version: Some(index.version),
+        query: Some(query.to_string()),
+        snapshot: snapshot_for(&manifests)?,
+        index_version: Some(2),
     };
-    let manifests = index
-        .captures
-        .into_iter()
-        .filter(|capture| {
-            capture
-                .source
-                .locator
-                .to_lowercase()
-                .contains(&normalized_query)
-                || capture
-                    .search_text
-                    .to_lowercase()
-                    .contains(&normalized_query)
-        })
-        .map(|capture| Manifest {
-            capture_id: capture.capture_id,
-            source: capture.source,
-            policy: capture.policy,
-            published_at: capture.published_at,
-            proof: capture.proof,
-            extractions: Vec::new(),
-            capabilities: Vec::new(),
-            artifacts: Vec::new(),
-            discoveries: Vec::new(),
-            remote_provenance: None,
-        })
-        .collect();
     print_json(&capture_page(manifests, cursor, limit, &binding)?)
 }
 
@@ -3195,32 +3183,16 @@ fn list_manifests() -> Result<Vec<Manifest>> {
 
 fn rebuild_search_index() -> Result<usize> {
     let lock = lock_search_index()?;
-    let captures: Vec<IndexedCapture> = list_manifests()?
-        .into_iter()
-        .map(|manifest| {
-            let search_text = search_text_for(&manifest)?;
-            Ok(IndexedCapture {
-                capture_id: manifest.capture_id,
-                source: manifest.source,
-                policy: manifest.policy,
-                published_at: manifest.published_at,
-                proof: manifest.proof,
-                search_text,
-            })
-        })
-        .collect::<Result<_>>()?;
-    let count = captures.len();
-    write_search_index(&SearchIndex {
-        version: 1,
-        captures,
-    })?;
+    let manifests = list_manifests()?;
+    let count = manifests.len();
+    write_search_index(&manifests)?;
     clear_index_degradation()?;
     unlock_search_index(&lock)?;
     Ok(count)
 }
 
 fn search_index_path() -> Result<PathBuf> {
-    Ok(repository_dir()?.join("index.json"))
+    Ok(repository_dir()?.join("index"))
 }
 
 fn lock_search_index() -> Result<File> {
@@ -3242,12 +3214,39 @@ fn unlock_search_index(file: &File) -> Result<()> {
     FileExt::unlock(file).context("unlocking search Index")
 }
 
-fn write_search_index(index: &SearchIndex) -> Result<()> {
+fn write_search_index(manifests: &[Manifest]) -> Result<()> {
     let path = search_index_path()?;
-    let temporary = path.with_file_name(format!(".index-{}.tmp", unique_id()));
-    let data = serde_json::to_vec_pretty(index).context("serializing search Index")?;
-    fs::write(&temporary, data)
-        .with_context(|| format!("writing search Index {}", temporary.display()))?;
+    let temporary = path.with_file_name(format!(".index-{}", unique_id()));
+    fs::create_dir_all(&temporary)
+        .with_context(|| format!("creating Search Index {}", temporary.display()))?;
+    let mut schema_builder = Schema::builder();
+    let capture_id = schema_builder.add_text_field("capture_id", STRING | STORED);
+    let source = schema_builder.add_text_field("source", TEXT);
+    let text = schema_builder.add_text_field("text", TEXT);
+    let index = Index::create_in_dir(&temporary, schema_builder.build())
+        .map_err(|error| anyhow::anyhow!(error))
+        .context("creating Search Index")?;
+    let mut writer = index
+        .writer(50_000_000)
+        .map_err(|error| anyhow::anyhow!(error))
+        .context("creating Search writer")?;
+    for manifest in manifests {
+        writer
+            .add_document(doc!(capture_id => manifest.capture_id.clone(), source => manifest.source.locator.clone(), text => search_text_for(manifest)?))
+            .map_err(|error| anyhow::anyhow!(error))
+            .context("indexing Capture")?;
+    }
+    writer
+        .commit()
+        .map_err(|error| anyhow::anyhow!(error))
+        .context("publishing Search Index")?;
+    if path
+        .try_exists()
+        .context("checking previous Search Index")?
+    {
+        fs::remove_dir_all(&path)
+            .with_context(|| format!("removing Search Index {}", path.display()))?;
+    }
     fs::rename(&temporary, &path)
         .with_context(|| format!("publishing search Index {}", path.display()))
 }
