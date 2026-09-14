@@ -231,6 +231,25 @@ printf 'photo' > "$out/payload"
 printf '{"requested_url":"%s","final_url":"%s","mime":"image/jpeg","sha256":"55c64d0fcd6f9d5f7c828093857e3fdfda68478bb4e9bd24d481ef391c7804e8","size_bytes":5,"redirect_chain":["%s"]}' "$url" "$url" "$url" > "$out/metadata.json"
 "#;
 
+const FAKE_LINKEDIN_BINARY_ACQUIRER: &str = r#"#!/bin/sh
+set -eu
+url=""
+while [ "$#" -gt 0 ]; do
+  case "$1" in
+    --url) url="$2"; shift 2 ;;
+    --output-dir) out="$2"; shift 2 ;;
+    *) shift ;;
+  esac
+done
+if [ "$url" = "https://www.linkedin.com/posts/post-1/" ]; then
+  printf '<script type="application/ld+json">{"@type":"SocialMediaPosting","articleBody":"Caption LinkedIn complete","image":{"url":"https://93.184.216.34/linkedin-photo.jpg"},"url":"https://www.linkedin.com/posts/post-1/","identifier":"post-1","author":{"name":"Alice"},"datePublished":"2026-09-14"}</script>' > "$out/payload"
+  printf '{"requested_url":"%s","final_url":"%s","mime":"text/html","sha256":"4dd05b7a8767936145cbbbba6d585558624b9fe118fd28e68084a704c572d9c6","size_bytes":299,"redirect_chain":["%s"]}' "$url" "$url" "$url" > "$out/metadata.json"
+else
+  printf 'photo' > "$out/payload"
+  printf '{"requested_url":"%s","final_url":"%s","mime":"image/jpeg","sha256":"55c64d0fcd6f9d5f7c828093857e3fdfda68478bb4e9bd24d481ef391c7804e8","size_bytes":5,"redirect_chain":["%s"]}' "$url" "$url" "$url" > "$out/metadata.json"
+fi
+"#;
+
 const FAKE_PAGE_RENDERER_TREE: &str = r#"#!/bin/sh
 set -eu
 url=""
@@ -1356,6 +1375,57 @@ fn capture_instagram_photo_preserves_caption_and_media_without_renderer() {
     assert_eq!(manifest["artifacts"][0]["mime"], "image/jpeg");
     assert_eq!(manifest["remote_provenance"]["media"][0]["size_bytes"], 5);
     assert_eq!(manifest["capabilities"][1]["state"], "succeeded");
+}
+
+#[test]
+fn capture_linkedin_photo_preserves_caption_and_media_without_renderer() {
+    let env = TestEnv::new("linkedin-photo");
+    env.install_binary("scriptor-binary-acquirer", FAKE_LINKEDIN_BINARY_ACQUIRER);
+    env.install_binary("scriptor-page-renderer", "#!/bin/sh\nexit 99\n");
+    let created: Value = serde_json::from_slice(
+        &env.command()
+            .args([
+                "capture",
+                "https://www.linkedin.com/posts/post-1/",
+                "--policy",
+                "safe-web@1",
+            ])
+            .assert()
+            .success()
+            .get_output()
+            .stdout,
+    )
+    .expect("Job JSON valide");
+    let job_id = created["job"]["job_id"]
+        .as_str()
+        .expect("identifiant de Job");
+    let job: Value = serde_json::from_slice(
+        &env.command()
+            .args(["job", "wait", job_id, "--timeout-secs", "5"])
+            .assert()
+            .success()
+            .get_output()
+            .stdout,
+    )
+    .expect("Job terminé JSON valide");
+    assert_eq!(job["state"], "succeeded", "{job}");
+    let capture_id = job["capture_id"].as_str().expect("identifiant de Capture");
+    let capture: Value = serde_json::from_slice(
+        &env.command()
+            .args(["capture", "inspect", capture_id])
+            .assert()
+            .success()
+            .get_output()
+            .stdout,
+    )
+    .expect("Capture JSON valide");
+    let manifest = &capture["manifest"];
+    assert_eq!(manifest["proof"]["artifact_id"], "proof-linkedin-metadata");
+    assert_eq!(manifest["extractions"][0]["size_bytes"], 25);
+    assert_eq!(manifest["artifacts"][0]["order"], 0);
+    assert_eq!(manifest["artifacts"][0]["mime"], "image/jpeg");
+    assert_eq!(manifest["remote_provenance"]["platform"], "linkedin");
+    assert_eq!(manifest["remote_provenance"]["media"][0]["size_bytes"], 5);
 }
 
 #[test]
