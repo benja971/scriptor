@@ -71,7 +71,6 @@ impl Acquisition for SocialAcquisition<'_> {
                 "--skip-download",
                 "--dump-single-json",
                 "--ignore-no-formats-error",
-                "--no-playlist",
                 self.url,
             ])
             .output()
@@ -144,6 +143,7 @@ impl Acquisition for SocialAcquisition<'_> {
             success("metadata", provider.clone()),
             success("caption", provider.clone()),
         ];
+        let mut partial = false;
         for (index, media_url) in media_urls.iter().enumerate() {
             let order = u32::try_from(index).context("converting Instagram media order")?;
             let acquisition_staging = capture.staging().join(format!("media-acquisition-{order}"));
@@ -154,7 +154,19 @@ impl Acquisition for SocialAcquisition<'_> {
                 self.job.policy.snapshot.limits.disk_byte_limit,
                 self.job.policy.snapshot.limits.download_byte_limit,
                 || Ok(read_job(&self.job.id)?.state == "cancelled"),
-            )?;
+            );
+            let acquired = match acquired {
+                Ok(acquired) => acquired,
+                Err(error) => {
+                    partial = true;
+                    capabilities.push(super::failed_capability(
+                        &format!("media-{order}"),
+                        provider.clone(),
+                        &error,
+                    ));
+                    continue;
+                }
+            };
             let media_relative = format!("proofs/media-{order}.{}", extension(&acquired.mime));
             fs::copy(&acquired.path, capture.staging().join(&media_relative))
                 .context("materializing Instagram media")?;
@@ -175,6 +187,9 @@ impl Acquisition for SocialAcquisition<'_> {
                 size_bytes: acquired.size_bytes,
                 redirect_chain: acquired.redirect_chain,
             });
+        }
+        if artifacts.is_empty() {
+            bail!("Instagram metadata media acquisition failed");
         }
         let canonical_url = metadata
             .get("webpage_url")
@@ -221,7 +236,7 @@ impl Acquisition for SocialAcquisition<'_> {
             }),
         };
         Ok(AcquisitionResult::Ready(PreparedCapture::new(
-            manifest, false,
+            manifest, partial,
         )))
     }
 }
@@ -289,24 +304,60 @@ fn acquire_linkedin(
         proof_artifact_id: metadata_proof.artifact_id.clone(),
         created_at: now_secs(),
     };
-    let acquired = crate::web::acquire_binary(
-        &post.image_url,
-        capture.staging(),
-        deadline,
-        job.policy.snapshot.limits.disk_byte_limit,
-        job.policy.snapshot.limits.download_byte_limit,
-        || Ok(read_job(&job.id)?.state == "cancelled"),
-    )?;
-    let media_relative = format!("proofs/media-0.{}", extension(&acquired.mime));
-    fs::copy(&acquired.path, capture.staging().join(&media_relative))
-        .context("materializing LinkedIn photo")?;
-    let media = proof(
-        capture.staging(),
-        "media-0",
-        &media_relative,
-        &acquired.mime,
-        Some(0),
-    )?;
+    let mut artifacts = Vec::new();
+    let mut media_provenance = Vec::new();
+    let mut capabilities = vec![
+        success("metadata", provider.clone()),
+        success("caption", provider.clone()),
+    ];
+    let mut partial = false;
+    for (index, media_url) in post.media_urls.iter().enumerate() {
+        let order = u32::try_from(index).context("converting LinkedIn media order")?;
+        let acquisition_staging = capture.staging().join(format!("media-acquisition-{order}"));
+        let acquired = crate::web::acquire_binary(
+            media_url,
+            &acquisition_staging,
+            deadline,
+            job.policy.snapshot.limits.disk_byte_limit,
+            job.policy.snapshot.limits.download_byte_limit,
+            || Ok(read_job(&job.id)?.state == "cancelled"),
+        );
+        let acquired = match acquired {
+            Ok(acquired) => acquired,
+            Err(error) => {
+                partial = true;
+                capabilities.push(super::failed_capability(
+                    &format!("media-{order}"),
+                    provider.clone(),
+                    &error,
+                ));
+                continue;
+            }
+        };
+        let media_relative = format!("proofs/media-{order}.{}", extension(&acquired.mime));
+        fs::copy(&acquired.path, capture.staging().join(&media_relative))
+            .context("materializing LinkedIn media")?;
+        artifacts.push(proof(
+            capture.staging(),
+            &format!("media-{order}"),
+            &media_relative,
+            &acquired.mime,
+            Some(order),
+        )?);
+        capabilities.push(success(&format!("media-{order}"), provider.clone()));
+        media_provenance.push(RemoteMediaProvenance {
+            order,
+            requested_url: acquired.requested_url,
+            final_url: acquired.final_url,
+            mime: acquired.mime,
+            sha256: acquired.sha256,
+            size_bytes: acquired.size_bytes,
+            redirect_chain: acquired.redirect_chain,
+        });
+    }
+    if artifacts.is_empty() {
+        bail!("LinkedIn structured metadata media acquisition failed");
+    }
     let final_url = post
         .canonical_url
         .clone()
@@ -321,12 +372,8 @@ fn acquire_linkedin(
         published_at: now_secs(),
         proof: metadata_proof.clone(),
         extractions: vec![caption_extraction],
-        capabilities: vec![
-            success("metadata", provider.clone()),
-            success("caption", provider.clone()),
-            success("media-0", provider),
-        ],
-        artifacts: vec![media],
+        capabilities,
+        artifacts,
         discoveries: Vec::new(),
         remote_provenance: Some(RemoteProvenance {
             requested_url: url.to_string(),
@@ -340,25 +387,17 @@ fn acquire_linkedin(
             post_id: post.id,
             author: post.author,
             published_at: post.published_at,
-            media: vec![RemoteMediaProvenance {
-                order: 0,
-                requested_url: acquired.requested_url,
-                final_url: acquired.final_url,
-                mime: acquired.mime,
-                sha256: acquired.sha256,
-                size_bytes: acquired.size_bytes,
-                redirect_chain: acquired.redirect_chain,
-            }],
+            media: media_provenance,
         }),
     };
     Ok(AcquisitionResult::Ready(PreparedCapture::new(
-        manifest, false,
+        manifest, partial,
     )))
 }
 
 struct LinkedInPost {
     caption: String,
-    image_url: String,
+    media_urls: Vec<String>,
     canonical_url: Option<String>,
     id: Option<String>,
     author: Option<String>,
@@ -383,10 +422,11 @@ fn linkedin_post(raw: &[u8]) -> Result<LinkedInPost> {
         .or_else(|| json_string(post, "description"))
         .unwrap_or_default()
         .to_string();
-    let image_url = json_image_url(post).context("LinkedIn JSON-LD has no publication image")?;
+    let media_urls =
+        linkedin_media_urls(post).context("LinkedIn JSON-LD has no publication media")?;
     Ok(LinkedInPost {
         caption,
-        image_url: image_url.to_string(),
+        media_urls,
         canonical_url: json_string(post, "url").map(str::to_string),
         id: json_string(post, "identifier").map(str::to_string),
         author: post.get("author").and_then(json_name).map(str::to_string),
@@ -407,7 +447,10 @@ fn linkedin_json_ld(html: &str) -> Option<&str> {
 fn find_linkedin_post(value: &Value) -> Option<&Value> {
     match value {
         Value::Object(object) => {
-            if object.contains_key("articleBody") || object.contains_key("image") {
+            if object.contains_key("articleBody")
+                || object.contains_key("image")
+                || object.contains_key("contentUrl")
+            {
                 Some(value)
             } else {
                 object.values().find_map(find_linkedin_post)
@@ -422,8 +465,27 @@ fn json_string<'a>(value: &'a Value, key: &str) -> Option<&'a str> {
     value.get(key).and_then(Value::as_str)
 }
 
+fn linkedin_media_urls(value: &Value) -> Option<Vec<String>> {
+    let video = value.get("contentUrl").and_then(Value::as_str);
+    let image = value.get("image");
+    let urls = match image {
+        Some(Value::Array(images)) => images
+            .iter()
+            .filter_map(json_image_url)
+            .map(str::to_string)
+            .collect(),
+        Some(image) => json_image_url(image).map(|url| vec![url.to_string()])?,
+        None => Vec::new(),
+    };
+    Some(if urls.is_empty() {
+        video.map(|url| vec![url.to_string()])?
+    } else {
+        urls
+    })
+}
+
 fn json_image_url(value: &Value) -> Option<&str> {
-    match value.get("image")? {
+    match value {
         Value::String(url) => Some(url),
         Value::Object(image) => image.get("url").and_then(Value::as_str),
         _ => None,
