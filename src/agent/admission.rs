@@ -40,16 +40,27 @@ fn admit_local(source: &Path) -> Result<Source> {
 }
 
 fn admit_web(source: &Path, policy: &Policy) -> Result<Source> {
-    if policy.snapshot.allowed_providers.iter().any(|provider| {
-        !matches!(
-            provider.as_str(),
-            "ffmpeg" | "ffprobe" | "whisper-cli" | "pdftotext" | "pdfinfo" | "tesseract"
-        )
-    }) {
-        bail!("safe-web@1 does not permit remote Providers");
+    const SAFE_WEB_PROVIDERS: &[&str] = &[
+        "ffmpeg",
+        "ffprobe",
+        "whisper-cli",
+        "pdftotext",
+        "pdfinfo",
+        "tesseract",
+        "page-renderer",
+        "instagram-provider",
+        "linkedin-provider",
+        "scriptor-binary-acquirer",
+        "yt-dlp",
+    ];
+    if policy
+        .snapshot
+        .allowed_providers
+        .iter()
+        .any(|provider| !SAFE_WEB_PROVIDERS.contains(&provider.as_str()))
+    {
+        bail!("safe-web@1 has an unsupported Provider");
     }
-    crate::binary::ensure_present("scriptor-page-renderer")
-        .context("safe-web@1 requires the Nix PageRenderer runtime")?;
     let url = source.to_str().context("Web Source must be valid UTF-8")?;
     crate::web::validate_public_url(url)?;
     Ok(Source::Web(url.to_string()))

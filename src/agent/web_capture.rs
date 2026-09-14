@@ -112,6 +112,12 @@ impl Acquisition for WebAcquisition<'_> {
                 } else {
                     provenance.redirect_chain
                 },
+                canonical_url: None,
+                platform: None,
+                post_id: None,
+                author: None,
+                published_at: None,
+                media: Vec::new(),
             }),
         };
         Ok(AcquisitionResult::Ready(PreparedCapture::new(
@@ -182,5 +188,6 @@ fn proof_for(staging: &Path, artifact_id: &str, path: &str, mime: &str) -> Resul
             .len(),
         locator: Locator::File,
         created_at: now_secs(),
+        order: None,
     })
 }

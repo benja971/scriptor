@@ -13,17 +13,6 @@ pub fn binary_exists_in(name: &str, path_env: &OsStr) -> bool {
     env::split_paths(path_env).any(|dir| is_executable_file(&dir.join(name)))
 }
 
-/// Vérifie que le binaire `name` est présent dans le `PATH` ambiant du
-/// process courant, avec le message d'erreur standard sinon.
-///
-/// # Errors
-///
-/// Retourne une erreur si le binaire est absent du `PATH`.
-pub fn ensure_present(name: &str) -> Result<()> {
-    let path_env = env::var_os("PATH").unwrap_or_default();
-    ensure_present_in(name, &path_env)
-}
-
 /// Variante de [`ensure_present`] acceptant un `PATH` explicite (cf.
 /// [`binary_exists_in`]).
 ///

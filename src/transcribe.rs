@@ -1,4 +1,5 @@
 use std::env;
+#[cfg(test)]
 use std::ffi::OsStr;
 use std::path::{Path, PathBuf};
 use std::process::Command;
@@ -7,34 +8,6 @@ use anyhow::{Context, Result, bail};
 
 use crate::binary::ensure_present_in;
 use crate::resource::ResourceBudget;
-
-/// Transcrit `audio_wav` avec `whisper-cli`, en utilisant le modèle situé à
-/// `model_path`, la langue `language` et `threads` threads. Écrit le
-/// résultat en `.txt` à côté de `output_basename` et retourne son chemin.
-///
-/// # Errors
-///
-/// Retourne une erreur si le binaire `whisper-cli` est absent du `PATH`, si
-/// le process ne peut pas être lancé, ou si `whisper-cli` termine avec un
-/// code de sortie non nul (le message d'erreur inclut alors stdout/stderr du
-/// process).
-pub fn transcribe(
-    model_path: &Path,
-    audio_wav: &Path,
-    language: &str,
-    threads: u32,
-    output_basename: &Path,
-) -> Result<PathBuf> {
-    let path_env = env::var_os("PATH").unwrap_or_default();
-    transcribe_with_path(
-        model_path,
-        audio_wav,
-        language,
-        threads,
-        output_basename,
-        &path_env,
-    )
-}
 
 pub fn transcribe_limited(
     model_path: &Path,
@@ -75,6 +48,7 @@ pub fn transcribe_limited(
     Ok(output_basename.with_extension("txt"))
 }
 
+#[cfg(test)]
 fn transcribe_with_path(
     model_path: &Path,
     audio_wav: &Path,
