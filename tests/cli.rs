@@ -211,6 +211,26 @@ printf '%s' '%PDF-1.4' > "$out/payload"
 printf '{"requested_url":"https://93.184.216.34/document.pdf","final_url":"https://93.184.216.34/document.pdf","mime":"application/pdf","sha256":"e16fa5d9b51928755db85b917f0297babaf22c7a47e97d9212adab56e61ba04e","size_bytes":8}' > "$out/metadata.json"
 "#;
 
+const FAKE_INSTAGRAM_YT_DLP: &str = r#"#!/bin/sh
+set -eu
+if [ "$1" = "--version" ]; then printf '2026.08.19\n'; exit 0; fi
+printf '{"id":"post-1","webpage_url":"https://www.instagram.com/p/post-1/","uploader":"alice","upload_date":"20260914","description":"Caption Instagram complete","thumbnails":[{"url":"https://93.184.216.34/photo.jpg"}]}'
+"#;
+
+const FAKE_INSTAGRAM_BINARY_ACQUIRER: &str = r#"#!/bin/sh
+set -eu
+url=""
+while [ "$#" -gt 0 ]; do
+  case "$1" in
+    --url) url="$2"; shift 2 ;;
+    --output-dir) out="$2"; shift 2 ;;
+    *) shift ;;
+  esac
+done
+printf 'photo' > "$out/payload"
+printf '{"requested_url":"%s","final_url":"%s","mime":"image/jpeg","sha256":"55c64d0fcd6f9d5f7c828093857e3fdfda68478bb4e9bd24d481ef391c7804e8","size_bytes":5,"redirect_chain":["%s"]}' "$url" "$url" "$url" > "$out/metadata.json"
+"#;
+
 const FAKE_PAGE_RENDERER_TREE: &str = r#"#!/bin/sh
 set -eu
 url=""
@@ -1284,6 +1304,58 @@ fn safe_web_publishes_a_portable_capture() {
     .expect("Job de Doublon terminé JSON valide");
     assert_eq!(reused["state"], "succeeded");
     assert_eq!(reused["capture_id"], capture_id);
+}
+
+#[test]
+fn capture_instagram_photo_preserves_caption_and_media_without_renderer() {
+    let env = TestEnv::new("instagram-photo");
+    env.install_binary("yt-dlp", FAKE_INSTAGRAM_YT_DLP);
+    env.install_binary("scriptor-binary-acquirer", FAKE_INSTAGRAM_BINARY_ACQUIRER);
+    env.install_binary("scriptor-page-renderer", "#!/bin/sh\nexit 99\n");
+    let created: Value = serde_json::from_slice(
+        &env.command()
+            .args([
+                "capture",
+                "https://www.instagram.com/p/post-1/",
+                "--policy",
+                "safe-web@1",
+            ])
+            .assert()
+            .success()
+            .get_output()
+            .stdout,
+    )
+    .expect("Job JSON valide");
+    let job_id = created["job"]["job_id"]
+        .as_str()
+        .expect("identifiant de Job");
+    let job: Value = serde_json::from_slice(
+        &env.command()
+            .args(["job", "wait", job_id, "--timeout-secs", "5"])
+            .assert()
+            .success()
+            .get_output()
+            .stdout,
+    )
+    .expect("Job terminé JSON valide");
+    assert_eq!(job["state"], "succeeded", "{job}");
+    let capture_id = job["capture_id"].as_str().expect("identifiant de Capture");
+    let capture: Value = serde_json::from_slice(
+        &env.command()
+            .args(["capture", "inspect", capture_id])
+            .assert()
+            .success()
+            .get_output()
+            .stdout,
+    )
+    .expect("Capture JSON valide");
+    let manifest = &capture["manifest"];
+    assert_eq!(manifest["proof"]["artifact_id"], "proof-instagram-metadata");
+    assert_eq!(manifest["extractions"][0]["size_bytes"], 26);
+    assert_eq!(manifest["artifacts"][0]["order"], 0);
+    assert_eq!(manifest["artifacts"][0]["mime"], "image/jpeg");
+    assert_eq!(manifest["remote_provenance"]["media"][0]["size_bytes"], 5);
+    assert_eq!(manifest["capabilities"][1]["state"], "succeeded");
 }
 
 #[test]
