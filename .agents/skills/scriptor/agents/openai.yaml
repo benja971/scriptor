@@ -1,0 +1,4 @@
+interface:
+  display_name: "Scriptor"
+  short_description: "Capture et vérifie des Sources avec Scriptor"
+  default_prompt: "Use $scriptor to capture and inspect this Source through Scriptor's verifiable local-first workflow."
