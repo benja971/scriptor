@@ -265,7 +265,11 @@ fn acquire_linkedin(
         || Ok(read_job(&job.id)?.state == "cancelled"),
     )?;
     let raw_metadata = fs::read(&metadata.path).context("reading LinkedIn structured metadata")?;
-    let post = linkedin_post(&raw_metadata).context("parsing LinkedIn structured metadata")?;
+    let mut post = linkedin_post(&raw_metadata).context("parsing LinkedIn structured metadata")?;
+    if post.media_urls.is_empty() {
+        post.media_urls =
+            linkedin_document_media_urls(job, capture.staging(), deadline, &raw_metadata)?;
+    }
     let provider = Provider {
         name: "linkedin-provider".to_string(),
         version: "1".to_string(),
@@ -422,8 +426,7 @@ fn linkedin_post(raw: &[u8]) -> Result<LinkedInPost> {
         .or_else(|| json_string(post, "description"))
         .unwrap_or_default()
         .to_string();
-    let media_urls =
-        linkedin_media_urls(post).context("LinkedIn JSON-LD has no publication media")?;
+    let media_urls = linkedin_media_urls(post).unwrap_or_default();
     Ok(LinkedInPost {
         caption,
         media_urls,
@@ -482,6 +485,86 @@ fn linkedin_media_urls(value: &Value) -> Option<Vec<String>> {
     } else {
         urls
     })
+}
+
+fn linkedin_document_media_urls(
+    job: &Job,
+    staging: &Path,
+    deadline: std::time::SystemTime,
+    html: &[u8],
+) -> Result<Vec<String>> {
+    let html = std::str::from_utf8(html).context("decoding LinkedIn document configuration")?;
+    let manifest_url = html_config_url(html, "manifestUrl")
+        .context("LinkedIn document configuration has no manifest URL")?;
+    let manifest = crate::web::acquire_binary(
+        &manifest_url,
+        &staging.join("document-manifest"),
+        deadline,
+        job.policy.snapshot.limits.disk_byte_limit,
+        job.policy.snapshot.limits.download_byte_limit,
+        || Ok(read_job(&job.id)?.state == "cancelled"),
+    )?;
+    let value: Value = serde_json::from_slice(
+        &fs::read(&manifest.path).context("reading LinkedIn document manifest")?,
+    )
+    .context("parsing LinkedIn document manifest")?;
+    let mut urls = value
+        .get("transcribedDocumentUrl")
+        .and_then(Value::as_str)
+        .map(str::to_string)
+        .into_iter()
+        .collect::<Vec<_>>();
+    let image_manifest_url = value
+        .get("perResolutions")
+        .and_then(Value::as_array)
+        .and_then(|resolutions| {
+            resolutions.iter().max_by_key(|resolution| {
+                resolution
+                    .get("width")
+                    .and_then(Value::as_u64)
+                    .unwrap_or_default()
+            })
+        })
+        .and_then(|resolution| resolution.get("imageManifestUrl"))
+        .and_then(Value::as_str);
+    if let Some(image_manifest_url) = image_manifest_url {
+        let images = crate::web::acquire_binary(
+            image_manifest_url,
+            &staging.join("document-pages-manifest"),
+            deadline,
+            job.policy.snapshot.limits.disk_byte_limit,
+            job.policy.snapshot.limits.download_byte_limit,
+            || Ok(read_job(&job.id)?.state == "cancelled"),
+        )?;
+        let pages: Value = serde_json::from_slice(
+            &fs::read(&images.path).context("reading LinkedIn document pages manifest")?,
+        )
+        .context("parsing LinkedIn document pages manifest")?;
+        collect_urls(&pages, &mut urls);
+    }
+    if urls.is_empty() {
+        bail!("LinkedIn document manifest has no media URL");
+    }
+    Ok(urls)
+}
+
+fn html_config_url(html: &str, key: &str) -> Option<String> {
+    let marker = format!("{key}&quot;:&quot;");
+    let value = html.split_once(&marker)?.1.split_once("&quot;")?.0;
+    Some(value.replace("&amp;", "&"))
+}
+
+fn collect_urls(value: &Value, urls: &mut Vec<String>) {
+    match value {
+        Value::String(url) if url.starts_with("https://") || url.starts_with("http://") => {
+            if !urls.contains(url) {
+                urls.push(url.clone());
+            }
+        }
+        Value::Array(values) => values.iter().for_each(|value| collect_urls(value, urls)),
+        Value::Object(values) => values.values().for_each(|value| collect_urls(value, urls)),
+        _ => {}
+    }
 }
 
 fn json_image_url(value: &Value) -> Option<&str> {
