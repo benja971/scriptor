@@ -54,6 +54,8 @@
           pkgs.rustfmt
 
           pkgs.ffmpeg
+          pkgs.poppler-utils
+          pkgs.tesseract
           pkgs.whisper-cpp
           pkgs.yt-dlp
           pageRenderer
