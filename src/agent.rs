@@ -23,6 +23,7 @@ mod admission;
 mod derive;
 mod error;
 mod publication;
+mod social_capture;
 mod web_capture;
 
 use error::CodedError;
@@ -321,6 +322,29 @@ struct RemoteProvenance {
     sha256: String,
     size_bytes: u64,
     redirect_chain: Vec<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    canonical_url: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    platform: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    post_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    author: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    published_at: Option<String>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    media: Vec<RemoteMediaProvenance>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct RemoteMediaProvenance {
+    order: u32,
+    requested_url: String,
+    final_url: String,
+    mime: String,
+    sha256: String,
+    size_bytes: u64,
+    redirect_chain: Vec<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -338,6 +362,8 @@ struct Proof {
     size_bytes: u64,
     locator: Locator,
     created_at: u64,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    order: Option<u32>,
 }
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -507,6 +533,8 @@ struct ArtifactMetadata {
     provider: Option<Provider>,
     #[serde(skip_serializing_if = "Option::is_none")]
     proof_artifact_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    order: Option<u32>,
 }
 
 #[derive(Serialize)]
@@ -1149,6 +1177,12 @@ fn resolve_discoveries(job: &Job, parent_capture_id: &str) -> Result<()> {
                             sha256: acquired.sha256.clone(),
                             size_bytes: acquired.size_bytes,
                             redirect_chain: acquired.redirect_chain.clone(),
+                            canonical_url: None,
+                            platform: None,
+                            post_id: None,
+                            author: None,
+                            published_at: None,
+                            media: Vec::new(),
                         },
                     },
                 )? {
@@ -1470,12 +1504,26 @@ fn publish_capture(job: &Job) -> Result<Publication> {
                 source: &source,
             },
         ),
-        admission::Source::Web(url) => publication::publish(
-            job,
-            &web_capture::WebAcquisition {
-                job,
-                url: &url,
-                forbidden_final_urls: &[],
+        admission::Source::Web(url) => social_capture::classify_url(&url).map_or_else(
+            || {
+                publication::publish(
+                    job,
+                    &web_capture::WebAcquisition {
+                        job,
+                        url: &url,
+                        forbidden_final_urls: &[],
+                    },
+                )
+            },
+            |platform| {
+                publication::publish(
+                    job,
+                    &social_capture::SocialAcquisition {
+                        job,
+                        url: &url,
+                        platform,
+                    },
+                )
             },
         ),
     }
@@ -1606,6 +1654,7 @@ impl Acquisition for LocalAcquisition<'_> {
                 size_bytes: proof_size,
                 locator: Locator::File,
                 created_at: proof_created_at,
+                order: None,
             },
             extractions: Vec::new(),
             capabilities: Vec::new(),
@@ -3220,6 +3269,7 @@ fn artifact_from_proof(proof: &Proof) -> ArtifactMetadata {
         created_at: proof.created_at,
         provider: None,
         proof_artifact_id: None,
+        order: proof.order,
     }
 }
 
@@ -3234,6 +3284,7 @@ fn artifact_from_extraction(extraction: &Extraction) -> ArtifactMetadata {
         created_at: extraction.created_at,
         provider: Some(extraction.provider.clone()),
         proof_artifact_id: Some(extraction.proof_artifact_id.clone()),
+        order: None,
     }
 }
 
@@ -3350,6 +3401,13 @@ fn policy_for(name: &str) -> Result<Policy> {
             RecipeKind::SourcedAnswer,
         ]
     } else {
+        allowed_providers.extend([
+            "page-renderer".to_string(),
+            "instagram-provider".to_string(),
+            "linkedin-provider".to_string(),
+            "scriptor-binary-acquirer".to_string(),
+            "yt-dlp".to_string(),
+        ]);
         Vec::new()
     };
     let snapshot = PolicySnapshot {
