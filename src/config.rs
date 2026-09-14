@@ -12,9 +12,6 @@ use serde::{Deserialize, Serialize};
 /// défauts pour tout champ absent.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct Config {
-    /// Dossier de sortie des transcriptions issues d'une Source distante.
-    #[serde(default = "default_output_dir")]
-    pub output_dir: PathBuf,
     /// Nom du Modèle whisper utilisé pour la transcription (ex. `small`).
     #[serde(default = "default_model")]
     pub model: String,
@@ -38,25 +35,11 @@ pub struct Config {
     /// scène trop proche d'une Frame à intervalle fixe est ignorée.
     #[serde(default = "default_frame_dedup_window_secs")]
     pub frame_dedup_window_secs: u32,
-    /// Conserve, pour une Source distante, la vidéo telle que téléchargée
-    /// (avec son) dans le dossier de Sortie.
-    #[serde(default = "default_keep_source_video")]
-    pub keep_source_video: bool,
-    /// Conserve, pour une Source distante, une version de la vidéo sans
-    /// piste audio dans le dossier de Sortie.
-    #[serde(default = "default_keep_muted_video")]
-    pub keep_muted_video: bool,
-    /// Conserve, pour une Source distante, l'audio d'origine (qualité
-    /// native, pas le WAV dégradé produit pour la transcription) dans le
-    /// dossier de Sortie.
-    #[serde(default = "default_keep_audio")]
-    pub keep_audio: bool,
 }
 
 impl Default for Config {
     fn default() -> Self {
         Self {
-            output_dir: default_output_dir(),
             model: default_model(),
             models_dir: default_models_dir(),
             language: default_language(),
@@ -64,9 +47,6 @@ impl Default for Config {
             frame_interval_secs: default_frame_interval_secs(),
             frame_scene_threshold: default_frame_scene_threshold(),
             frame_dedup_window_secs: default_frame_dedup_window_secs(),
-            keep_source_video: default_keep_source_video(),
-            keep_muted_video: default_keep_muted_video(),
-            keep_audio: default_keep_audio(),
         }
     }
 }
@@ -134,13 +114,6 @@ fn config_file_path() -> Result<PathBuf> {
     Ok(config_dir.join("scriptor").join("config.toml"))
 }
 
-fn default_output_dir() -> PathBuf {
-    dirs::download_dir()
-        .or_else(dirs::home_dir)
-        .unwrap_or_else(|| PathBuf::from("."))
-        .join("scriptor")
-}
-
 fn default_model() -> String {
     "small".to_string()
 }
@@ -179,18 +152,6 @@ const fn default_frame_dedup_window_secs() -> u32 {
     3
 }
 
-const fn default_keep_source_video() -> bool {
-    false
-}
-
-const fn default_keep_muted_video() -> bool {
-    false
-}
-
-const fn default_keep_audio() -> bool {
-    false
-}
-
 // Les lints anti-panic (`unwrap_used`, `expect_used`, `panic`) sont désactivés ici :
 // ils protègent le code de production, pas les assertions de test qui doivent
 // justement échouer bruyamment.
@@ -201,9 +162,8 @@ mod tests {
 
     use super::{
         Config, default_frame_dedup_window_secs, default_frame_interval_secs,
-        default_frame_scene_threshold, default_keep_audio, default_keep_muted_video,
-        default_keep_source_video, default_language, default_model, default_models_dir,
-        default_output_dir, default_threads,
+        default_frame_scene_threshold, default_language, default_model, default_models_dir,
+        default_threads,
     };
 
     #[test]
@@ -213,7 +173,6 @@ mod tests {
 
         let config = Config::load_from_path(&path).expect("loading should succeed");
 
-        assert_eq!(config.output_dir, default_output_dir());
         assert_eq!(config.model, default_model());
         assert_eq!(config.models_dir, default_models_dir());
         assert_eq!(config.language, default_language());
@@ -226,9 +185,6 @@ mod tests {
             config.frame_dedup_window_secs,
             default_frame_dedup_window_secs()
         );
-        assert_eq!(config.keep_source_video, default_keep_source_video());
-        assert_eq!(config.keep_muted_video, default_keep_muted_video());
-        assert_eq!(config.keep_audio, default_keep_audio());
     }
 
     #[test]
@@ -260,7 +216,6 @@ mod tests {
 
         assert_eq!(config.model, "medium");
         assert_eq!(config.threads, 4);
-        assert_eq!(config.output_dir, default_output_dir());
         assert_eq!(config.models_dir, default_models_dir());
         assert_eq!(config.language, default_language());
     }

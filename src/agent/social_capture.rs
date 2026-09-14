@@ -12,6 +12,7 @@ use super::{
     PreparedCapture, Proof, Provider, ProviderDependency, RemoteMediaProvenance, RemoteProvenance,
     SourceIdentity, now_secs, read_job, sha256_bytes, sha256_file,
 };
+use crate::resource::ResourceBudget;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(super) enum SocialPlatform {
@@ -139,6 +140,7 @@ impl Acquisition for SocialAcquisition<'_> {
             .context("calculating Instagram acquisition deadline")?;
         let mut artifacts = Vec::new();
         let mut media_provenance = Vec::new();
+        let mut videos = Vec::new();
         let mut capabilities = vec![
             success("metadata", provider.clone()),
             success("caption", provider.clone()),
@@ -170,6 +172,9 @@ impl Acquisition for SocialAcquisition<'_> {
             let media_relative = format!("proofs/media-{order}.{}", extension(&acquired.mime));
             fs::copy(&acquired.path, capture.staging().join(&media_relative))
                 .context("materializing Instagram media")?;
+            if acquired.mime.starts_with("video/") {
+                videos.push((order, capture.staging().join(&media_relative)));
+            }
             artifacts.push(proof(
                 capture.staging(),
                 &format!("media-{order}"),
@@ -198,7 +203,7 @@ impl Acquisition for SocialAcquisition<'_> {
         let final_url = canonical_url
             .clone()
             .unwrap_or_else(|| self.url.to_string());
-        let manifest = Manifest {
+        let mut manifest = Manifest {
             capture_id: capture.capture_id().to_string(),
             source: SourceIdentity {
                 locator: final_url.clone(),
@@ -235,6 +240,13 @@ impl Acquisition for SocialAcquisition<'_> {
                 media: media_provenance,
             }),
         };
+        if enrich_video_extractions(self.job, capture.staging(), &mut manifest, &videos)? {
+            return Ok(AcquisitionResult::Cancelled);
+        }
+        partial |= manifest
+            .capabilities
+            .iter()
+            .any(|capability| capability.state != "succeeded");
         Ok(AcquisitionResult::Ready(PreparedCapture::new(
             manifest, partial,
         )))
@@ -310,6 +322,7 @@ fn acquire_linkedin(
     };
     let mut artifacts = Vec::new();
     let mut media_provenance = Vec::new();
+    let mut videos = Vec::new();
     let mut capabilities = vec![
         success("metadata", provider.clone()),
         success("caption", provider.clone()),
@@ -341,6 +354,9 @@ fn acquire_linkedin(
         let media_relative = format!("proofs/media-{order}.{}", extension(&acquired.mime));
         fs::copy(&acquired.path, capture.staging().join(&media_relative))
             .context("materializing LinkedIn media")?;
+        if acquired.mime.starts_with("video/") {
+            videos.push((order, capture.staging().join(&media_relative)));
+        }
         artifacts.push(proof(
             capture.staging(),
             &format!("media-{order}"),
@@ -366,7 +382,7 @@ fn acquire_linkedin(
         .canonical_url
         .clone()
         .unwrap_or_else(|| metadata.final_url.clone());
-    let manifest = Manifest {
+    let mut manifest = Manifest {
         capture_id: capture.capture_id().to_string(),
         source: SourceIdentity {
             locator: final_url.clone(),
@@ -394,9 +410,39 @@ fn acquire_linkedin(
             media: media_provenance,
         }),
     };
+    if enrich_video_extractions(job, capture.staging(), &mut manifest, &videos)? {
+        return Ok(AcquisitionResult::Cancelled);
+    }
+    partial |= manifest
+        .capabilities
+        .iter()
+        .any(|capability| capability.state != "succeeded");
     Ok(AcquisitionResult::Ready(PreparedCapture::new(
         manifest, partial,
     )))
+}
+
+fn enrich_video_extractions(
+    job: &Job,
+    staging: &Path,
+    manifest: &mut Manifest,
+    videos: &[(u32, std::path::PathBuf)],
+) -> Result<bool> {
+    let is_cancelled = || Ok(read_job(&job.id)?.state == "cancelled");
+    let budget = ResourceBudget::new(
+        staging,
+        job.created_at,
+        job.policy.snapshot.limits.duration_limit_secs,
+        job.policy.snapshot.limits.disk_byte_limit,
+    )
+    .with_cancellation(&is_cancelled);
+    for (order, path) in videos {
+        super::capture_local_media(job, path, staging, manifest, &budget, Some(*order));
+        if budget.is_cancelled()? {
+            return Ok(true);
+        }
+    }
+    Ok(false)
 }
 
 struct LinkedInPost {

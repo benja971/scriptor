@@ -38,28 +38,6 @@ struct ExtractedFrame {
     timestamp_secs: f64,
 }
 
-/// Extrait les Frames de `input` vers `frames_dir` (créé seulement si au
-/// moins une Frame est produite), combinant intervalle fixe et changement de
-/// scène. Utilise `tmp_dir` pour les passes intermédiaires. Retourne le
-/// nombre de Frames écrites dans `frames_dir` ; `0` si `input` ne contient
-/// aucun flux vidéo.
-///
-/// # Errors
-///
-/// Retourne une erreur si `ffmpeg` ou `ffprobe` est absent du `PATH`, si l'un
-/// des deux process ne peut pas être lancé, si l'un d'eux termine avec un
-/// code de sortie non nul, ou si le nombre de Frames extraites par une passe
-/// ne correspond pas au nombre de timestamps lus dans sa sortie.
-pub fn extract_frames(
-    input: &Path,
-    tmp_dir: &Path,
-    frames_dir: &Path,
-    params: FrameExtractionParams,
-) -> Result<usize> {
-    let path_env = env::var_os("PATH").unwrap_or_default();
-    extract_frames_with_path(input, tmp_dir, frames_dir, params, &path_env)
-}
-
 pub fn extract_frames_limited(
     input: &Path,
     tmp_dir: &Path,
@@ -71,6 +49,7 @@ pub fn extract_frames_limited(
     extract_frames_with_budget(input, tmp_dir, frames_dir, params, &path_env, Some(budget))
 }
 
+#[cfg(test)]
 fn extract_frames_with_path(
     input: &Path,
     tmp_dir: &Path,

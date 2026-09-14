@@ -1,5 +1,5 @@
 {
-  description = "scriptor dev shell";
+  description = "scriptor capture development shell";
 
   inputs.nixpkgs.url = "github:NixOS/nixpkgs/nixos-unstable";
 
@@ -56,7 +56,6 @@
           pkgs.ffmpeg
           pkgs.whisper-cpp
           pkgs.yt-dlp
-          pkgs.libnotify
           pageRenderer
           pageRendererTest
           binaryAcquirer

@@ -1,6 +1,7 @@
 use std::ffi::OsString;
 use std::fs::{self, File, OpenOptions};
 use std::io::{BufReader, Read, Seek, SeekFrom, Write};
+use std::os::unix::process::CommandExt;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 use std::thread;
@@ -574,15 +575,6 @@ struct ReadRequest {
     expected_sha256: Option<String>,
 }
 
-pub fn is_agent_command(arguments: &[OsString]) -> bool {
-    arguments.get(1).is_some_and(|argument| {
-        matches!(
-            argument.to_str(),
-            Some("capture" | "derive" | "job" | "capture-worker")
-        )
-    })
-}
-
 pub fn run(arguments: Vec<OsString>) -> Result<()> {
     let cli = match AgentCli::try_parse_from(arguments) {
         Ok(cli) => cli,
@@ -844,6 +836,7 @@ fn create_job(
         .stdin(Stdio::null())
         .stdout(Stdio::null())
         .stderr(Stdio::null())
+        .process_group(0)
         .spawn();
     let worker = match worker {
         Ok(worker) => worker,
@@ -1669,6 +1662,7 @@ impl Acquisition for LocalAcquisition<'_> {
                 capture.staging(),
                 &mut manifest,
                 &budget,
+                None,
             );
         } else if is_document_source(self.source) {
             capture_local_document(
@@ -2057,6 +2051,7 @@ fn capture_local_media(
     staging: &Path,
     manifest: &mut Manifest,
     budget: &ResourceBudget<'_>,
+    media_order: Option<u32>,
 ) {
     let config = match Config::load().context("loading configuration for local media Capture") {
         Ok(config) => config,
@@ -2065,59 +2060,92 @@ fn capture_local_media(
             return;
         }
     };
-    let work_dir = staging.join("work");
+    let work_dir = media_order.map_or_else(
+        || staging.join("work"),
+        |order| staging.join(format!("media-work-{order}")),
+    );
     if let Err(error) = fs::create_dir_all(&work_dir)
         .with_context(|| format!("creating media work directory {}", work_dir.display()))
     {
         record_media_setup_failure(manifest, &error);
         return;
     }
+    let target = MediaExtractionTarget {
+        staging,
+        work_dir: &work_dir,
+        order: media_order,
+    };
     let audio_allowed = policy_allows(&job.policy, "ffmpeg");
     let transcription_allowed = audio_allowed && policy_allows(&job.policy, "whisper-cli");
     if audio_allowed {
         if let Err(error) = capture_transcription(
             proof_path,
-            staging,
             manifest,
-            &work_dir,
             &config,
             budget,
             transcription_allowed,
+            &target,
         ) {
-            cleanup_media_extraction(staging, "transcription", manifest);
-            record_capability_failure(manifest, "transcription", &error);
+            cleanup_media_extraction(staging, "transcription", manifest, media_order);
+            record_capability_failure(
+                manifest,
+                &media_capability_name(media_order, "transcription"),
+                &error,
+            );
         }
     } else {
         let error = denied_provider_error("ffmpeg");
         manifest.capabilities.push(blocked_capability(
-            "audio-extraction",
+            &media_capability_name(media_order, "audio-extraction"),
             unresolved_provider("ffmpeg"),
             &error,
         ));
         manifest.capabilities.push(blocked_capability(
-            "transcription",
+            &media_capability_name(media_order, "transcription"),
             unresolved_provider("ffmpeg"),
             &error,
         ));
     }
-    if !enforce_media_limits(budget, staging, manifest, "transcription") {
+    if !enforce_media_limits(
+        budget,
+        staging,
+        manifest,
+        &media_capability_name(media_order, "transcription"),
+        media_order,
+    ) {
         cleanup_work_dir(&work_dir, manifest);
         return;
     }
     if let Some(provider) = first_denied_provider(&job.policy, &["ffmpeg", "ffprobe"]) {
         let error = denied_provider_error(provider);
         manifest.capabilities.push(blocked_capability(
-            "frames",
+            &media_capability_name(media_order, "frames"),
             unresolved_provider(provider),
             &error,
         ));
-    } else if let Err(error) =
-        capture_frames(proof_path, staging, manifest, &work_dir, &config, budget)
-    {
-        cleanup_media_extraction(staging, "frames", manifest);
-        record_capability_failure(manifest, "frames", &error);
+    } else if let Err(error) = capture_frames(
+        proof_path,
+        staging,
+        manifest,
+        &work_dir,
+        &config,
+        budget,
+        media_order,
+    ) {
+        cleanup_media_extraction(staging, "frames", manifest, media_order);
+        record_capability_failure(
+            manifest,
+            &media_capability_name(media_order, "frames"),
+            &error,
+        );
     }
-    enforce_media_limits(budget, staging, manifest, "frames");
+    enforce_media_limits(
+        budget,
+        staging,
+        manifest,
+        &media_capability_name(media_order, "frames"),
+        media_order,
+    );
     cleanup_work_dir(&work_dir, manifest);
 }
 
@@ -2133,12 +2161,13 @@ fn cleanup_work_dir(work_dir: &Path, manifest: &mut Manifest) {
     }
 }
 
-fn cleanup_media_extraction(staging: &Path, capability: &str, manifest: &mut Manifest) {
-    let path = if capability == "frames" {
-        staging.join("extractions").join("frames")
-    } else {
-        staging.join("extractions").join("transcription.txt")
-    };
+fn cleanup_media_extraction(
+    staging: &Path,
+    capability: &str,
+    manifest: &mut Manifest,
+    media_order: Option<u32>,
+) {
+    let path = media_extraction_path(staging, capability, media_order);
     let result = if capability == "frames" {
         fs::remove_dir_all(&path)
     } else {
@@ -2159,16 +2188,54 @@ fn cleanup_media_extraction(staging: &Path, capability: &str, manifest: &mut Man
     }
 }
 
+fn media_capability_name(media_order: Option<u32>, capability: &str) -> String {
+    media_order.map_or_else(
+        || capability.to_string(),
+        |order| format!("media-{order}-{capability}"),
+    )
+}
+
+fn media_extraction_path(staging: &Path, capability: &str, media_order: Option<u32>) -> PathBuf {
+    let directory = media_order.map_or_else(
+        || staging.join("extractions"),
+        |order| staging.join("extractions").join(format!("media-{order}")),
+    );
+    if capability == "frames" {
+        directory.join("frames")
+    } else {
+        directory.join("transcription.txt")
+    }
+}
+
+fn media_extraction_relative(capability: &str, media_order: Option<u32>) -> String {
+    media_order.map_or_else(
+        || format!("extractions/{capability}.txt"),
+        |order| format!("extractions/media-{order}/{capability}.txt"),
+    )
+}
+
+fn media_artifact_id(media_order: Option<u32>, kind: &str) -> String {
+    media_order.map_or_else(
+        || format!("extraction-{kind}"),
+        |order| format!("extraction-media-{order}-{kind}"),
+    )
+}
+
+struct MediaExtractionTarget<'a> {
+    staging: &'a Path,
+    work_dir: &'a Path,
+    order: Option<u32>,
+}
+
 fn capture_transcription(
     proof_path: &Path,
-    staging: &Path,
     manifest: &mut Manifest,
-    work_dir: &Path,
     config: &Config,
     budget: &ResourceBudget<'_>,
     transcription_allowed: bool,
+    target: &MediaExtractionTarget<'_>,
 ) -> Result<()> {
-    let audio_path = work_dir.join("audio.wav");
+    let audio_path = target.work_dir.join("audio.wav");
     let audio_parameters = json!({
         "format": "pcm_s16le",
         "sample_rate_hz": 16_000,
@@ -2178,12 +2245,12 @@ fn capture_transcription(
         Ok(provider) => provider,
         Err(error) => {
             manifest.capabilities.push(failed_capability(
-                "audio-extraction",
+                &media_capability_name(target.order, "audio-extraction"),
                 unresolved_provider_for(&error, "ffmpeg"),
                 &error,
             ));
             manifest.capabilities.push(blocked_capability(
-                "transcription",
+                &media_capability_name(target.order, "transcription"),
                 unresolved_provider("whisper-cli"),
                 &error,
             ));
@@ -2193,25 +2260,24 @@ fn capture_transcription(
     match audio::extract_audio_limited(proof_path, &audio_path, budget) {
         Ok(()) => {
             manifest.capabilities.push(Capability {
-                name: "audio-extraction".to_string(),
+                name: media_capability_name(target.order, "audio-extraction"),
                 state: "succeeded".to_string(),
                 provider: audio_provider.clone(),
                 error: None,
             });
             if transcription_allowed {
                 capture_transcription_text(
-                    staging,
                     manifest,
                     &audio_path,
-                    work_dir,
                     config,
                     budget,
                     &audio_provider,
+                    target,
                 )?;
             } else {
                 let error = denied_provider_error("whisper-cli");
                 manifest.capabilities.push(blocked_capability(
-                    "transcription",
+                    &media_capability_name(target.order, "transcription"),
                     unresolved_provider("whisper-cli"),
                     &error,
                 ));
@@ -2219,12 +2285,12 @@ fn capture_transcription(
         }
         Err(error) => {
             manifest.capabilities.push(failed_capability(
-                "audio-extraction",
+                &media_capability_name(target.order, "audio-extraction"),
                 audio_provider,
                 &error,
             ));
             manifest.capabilities.push(blocked_capability(
-                "transcription",
+                &media_capability_name(target.order, "transcription"),
                 unresolved_provider("whisper-cli"),
                 &error,
             ));
@@ -2234,13 +2300,12 @@ fn capture_transcription(
 }
 
 fn capture_transcription_text(
-    staging: &Path,
     manifest: &mut Manifest,
     audio_path: &Path,
-    work_dir: &Path,
     config: &Config,
     budget: &ResourceBudget<'_>,
     audio_provider: &Provider,
+    target: &MediaExtractionTarget<'_>,
 ) -> Result<()> {
     let transcription_provider = match transcription_parameters(config, audio_provider, budget)
         .and_then(|parameters| provider("whisper-cli", parameters, &[], budget))
@@ -2248,7 +2313,7 @@ fn capture_transcription_text(
         Ok(provider) => provider,
         Err(error) => {
             manifest.capabilities.push(failed_capability(
-                "transcription",
+                &media_capability_name(target.order, "transcription"),
                 unresolved_provider("whisper-cli"),
                 &error,
             ));
@@ -2260,30 +2325,34 @@ fn capture_transcription_text(
         audio_path,
         &config.language,
         u32::try_from(config.threads).context("converting transcription thread count")?,
-        &work_dir.join("transcription"),
+        &target.work_dir.join("transcription"),
         budget,
     ) {
         Ok(transcription_path) => {
-            let destination = staging.join("extractions").join("transcription.txt");
+            let destination = media_extraction_path(target.staging, "transcription", target.order);
             copy_extraction(&transcription_path, &destination, budget)?;
-            manifest.extractions.push(extraction(
-                "extraction-transcription",
-                "extractions/transcription.txt",
+            let mut extraction = extraction(
+                &media_artifact_id(target.order, "transcription"),
+                &media_extraction_relative("transcription", target.order),
                 "text/plain",
                 &destination,
                 None,
                 transcription_provider.clone(),
                 budget,
-            )?);
+            )?;
+            if let Some(order) = target.order {
+                extraction.proof_artifact_id = format!("media-{order}");
+            }
+            manifest.extractions.push(extraction);
             manifest.capabilities.push(Capability {
-                name: "transcription".to_string(),
+                name: media_capability_name(target.order, "transcription"),
                 state: "succeeded".to_string(),
                 provider: transcription_provider,
                 error: None,
             });
         }
         Err(error) => manifest.capabilities.push(failed_capability(
-            "transcription",
+            &media_capability_name(target.order, "transcription"),
             transcription_provider,
             &error,
         )),
@@ -2298,6 +2367,7 @@ fn capture_frames(
     work_dir: &Path,
     config: &Config,
     budget: &ResourceBudget<'_>,
+    media_order: Option<u32>,
 ) -> Result<()> {
     let frames_dir = work_dir.join("frames");
     let frames_provider = match provider(
@@ -2313,7 +2383,7 @@ fn capture_frames(
         Ok(provider) => provider,
         Err(error) => {
             manifest.capabilities.push(failed_capability(
-                "frames",
+                &media_capability_name(media_order, "frames"),
                 unresolved_provider("ffmpeg"),
                 &error,
             ));
@@ -2327,7 +2397,7 @@ fn capture_frames(
     };
     match frames::extract_frames_limited(proof_path, work_dir, &frames_dir, frame_params, budget) {
         Ok(frame_count) => {
-            let destination = staging.join("extractions").join("frames");
+            let destination = media_extraction_path(staging, "frames", media_order);
             if frame_count > 0 {
                 budget.check()?;
                 fs::create_dir_all(&destination).with_context(|| {
@@ -2350,9 +2420,15 @@ fn capture_frames(
                     let extraction_path = destination.join(filename.as_ref());
                     copy_extraction(frame, &extraction_path, budget)?;
                     budget.check()?;
-                    let artifact_id = format!("extraction-frame-{index:04}");
-                    let path = format!("extractions/frames/{filename}");
-                    manifest.extractions.push(extraction(
+                    let artifact_id = media_order.map_or_else(
+                        || format!("extraction-frame-{index:04}"),
+                        |order| format!("extraction-media-{order}-frame-{index:04}"),
+                    );
+                    let path = media_order.map_or_else(
+                        || format!("extractions/frames/{filename}"),
+                        |order| format!("extractions/media-{order}/frames/{filename}"),
+                    );
+                    let mut extraction = extraction(
                         &artifact_id,
                         &path,
                         "image/jpeg",
@@ -2362,21 +2438,27 @@ fn capture_frames(
                         }),
                         frames_provider.clone(),
                         budget,
-                    )?);
+                    )?;
+                    if let Some(order) = media_order {
+                        extraction.proof_artifact_id = format!("media-{order}");
+                    }
+                    manifest.extractions.push(extraction);
                     budget.check()?;
                 }
             }
             manifest.capabilities.push(Capability {
-                name: "frames".to_string(),
+                name: media_capability_name(media_order, "frames"),
                 state: "succeeded".to_string(),
                 provider: frames_provider,
                 error: None,
             });
         }
         Err(error) => {
-            manifest
-                .capabilities
-                .push(failed_capability("frames", frames_provider, &error));
+            manifest.capabilities.push(failed_capability(
+                &media_capability_name(media_order, "frames"),
+                frames_provider,
+                &error,
+            ));
         }
     }
     Ok(())
@@ -2459,18 +2541,29 @@ fn enforce_media_limits(
     staging: &Path,
     manifest: &mut Manifest,
     capability: &str,
+    media_order: Option<u32>,
 ) -> bool {
     let result = budget.check();
     if let Err(error) = result {
         manifest.extractions.retain(|extraction| {
-            let affected = match capability {
-                "transcription" => extraction.artifact_id == "extraction-transcription",
-                "frames" => extraction.artifact_id.starts_with("extraction-frame-"),
+            let affected = match capability.rsplit('-').next() {
+                Some("transcription") => {
+                    extraction.artifact_id == media_artifact_id(media_order, "transcription")
+                }
+                Some("frames") => media_order.map_or_else(
+                    || extraction.artifact_id.starts_with("extraction-frame-"),
+                    |order| {
+                        extraction
+                            .artifact_id
+                            .starts_with(&format!("extraction-media-{order}-frame-"))
+                    },
+                ),
                 _ => false,
             };
             !affected
         });
-        cleanup_media_extraction(staging, capability, manifest);
+        let base_capability = capability.rsplit('-').next().unwrap_or(capability);
+        cleanup_media_extraction(staging, base_capability, manifest, media_order);
         if manifest
             .capabilities
             .iter()
@@ -3212,19 +3305,35 @@ fn snapshot_for(manifests: &[Manifest]) -> Result<String> {
 }
 
 fn search_text_for(manifest: &Manifest) -> Result<String> {
-    if !is_text_mime(&manifest.proof.mime) {
-        return Ok(String::new());
+    let mut artifact_paths = Vec::new();
+    if is_text_mime(&manifest.proof.mime) {
+        artifact_paths.push(&manifest.proof.path);
     }
-    let path = captures_dir()?
-        .join(&manifest.capture_id)
-        .join(&manifest.proof.path);
-    let file =
-        File::open(&path).with_context(|| format!("opening text artifact {}", path.display()))?;
-    let mut bytes = Vec::new();
-    file.take(u64::try_from(MAX_READ_LENGTH).context("converting Index text limit")?)
-        .read_to_end(&mut bytes)
-        .with_context(|| format!("reading text artifact {}", path.display()))?;
-    Ok(String::from_utf8(bytes).unwrap_or_default())
+    artifact_paths.extend(
+        manifest
+            .extractions
+            .iter()
+            .filter(|extraction| is_text_mime(&extraction.mime))
+            .map(|extraction| &extraction.path),
+    );
+    let capture_dir = captures_dir()?.join(&manifest.capture_id);
+    let mut text = String::new();
+    for relative_path in artifact_paths {
+        let remaining = MAX_READ_LENGTH.saturating_sub(text.len());
+        if remaining == 0 {
+            break;
+        }
+        let path = capture_dir.join(relative_path);
+        let file = File::open(&path)
+            .with_context(|| format!("opening text artifact {}", path.display()))?;
+        let mut bytes = Vec::new();
+        file.take(u64::try_from(remaining).context("converting Index text limit")?)
+            .read_to_end(&mut bytes)
+            .with_context(|| format!("reading text artifact {}", path.display()))?;
+        text.push_str(&String::from_utf8(bytes).unwrap_or_default());
+        text.push('\n');
+    }
+    Ok(text)
 }
 
 fn summary_for(manifest: &Manifest) -> CaptureSummary {
