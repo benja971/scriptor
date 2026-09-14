@@ -248,6 +248,7 @@ fn build_derivative(
         created_at,
         provider: Some(provider.clone()),
         proof_artifact_id: None,
+        order: None,
     };
     let reference = reference_for_artifact(publication.capture_id, &artifact);
     Ok(Derivative {
