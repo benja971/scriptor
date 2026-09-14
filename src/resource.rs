@@ -18,14 +18,14 @@ const MAX_DIAGNOSTIC_BYTES_U64: u64 = 1024 * 1024;
 /// Budget partagé par les Providers d'une Capture. Chaque process est isolé
 /// dans son groupe afin que son arrêt emporte les éventuels enfants qu'il a
 /// lancés.
-pub struct CaptureBudget<'a> {
+pub struct ResourceBudget<'a> {
     root: &'a Path,
     deadline_secs: u64,
     disk_byte_limit: u64,
     is_cancelled: Option<&'a dyn Fn() -> Result<bool>>,
 }
 
-impl<'a> CaptureBudget<'a> {
+impl<'a> ResourceBudget<'a> {
     pub const fn new(
         root: &'a Path,
         created_at: u64,

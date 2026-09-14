@@ -7,7 +7,7 @@ use std::thread;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use anyhow::{Context, Result, bail};
-use clap::{Args, Parser, Subcommand};
+use clap::{Args, Parser, Subcommand, ValueEnum};
 use fs2::FileExt;
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
@@ -15,11 +15,12 @@ use sha2::{Digest, Sha256};
 use url::Url;
 
 use crate::config::Config;
-use crate::resource::CaptureBudget;
+use crate::resource::ResourceBudget;
 use crate::unique_id::unique_id;
 use crate::{audio, frames, transcribe};
 
 mod admission;
+mod derive;
 mod error;
 mod publication;
 mod web_capture;
@@ -44,12 +45,32 @@ struct AgentCli {
 #[derive(Subcommand)]
 enum AgentCommand {
     Capture(CaptureCommand),
+    Derive(DeriveCommand),
     Job(JobCommand),
     #[command(name = "capture-worker", hide = true)]
     CaptureWorker {
         #[arg(long)]
         job_id: String,
     },
+}
+
+#[derive(Args)]
+struct DeriveCommand {
+    capture_id: String,
+    #[arg(long, value_enum)]
+    recipe: RecipeKind,
+    #[arg(long)]
+    provider: String,
+    #[arg(long)]
+    policy: Option<String>,
+    #[arg(long, conflicts_with = "reference")]
+    whole_capture: bool,
+    #[arg(long)]
+    reference: Vec<String>,
+    #[arg(long)]
+    parameters: Option<String>,
+    #[arg(long)]
+    retry_of: Option<String>,
 }
 
 #[derive(Args)]
@@ -144,6 +165,8 @@ struct PolicySnapshot {
     limits: Limits,
     allows_remote_calls: bool,
     allowed_providers: Vec<String>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    allowed_recipes: Vec<RecipeKind>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -175,6 +198,10 @@ struct Job {
     updated_at: u64,
     worker_pid: Option<u32>,
     capture_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    derive_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    retry_of: Option<String>,
     #[serde(default)]
     child_capture_ids: Vec<String>,
     #[serde(default)]
@@ -191,6 +218,47 @@ enum JobOperation {
         parent_capture_id: String,
         discovery_ids: Vec<String>,
     },
+    Derive {
+        capture_id: String,
+        recipe: Recipe,
+        provider: String,
+        parameters: Value,
+    },
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, ValueEnum)]
+#[serde(rename_all = "kebab-case")]
+enum RecipeKind {
+    StructuredSummary,
+    ProvenClaims,
+    Checklist,
+    MarkdownNote,
+    SourcedAnswer,
+}
+
+impl RecipeKind {
+    const fn as_str(self) -> &'static str {
+        match self {
+            Self::StructuredSummary => "structured-summary",
+            Self::ProvenClaims => "proven-claims",
+            Self::Checklist => "checklist",
+            Self::MarkdownNote => "markdown-note",
+            Self::SourcedAnswer => "sourced-answer",
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+struct Recipe {
+    kind: RecipeKind,
+    target: RecipeTarget,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+enum RecipeTarget {
+    Capture { capture_id: String },
+    References { references: Vec<Reference> },
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -217,6 +285,8 @@ struct QueuedDiscovery {
 struct StructuredError {
     code: String,
     message: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    capability: Option<String>,
 }
 
 #[derive(Serialize)]
@@ -307,7 +377,7 @@ struct ProviderDependency {
     version: String,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(tag = "kind", rename_all = "kebab-case")]
 enum Locator {
     File,
@@ -318,7 +388,7 @@ enum Locator {
     CssSelector { value: String },
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 struct ImageRegion {
     left: u32,
     top: u32,
@@ -330,6 +400,7 @@ struct ImageRegion {
 struct InspectedCapture {
     manifest: Manifest,
     ledger: Vec<LedgerEvent>,
+    derivatives: Vec<derive::Derivative>,
 }
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -341,7 +412,7 @@ struct LedgerEvent {
     details: Option<Value>,
 }
 
-#[derive(Debug, Clone, Deserialize, Serialize)]
+#[derive(Debug, Clone, Deserialize, PartialEq, Serialize)]
 struct Reference {
     capture_id: String,
     artifact_id: String,
@@ -423,7 +494,7 @@ struct ReadArtifact {
     content: ReadContent,
 }
 
-#[derive(Serialize)]
+#[derive(Debug, Clone, Deserialize, Serialize)]
 struct ArtifactMetadata {
     artifact_id: String,
     path: String,
@@ -479,7 +550,7 @@ pub fn is_agent_command(arguments: &[OsString]) -> bool {
     arguments.get(1).is_some_and(|argument| {
         matches!(
             argument.to_str(),
-            Some("capture" | "job" | "capture-worker")
+            Some("capture" | "derive" | "job" | "capture-worker")
         )
     })
 }
@@ -491,6 +562,7 @@ pub fn run(arguments: Vec<OsString>) -> Result<()> {
     };
     let result = match cli.command {
         AgentCommand::Capture(command) => run_capture_command(command),
+        AgentCommand::Derive(command) => run_derive_command(command),
         AgentCommand::Job(command) => run_job_command(command),
         AgentCommand::CaptureWorker { job_id } => run_worker(&job_id),
     };
@@ -502,17 +574,97 @@ pub fn run(arguments: Vec<OsString>) -> Result<()> {
     }
 }
 
+fn run_derive_command(command: DeriveCommand) -> Result<()> {
+    let policy_name = command
+        .policy
+        .as_deref()
+        .context("derive requires --policy")?;
+    let parameters = command
+        .parameters
+        .as_deref()
+        .map_or_else(
+            || Ok(Value::Object(serde_json::Map::new())),
+            serde_json::from_str,
+        )
+        .context("parsing Derive parameters as JSON")?;
+    derive::validate_parameters(&parameters)?;
+    let references = command
+        .reference
+        .iter()
+        .map(|reference| {
+            serde_json::from_str(reference).context("parsing Derive Reference as JSON")
+        })
+        .collect::<Result<Vec<Reference>>>()?;
+    if !command.whole_capture && references.is_empty() {
+        return Err(coded_error(
+            AgentErrorCode::InvalidDeriveTarget,
+            "derive requires --whole-capture or --reference",
+        ));
+    }
+    let target = if command.whole_capture {
+        RecipeTarget::Capture {
+            capture_id: command.capture_id.clone(),
+        }
+    } else {
+        RecipeTarget::References { references }
+    };
+    let policy = policy_for(policy_name)?;
+    derive::admit(
+        &command.capture_id,
+        command.recipe,
+        &command.provider,
+        &target,
+        &policy,
+    )?;
+    let recipe = Recipe {
+        kind: command.recipe,
+        target,
+    };
+    if let Some(retry_of) = command.retry_of.as_deref() {
+        derive::admit_retry(
+            retry_of,
+            &command.capture_id,
+            &recipe,
+            &command.provider,
+            &parameters,
+        )?;
+    }
+    create_job(
+        command.capture_id.clone(),
+        policy,
+        JobOperation::Derive {
+            capture_id: command.capture_id,
+            recipe,
+            provider: command.provider,
+            parameters,
+        },
+        command.retry_of,
+    )
+}
+
 fn print_agent_error(code: &str, message: String) -> Result<()> {
     print_json(&AgentError {
         error: StructuredError {
             code: code.to_string(),
             message,
+            capability: None,
         },
     })
 }
 
 fn agent_error(error: &anyhow::Error) -> StructuredError {
     let message = format!("{error:#}");
+    if let Some(code) = error.chain().find_map(|cause| {
+        cause
+            .downcast_ref::<CodedError>()
+            .map(|coded| coded.code.as_str())
+    }) {
+        return StructuredError {
+            code: code.to_string(),
+            message,
+            capability: None,
+        };
+    }
     let code = if message.contains("pagination cursor") {
         "invalid_cursor"
     } else if message.contains("requires --policy") {
@@ -543,6 +695,7 @@ fn agent_error(error: &anyhow::Error) -> StructuredError {
     StructuredError {
         code: code.to_string(),
         message,
+        capability: None,
     }
 }
 
@@ -610,6 +763,7 @@ fn continue_capture(
             parent_capture_id: capture_id.to_string(),
             discovery_ids: discovery_ids.to_vec(),
         },
+        None,
     )
 }
 
@@ -627,10 +781,15 @@ fn run_job_command(command: JobCommand) -> Result<()> {
 fn create_capture_job(source: &Path, policy_name: &str) -> Result<()> {
     let policy = policy_for(policy_name)?;
     let source = admission::admit(source, &policy)?.into_job_source();
-    create_job(source, policy, JobOperation::Capture)
+    create_job(source, policy, JobOperation::Capture, None)
 }
 
-fn create_job(source: String, policy: Policy, operation: JobOperation) -> Result<()> {
+fn create_job(
+    source: String,
+    policy: Policy,
+    operation: JobOperation,
+    retry_of: Option<String>,
+) -> Result<()> {
     let now = now_secs();
     let job = Job {
         id: format!("job-{}", unique_id()),
@@ -642,6 +801,8 @@ fn create_job(source: String, policy: Policy, operation: JobOperation) -> Result
         updated_at: now,
         worker_pid: None,
         capture_id: None,
+        derive_id: None,
+        retry_of,
         child_capture_ids: Vec::new(),
         checkpoint: None,
         error: None,
@@ -682,6 +843,13 @@ fn run_worker(job_id: &str) -> Result<()> {
     } = &job.operation
     {
         return match resolve_discoveries(&job, parent_capture_id) {
+            Ok(()) => Ok(()),
+            Err(error) => fail_job(job_id, &error),
+        };
+    }
+
+    if matches!(job.operation, JobOperation::Derive { .. }) {
+        return match derive::publish(&job) {
             Ok(()) => Ok(()),
             Err(error) => fail_job(job_id, &error),
         };
@@ -1209,7 +1377,7 @@ impl JobOperation {
     fn discovery_ids(&self) -> &[String] {
         match self {
             Self::Continue { discovery_ids, .. } => discovery_ids,
-            Self::Capture => &[],
+            Self::Capture | Self::Derive { .. } => &[],
         }
     }
 }
@@ -1354,7 +1522,10 @@ impl Acquisition for RemoteBinaryAcquisition<'_> {
 }
 
 impl LocalAcquisition<'_> {
-    fn cancelled<T>(budget: &CaptureBudget<'_>, result: Result<T>) -> Result<AcquisitionResult<T>> {
+    fn cancelled<T>(
+        budget: &ResourceBudget<'_>,
+        result: Result<T>,
+    ) -> Result<AcquisitionResult<T>> {
         match result {
             Ok(value) => Ok(AcquisitionResult::Ready(value)),
             Err(_error) if budget.is_cancelled()? => Ok(AcquisitionResult::Cancelled),
@@ -1374,7 +1545,7 @@ impl Acquisition for LocalAcquisition<'_> {
             bail!("local Source exceeds safe-local@1 disk budget");
         }
         let is_cancelled = || Ok(read_job(&self.job.id)?.state == "cancelled");
-        let budget = CaptureBudget::new(
+        let budget = ResourceBudget::new(
             staging,
             self.job.created_at,
             self.job.policy.snapshot.limits.duration_limit_secs,
@@ -1396,7 +1567,7 @@ impl Acquisition for LocalAcquisition<'_> {
             )
         })?;
         let is_cancelled = || Ok(read_job(&self.job.id)?.state == "cancelled");
-        let budget = CaptureBudget::new(
+        let budget = ResourceBudget::new(
             capture.staging(),
             self.job.created_at,
             self.job.policy.snapshot.limits.duration_limit_secs,
@@ -1507,7 +1678,7 @@ fn capture_local_document(
     proof_path: &Path,
     staging: &Path,
     manifest: &mut Manifest,
-    budget: &CaptureBudget<'_>,
+    budget: &ResourceBudget<'_>,
 ) {
     let result = match mime_for_source(Path::new(&job.source)) {
         "application/pdf" => extract_pdf_document(job, proof_path, staging, manifest, budget),
@@ -1530,6 +1701,7 @@ fn capture_local_document(
             error: Some(StructuredError {
                 code: code.to_string(),
                 message: format!("{error:#}"),
+                capability: None,
             }),
         });
     }
@@ -1551,7 +1723,7 @@ fn extract_pdf_document(
     proof_path: &Path,
     staging: &Path,
     manifest: &mut Manifest,
-    budget: &CaptureBudget<'_>,
+    budget: &ResourceBudget<'_>,
 ) -> std::result::Result<(), DocumentFailure> {
     const CAPABILITY: &str = "pdf-text-extraction";
     if !policy_allows(&job.policy, "pdftotext") {
@@ -1660,7 +1832,7 @@ fn extract_image_document(
     proof_path: &Path,
     staging: &Path,
     manifest: &mut Manifest,
-    budget: &CaptureBudget<'_>,
+    budget: &ResourceBudget<'_>,
 ) -> std::result::Result<(), DocumentFailure> {
     const CAPABILITY: &str = "image-ocr";
     if !policy_allows(&job.policy, "tesseract") {
@@ -1737,12 +1909,12 @@ fn extract_image_document(
 fn document_provider(
     name: &str,
     parameters: Value,
-    budget: &CaptureBudget<'_>,
+    budget: &ResourceBudget<'_>,
 ) -> Result<Provider> {
     provider(name, parameters, &[], budget)
 }
 
-fn pdf_page_count(proof_path: &Path, budget: &CaptureBudget<'_>) -> Result<u32> {
+fn pdf_page_count(proof_path: &Path, budget: &ResourceBudget<'_>) -> Result<u32> {
     let mut command = Command::new("pdfinfo");
     command.arg(proof_path);
     let output = budget.output(&mut command)?;
@@ -1796,7 +1968,7 @@ fn document_extraction(
     locator: Locator,
     locator_provider: Option<Provider>,
     provider: Provider,
-    budget: &CaptureBudget<'_>,
+    budget: &ResourceBudget<'_>,
 ) -> Result<Extraction> {
     Ok(Extraction {
         artifact_id: artifact_id.to_string(),
@@ -1835,7 +2007,7 @@ fn capture_local_media(
     proof_path: &Path,
     staging: &Path,
     manifest: &mut Manifest,
-    budget: &CaptureBudget<'_>,
+    budget: &ResourceBudget<'_>,
 ) {
     let config = match Config::load().context("loading configuration for local media Capture") {
         Ok(config) => config,
@@ -1944,7 +2116,7 @@ fn capture_transcription(
     manifest: &mut Manifest,
     work_dir: &Path,
     config: &Config,
-    budget: &CaptureBudget<'_>,
+    budget: &ResourceBudget<'_>,
     transcription_allowed: bool,
 ) -> Result<()> {
     let audio_path = work_dir.join("audio.wav");
@@ -2018,7 +2190,7 @@ fn capture_transcription_text(
     audio_path: &Path,
     work_dir: &Path,
     config: &Config,
-    budget: &CaptureBudget<'_>,
+    budget: &ResourceBudget<'_>,
     audio_provider: &Provider,
 ) -> Result<()> {
     let transcription_provider = match transcription_parameters(config, audio_provider, budget)
@@ -2076,7 +2248,7 @@ fn capture_frames(
     manifest: &mut Manifest,
     work_dir: &Path,
     config: &Config,
-    budget: &CaptureBudget<'_>,
+    budget: &ResourceBudget<'_>,
 ) -> Result<()> {
     let frames_dir = work_dir.join("frames");
     let frames_provider = match provider(
@@ -2169,6 +2341,7 @@ fn failed_capability(name: &str, provider: Provider, error: &anyhow::Error) -> C
         error: Some(StructuredError {
             code: "capability_failed".to_string(),
             message: format!("{error:#}"),
+            capability: None,
         }),
     }
 }
@@ -2181,6 +2354,7 @@ fn blocked_capability(name: &str, provider: Provider, error: &anyhow::Error) -> 
         error: Some(StructuredError {
             code: "capability_blocked".to_string(),
             message: format!("required capability failed: {error:#}"),
+            capability: None,
         }),
     }
 }
@@ -2220,6 +2394,7 @@ fn record_capability_failure(manifest: &mut Manifest, name: &str, error: &anyhow
         capability.error = Some(StructuredError {
             code: "capability_failed".to_string(),
             message: format!("{error:#}"),
+            capability: None,
         });
     } else {
         manifest.capabilities.push(failed_capability(
@@ -2231,7 +2406,7 @@ fn record_capability_failure(manifest: &mut Manifest, name: &str, error: &anyhow
 }
 
 fn enforce_media_limits(
-    budget: &CaptureBudget<'_>,
+    budget: &ResourceBudget<'_>,
     staging: &Path,
     manifest: &mut Manifest,
     capability: &str,
@@ -2259,7 +2434,7 @@ fn enforce_media_limits(
     true
 }
 
-fn copy_extraction(source: &Path, destination: &Path, budget: &CaptureBudget<'_>) -> Result<()> {
+fn copy_extraction(source: &Path, destination: &Path, budget: &ResourceBudget<'_>) -> Result<()> {
     let parent = destination
         .parent()
         .context("resolving Extraction directory")?;
@@ -2281,7 +2456,7 @@ fn extraction(
     file: &Path,
     locator: Option<Locator>,
     provider: Provider,
-    budget: &CaptureBudget<'_>,
+    budget: &ResourceBudget<'_>,
 ) -> Result<Extraction> {
     Ok(Extraction {
         artifact_id: artifact_id.to_string(),
@@ -2341,7 +2516,7 @@ fn media_mime(source: &Path) -> &'static str {
 fn transcription_parameters(
     config: &Config,
     audio_provider: &Provider,
-    budget: &CaptureBudget<'_>,
+    budget: &ResourceBudget<'_>,
 ) -> Result<Value> {
     let model_path = config.model_path();
     Ok(json!({
@@ -2362,7 +2537,7 @@ fn provider(
     name: &str,
     parameters: Value,
     dependencies: &[&str],
-    budget: &CaptureBudget<'_>,
+    budget: &ResourceBudget<'_>,
 ) -> Result<Provider> {
     let path = provider_path(name)?;
     let dependencies = dependencies
@@ -2429,6 +2604,10 @@ fn start_job(job_id: &str) -> Result<Option<Job>> {
                 "{}@{} concurrency budget exceeded",
                 job.policy.id, job.policy.version
             ),
+            capability: match &job.operation {
+                JobOperation::Derive { recipe, .. } => Some(recipe.kind.as_str().to_string()),
+                _ => None,
+            },
         });
         write_job(&job)?;
         append_job_event(job_id, "failed")?;
@@ -2506,9 +2685,22 @@ fn fail_job(job_id: &str, error: &anyhow::Error) -> Result<()> {
     job.state = "failed".to_string();
     job.updated_at = now_secs();
     job.worker_pid = None;
+    let typed_code = error.chain().find_map(|cause| {
+        cause
+            .downcast_ref::<CodedError>()
+            .map(|coded| coded.code.as_str().to_string())
+    });
+    let (code, capability) = match &job.operation {
+        JobOperation::Derive { recipe, .. } => (
+            typed_code.unwrap_or_else(|| "derive_provider_failed".to_string()),
+            Some(recipe.kind.as_str().to_string()),
+        ),
+        _ => (error_code(error), None),
+    };
     job.error = Some(StructuredError {
-        code: error_code(error),
+        code,
         message: format!("{error:#}"),
+        capability,
     });
     write_job(&job)?;
     append_job_event(&job.id, "failed")?;
@@ -2566,7 +2758,12 @@ fn inspect_capture(capture_id: &str) -> Result<()> {
     let directory = captures_dir()?.join(capture_id);
     let manifest: Manifest = read_json(&directory.join("manifest.json"))?;
     let ledger = read_json_lines(&directory.join("ledger.jsonl"))?;
-    print_json(&InspectedCapture { manifest, ledger })
+    let derivatives = derive::list(capture_id)?;
+    print_json(&InspectedCapture {
+        manifest,
+        ledger,
+        derivatives,
+    })
 }
 
 fn run_index_command(command: &IndexCommand) -> Result<()> {
@@ -2600,6 +2797,7 @@ fn search_captures(query: &str, cursor: Option<&str>, limit: usize) -> Result<()
                 error: StructuredError {
                     code: "index_unavailable".to_string(),
                     message: format!("search Index is unavailable: {error:#}"),
+                    capability: None,
                 },
             });
         }
@@ -2609,6 +2807,7 @@ fn search_captures(query: &str, cursor: Option<&str>, limit: usize) -> Result<()
             error: StructuredError {
                 code: "index_unavailable".to_string(),
                 message: "search Index version is unsupported".to_string(),
+                capability: None,
             },
         });
     }
@@ -2666,8 +2865,12 @@ fn read_artifact(
     }
     let directory = captures_dir()?.join(&request.capture_id);
     let manifest: Manifest = read_json(&directory.join("manifest.json"))?;
-    let artifact =
-        artifact_for(&manifest, &request.artifact_id).context("unknown artifact identifier")?;
+    let artifact = artifact_for(&manifest, &request.artifact_id)
+        .or(derive::artifact_for(
+            &request.capture_id,
+            &request.artifact_id,
+        )?)
+        .context("unknown artifact identifier")?;
     if !is_text_mime(&artifact.mime) {
         bail!("binary artifacts cannot be read on stdout");
     }
@@ -2918,6 +3121,7 @@ fn record_index_degradation(error: &anyhow::Error) {
                 error: StructuredError {
                     code: "index_degraded".to_string(),
                     message: format!("{error:#}"),
+                    capability: None,
                 },
             },
         )
@@ -3128,14 +3332,22 @@ fn policy_for(name: &str) -> Result<Policy> {
         duration_limit_secs: 30 * 60,
         concurrency_limit: 2,
     };
-    let allowed_providers = if name == POLICY_NAME || name == "safe-web@1" {
+    let mut allowed_providers = vec![
+        "ffmpeg".to_string(),
+        "ffprobe".to_string(),
+        "whisper-cli".to_string(),
+        "pdftotext".to_string(),
+        "pdfinfo".to_string(),
+        "tesseract".to_string(),
+    ];
+    let allowed_recipes = if name == POLICY_NAME {
+        allowed_providers.push("scriptor-local-derive".to_string());
         vec![
-            "ffmpeg".to_string(),
-            "ffprobe".to_string(),
-            "whisper-cli".to_string(),
-            "pdftotext".to_string(),
-            "pdfinfo".to_string(),
-            "tesseract".to_string(),
+            RecipeKind::StructuredSummary,
+            RecipeKind::ProvenClaims,
+            RecipeKind::Checklist,
+            RecipeKind::MarkdownNote,
+            RecipeKind::SourcedAnswer,
         ]
     } else {
         Vec::new()
@@ -3145,6 +3357,7 @@ fn policy_for(name: &str) -> Result<Policy> {
         limits,
         allows_remote_calls: name == "safe-web@1",
         allowed_providers,
+        allowed_recipes,
     };
     let canonical_snapshot =
         serde_json::to_value(&snapshot).context("normalizing Policy snapshot")?;
@@ -3375,7 +3588,7 @@ fn sha256_file(path: &Path) -> Result<String> {
     Ok(format!("{:x}", hash.finalize()))
 }
 
-fn sha256_file_limited(path: &Path, budget: &CaptureBudget<'_>) -> Result<String> {
+fn sha256_file_limited(path: &Path, budget: &ResourceBudget<'_>) -> Result<String> {
     let mut file = File::open(path).with_context(|| format!("opening {}", path.display()))?;
     let mut hash = Sha256::new();
     let mut buffer = [0_u8; 8192];
@@ -3393,7 +3606,7 @@ fn sha256_file_limited(path: &Path, budget: &CaptureBudget<'_>) -> Result<String
     Ok(format!("{:x}", hash.finalize()))
 }
 
-fn copy_file_limited(source: &Path, destination: &Path, budget: &CaptureBudget<'_>) -> Result<()> {
+fn copy_file_limited(source: &Path, destination: &Path, budget: &ResourceBudget<'_>) -> Result<()> {
     let mut input = File::open(source).with_context(|| format!("opening {}", source.display()))?;
     let mut output =
         File::create(destination).with_context(|| format!("creating {}", destination.display()))?;

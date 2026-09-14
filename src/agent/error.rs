@@ -4,6 +4,11 @@ use anyhow::Error;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum AgentErrorCode {
+    InvalidDeriveTarget,
+    InvalidRetry,
+    ProviderNotAllowed,
+    RecipeNotAllowed,
+    SensitiveParameters,
     DownloadBudgetExceeded,
     DiskBudgetExceeded,
     PortRefused,
@@ -23,6 +28,11 @@ pub enum AgentErrorCode {
 impl AgentErrorCode {
     pub const fn as_str(self) -> &'static str {
         match self {
+            Self::InvalidDeriveTarget => "invalid_derive_target",
+            Self::InvalidRetry => "invalid_retry",
+            Self::ProviderNotAllowed => "provider_not_allowed",
+            Self::RecipeNotAllowed => "recipe_not_allowed",
+            Self::SensitiveParameters => "sensitive_parameters",
             Self::DownloadBudgetExceeded => "web_download_budget_exceeded",
             Self::DiskBudgetExceeded => "web_disk_budget_exceeded",
             Self::PortRefused => "web_port_refused",

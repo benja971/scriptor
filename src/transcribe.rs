@@ -6,7 +6,7 @@ use std::process::Command;
 use anyhow::{Context, Result, bail};
 
 use crate::binary::ensure_present_in;
-use crate::resource::CaptureBudget;
+use crate::resource::ResourceBudget;
 
 /// Transcrit `audio_wav` avec `whisper-cli`, en utilisant le modèle situé à
 /// `model_path`, la langue `language` et `threads` threads. Écrit le
@@ -42,7 +42,7 @@ pub fn transcribe_limited(
     language: &str,
     threads: u32,
     output_basename: &Path,
-    budget: &CaptureBudget<'_>,
+    budget: &ResourceBudget<'_>,
 ) -> Result<PathBuf> {
     let path_env = env::var_os("PATH").unwrap_or_default();
     ensure_present_in("whisper-cli", &path_env)?;
