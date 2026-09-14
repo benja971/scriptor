@@ -43,9 +43,15 @@ export const createPinnedProxy = async (limit, resolveTarget = resolvedTarget) =
       const upstream = httpRequest({ host: ip, port, method: request.method, path: `${target.pathname}${target.search}`, headers: { ...request.headers, host: target.host, connection: "close" } }, (upstreamResponse) => {
         response.writeHead(upstreamResponse.statusCode ?? 502, upstreamResponse.headers);
         upstreamResponse.on("data", (chunk) => { try { reserve(chunk.length); } catch (error) { recordFailure(error); upstream.destroy(); response.destroy(); } });
+        upstreamResponse.on("error", () => response.destroy());
+        response.on("close", () => upstreamResponse.destroy());
         upstreamResponse.pipe(response);
       });
-      upstream.on("error", () => response.destroy()); request.pipe(upstream);
+      upstream.on("error", () => response.destroy());
+      upstream.on("socket", (socket) => socket.on("error", () => response.destroy()));
+      request.on("error", () => upstream.destroy());
+      response.on("error", () => upstream.destroy());
+      request.pipe(upstream);
     } catch (error) { recordFailure(error); response.destroy(); }
   });
   server.on("connect", async (request, client, head) => {

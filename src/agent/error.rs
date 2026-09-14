@@ -11,6 +11,7 @@ pub enum AgentErrorCode {
     SensitiveParameters,
     DownloadBudgetExceeded,
     DiskBudgetExceeded,
+    NavigationFailed,
     PortRefused,
     PrivateTargetRefused,
     RendererFirefoxUnavailable,
@@ -35,6 +36,7 @@ impl AgentErrorCode {
             Self::SensitiveParameters => "sensitive_parameters",
             Self::DownloadBudgetExceeded => "web_download_budget_exceeded",
             Self::DiskBudgetExceeded => "web_disk_budget_exceeded",
+            Self::NavigationFailed => "web_navigation_failed",
             Self::PortRefused => "web_port_refused",
             Self::PrivateTargetRefused => "web_private_target_refused",
             Self::RendererFirefoxUnavailable => "web_renderer_firefox_unavailable",
@@ -54,6 +56,7 @@ impl AgentErrorCode {
         match value {
             "web_download_budget_exceeded" => Some(Self::DownloadBudgetExceeded),
             "web_disk_budget_exceeded" => Some(Self::DiskBudgetExceeded),
+            "web_navigation_failed" => Some(Self::NavigationFailed),
             "web_port_refused" => Some(Self::PortRefused),
             "web_private_target_refused" => Some(Self::PrivateTargetRefused),
             "web_renderer_firefox_unavailable" => Some(Self::RendererFirefoxUnavailable),

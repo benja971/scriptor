@@ -175,6 +175,9 @@ printf '{"final_url":"https://93.184.216.34/"}' > "$out/provenance.json"
 const FAKE_PAGE_RENDERER_PRIVATE_TARGET: &str =
     "#!/bin/sh\necho web_private_target_refused >&2\nexit 1\n";
 
+const FAKE_PAGE_RENDERER_NAVIGATION_FAILURE: &str =
+    "#!/bin/sh\necho 'web_navigation_failed: 503' >&2\nexit 1\n";
+
 const FAKE_PAGE_RENDERER_SKIPPED_DISCOVERY: &str = r#"#!/bin/sh
 set -eu
 while [ "$#" -gt 0 ]; do
@@ -1540,33 +1543,44 @@ fn capture_continue_cancellation_stops_a_running_web_child() {
 }
 
 #[test]
-fn safe_web_preserves_a_renderer_refusal_code_in_the_job_contract() {
-    let env = TestEnv::new("safe-web-refusal");
-    env.install_binary("scriptor-page-renderer", FAKE_PAGE_RENDERER_PRIVATE_TARGET);
-    let created: Value = serde_json::from_slice(
-        &env.command()
-            .args([
-                "capture",
-                "https://93.184.216.34/",
-                "--policy",
-                "safe-web@1",
-            ])
+fn safe_web_preserves_renderer_failure_codes_in_the_job_contract() {
+    for (name, renderer, code) in [
+        (
+            "private-target",
+            FAKE_PAGE_RENDERER_PRIVATE_TARGET,
+            "web_private_target_refused",
+        ),
+        (
+            "navigation",
+            FAKE_PAGE_RENDERER_NAVIGATION_FAILURE,
+            "web_navigation_failed",
+        ),
+    ] {
+        let env = TestEnv::new(&format!("safe-web-{name}"));
+        env.install_binary("scriptor-page-renderer", renderer);
+        let created: Value = serde_json::from_slice(
+            &env.command()
+                .args([
+                    "capture",
+                    "https://93.184.216.34/",
+                    "--policy",
+                    "safe-web@1",
+                ])
+                .assert()
+                .success()
+                .get_output()
+                .stdout,
+        )
+        .expect("Job JSON valide");
+        let job_id = created["job"]["job_id"]
+            .as_str()
+            .expect("identifiant de Job");
+        env.command()
+            .args(["job", "wait", job_id, "--timeout-secs", "5"])
             .assert()
             .success()
-            .get_output()
-            .stdout,
-    )
-    .expect("Job JSON valide");
-    let job_id = created["job"]["job_id"]
-        .as_str()
-        .expect("identifiant de Job");
-    env.command()
-        .args(["job", "wait", job_id, "--timeout-secs", "5"])
-        .assert()
-        .success()
-        .stdout(predicate::str::contains(
-            "\"code\":\"web_private_target_refused\"",
-        ));
+            .stdout(predicate::str::contains(format!("\"code\":\"{code}\"")));
+    }
 }
 
 #[test]

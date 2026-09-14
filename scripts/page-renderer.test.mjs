@@ -19,6 +19,27 @@ await new Promise((resolve) => proxyServer.listen(0, "127.0.0.1", resolve));
 const address = proxyServer.address();
 assert.ok(address && typeof address !== "string");
 const proxy = `http://127.0.0.1:${address.port}`;
+const redPixelsIn = async (browserName, screenshot) => {
+  const browser = await launchBrowser(browserName, proxy);
+  try {
+    const page = await browser.newPage();
+    return await page.evaluate(async (encoded) => {
+      const image = new Image();
+      image.src = `data:image/png;base64,${encoded}`;
+      await image.decode();
+      const canvas = document.createElement("canvas");
+      canvas.width = image.width;
+      canvas.height = image.height;
+      const context = canvas.getContext("2d");
+      context.drawImage(image, 0, 0);
+      return [...context.getImageData(0, 0, canvas.width, canvas.height).data]
+        .filter((_value, index, values) => index % 4 === 0 && values[index] > 200 && values[index + 1] < 50 && values[index + 2] < 50)
+        .length;
+    }, screenshot.toString("base64"));
+  } finally {
+    await browser.close();
+  }
+};
 
 const privateProxy = await createPinnedProxy(1024);
 await new Promise((resolve) => {
@@ -100,6 +121,9 @@ try {
   await rm(rebindingOutput, { recursive: true, force: true });
 }
 
+assert.throws(() => launchOptions("webkit", proxy), /web_renderer_unknown/);
+assert.throws(() => launchOptions("lightpanda", proxy), /web_renderer_unknown/);
+
 for (const browserName of ["firefox", "chromium"]) {
   const options = launchOptions(browserName, proxy);
   if (browserName === "chromium") {
@@ -124,15 +148,19 @@ for (const browserName of ["firefox", "chromium"]) {
 }
 
 const fixtureServer = createServer((request, response) => {
+  if (request.url === "/failure") {
+    response.writeHead(503).end("temporarily unavailable");
+    return;
+  }
   if (request.url === "/app.js") {
-    response.writeHead(200, { "content-type": "application/javascript" }).end("setTimeout(() => document.body.insertAdjacentHTML('beforeend', '<p>SPA loaded</p>'), 0)");
+    response.writeHead(200, { "content-type": "application/javascript" }).end("const canvas = document.querySelector('canvas'); canvas.getContext('2d').fillStyle = 'red'; canvas.getContext('2d').fillRect(0, 0, 100, 100); setTimeout(() => document.body.insertAdjacentHTML('beforeend', '<p>SPA loaded</p>'), 0); addEventListener('scroll', () => { if (innerHeight + scrollY >= document.documentElement.scrollHeight) document.body.insertAdjacentHTML('beforeend', '<p>Lazy loaded</p>'); }, { once: true })");
     return;
   }
   if (request.url === "/frame") {
     response.writeHead(200, { "content-type": "text/html" }).end("<p>iframe content</p>");
     return;
   }
-  response.writeHead(200, { "content-type": "text/html" }).end("<main><h1>Fixture page</h1><p>Static content</p><img src='/image.png'><audio src='/audio.mp3'></audio><video src='/video.mp4'></video><iframe src='/frame'></iframe><a href='/document.pdf'>Document</a><script src='/app.js'></script></main>");
+  response.writeHead(200, { "content-type": "text/html" }).end("<main style='min-height: 2400px'><h1>Fixture page</h1><p>Static content</p><canvas width='100' height='100' style='border: 2px solid black'></canvas><img src='/image.png'><audio src='/audio.mp3'></audio><video src='/video.mp4'></video><iframe src='/frame'></iframe><a href='/document.pdf'>Document</a><script src='/app.js'></script></main>");
 });
 await new Promise((resolve) => fixtureServer.listen(0, "127.0.0.1", resolve));
 const fixtureAddress = fixtureServer.address();
@@ -150,14 +178,31 @@ for (const browserName of ["firefox", "chromium"]) {
     });
     assert.match(await readFile(join(outputDir, "proofs/dom.html"), "utf8"), /Fixture page/);
     assert.match(await readFile(join(outputDir, "extractions/page.md"), "utf8"), /SPA loaded/);
+    assert.match(await readFile(join(outputDir, "extractions/page.md"), "utf8"), /Lazy loaded/);
     const screenshot = await readFile(join(outputDir, "proofs/screenshot.png"));
     assert.ok(screenshot.length > 0);
+    assert.ok(await redPixelsIn(browserName, screenshot) > 100);
     const discoveries = JSON.parse(await readFile(join(outputDir, "discoveries.json"), "utf8"));
     assert.equal(discoveries.length, 5);
     assert.deepEqual(discoveries.map((discovery) => discovery.order), [0, 1, 2, 3, 4]);
   } finally {
     await rm(outputDir, { recursive: true, force: true });
   }
+}
+const failedOutput = await mkdtemp(join(tmpdir(), "scriptor-render-failure-"));
+try {
+  await assert.rejects(
+    render(["--output-dir", failedOutput, "--url", `${fixtureUrl}failure`, "--browser", "firefox", "--max-output-bytes", "1048576", "--max-download-bytes", "1048576"], {
+      assertPublic: async () => undefined,
+      createPinnedProxy: (limit) => createPinnedProxy(limit, async (host) => {
+        if (host === "public.test") return "127.0.0.1";
+        throw new Error("web_private_target_refused");
+      }),
+    }),
+    /web_navigation_failed: 503/,
+  );
+} finally {
+  await rm(failedOutput, { recursive: true, force: true });
 }
 await new Promise((resolve) => fixtureServer.close(resolve));
 

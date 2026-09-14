@@ -38,6 +38,18 @@ export const protectContext = async (context, assertPublicUrl = assertPublic) =>
   await context.routeWebSocket("**/*", async (socket) => { rejection = new Error("web_websocket_refused"); await socket.close({ code: 1008, reason: "WebSocket capture is disabled" }); });
   return () => rejection;
 };
+const settleLazyContent = async (page) => {
+  let previousHeight = -1;
+  let stablePasses = 0;
+  for (let pass = 0; pass < 10 && stablePasses < 2; pass += 1) {
+    await page.evaluate(() => scrollTo(0, document.documentElement.scrollHeight));
+    await page.waitForTimeout(100);
+    const height = await page.evaluate(() => document.documentElement.scrollHeight);
+    stablePasses = height === previousHeight ? stablePasses + 1 : 0;
+    previousHeight = height;
+  }
+  await page.evaluate(() => scrollTo(0, 0));
+};
 
 const option = (args, name, required = true) => { const index = args.indexOf(name); if (index < 0) { if (required) throw new Error(`missing ${name}`); return undefined; } if (!args[index + 1]) throw new Error(`missing ${name}`); return args[index + 1]; };
 export const render = async (args, dependencies = {}) => {
@@ -59,7 +71,9 @@ export const render = async (args, dependencies = {}) => {
       if (rejection) throw rejection;
       throw error;
     }
-    const rejection = routeRejection() ?? proxy.failure(); if (rejection) throw rejection; await assertPublicUrl(page.url());
+    const rejection = routeRejection() ?? proxy.failure(); if (rejection) throw rejection;
+    if (navigation && !navigation.ok()) throw new Error(`web_navigation_failed: ${navigation.status()}`);
+    await assertPublicUrl(page.url()); await settleLazyContent(page);
     const [dom, markdown, discoveries] = await page.evaluate(() => {
       const extensions = /\.(pdf|docx?|odt|rtf)$/i;
       const cssPath = (node) => { const parts = []; for (let current = node; current && current.nodeType === 1; current = current.parentElement) { const parent = current.parentElement; if (!parent) { parts.unshift(current.tagName.toLowerCase()); continue; } const siblings = [...parent.children].filter((item) => item.tagName === current.tagName); parts.unshift(`${current.tagName.toLowerCase()}:nth-of-type(${siblings.indexOf(current) + 1})`); } return parts.join(" > "); };
