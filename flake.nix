@@ -15,6 +15,7 @@
         mkdir -p "$out"
         cp ${./scripts/page-renderer.mjs} "$out/page-renderer.mjs"
         cp ${./scripts/binary-acquirer.mjs} "$out/binary-acquirer.mjs"
+        cp ${./scripts/web-safety.mjs} "$out/web-safety.mjs"
       '';
       pageRenderer = pkgs.writeShellApplication {
         name = "scriptor-page-renderer";

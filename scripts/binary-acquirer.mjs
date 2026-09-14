@@ -5,7 +5,7 @@ import { mkdir, readFile, rm, stat, writeFile } from "node:fs/promises";
 import { join } from "node:path";
 import { promisify } from "node:util";
 
-import { assertPublic, createPinnedProxy } from "./page-renderer.mjs";
+import { assertPublic, createPinnedProxy } from "./web-safety.mjs";
 
 const execFileAsync = promisify(execFile);
 
