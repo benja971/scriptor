@@ -42,6 +42,7 @@ impl Acquisition for SocialAcquisition<'_> {
     fn source_hash(&self, _: &Path) -> Result<AcquisitionResult<String>> {
         Ok(AcquisitionResult::Ready(sha256_bytes(self.url.as_bytes())))
     }
+    #[allow(clippy::too_many_lines)]
     fn acquire(
         &self,
         capture: &super::publication::StagedCapture,
@@ -174,7 +175,7 @@ impl Acquisition for SocialAcquisition<'_> {
             capabilities: vec![
                 success("metadata", provider.clone()),
                 success("caption", provider.clone()),
-                success("media-0", provider.clone()),
+                success("media-0", provider),
             ],
             artifacts: vec![media],
             discoveries: Vec::new(),
@@ -216,6 +217,7 @@ impl Acquisition for SocialAcquisition<'_> {
     }
 }
 
+#[allow(clippy::too_many_lines)]
 fn acquire_linkedin(
     job: &Job,
     url: &str,
@@ -313,7 +315,7 @@ fn acquire_linkedin(
         capabilities: vec![
             success("metadata", provider.clone()),
             success("caption", provider.clone()),
-            success("media-0", provider.clone()),
+            success("media-0", provider),
         ],
         artifacts: vec![media],
         discoveries: Vec::new(),
@@ -387,7 +389,8 @@ fn linkedin_json_ld(html: &str) -> Option<&str> {
     let marker = "application/ld+json";
     let type_offset = html.find(marker)?;
     let contents = html.get(type_offset..)?;
-    let start = contents.find('>')?.checked_add(type_offset + 1)?;
+    let type_end = type_offset.checked_add(1)?;
+    let start = contents.find('>')?.checked_add(type_end)?;
     let end = html.get(start..)?.find("</script>")?.checked_add(start)?;
     html.get(start..end).map(str::trim)
 }
