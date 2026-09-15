@@ -413,6 +413,7 @@ impl TestEnv {
         write_executable(&bin_dir, "ffmpeg", FAKE_FFMPEG);
         write_executable(&bin_dir, "ffprobe", FAKE_FFPROBE);
         write_executable(&bin_dir, "whisper-cli", FAKE_WHISPER_CLI);
+        write_executable(&bin_dir, "tesseract", FAKE_TESSERACT);
 
         Self {
             bin_dir,
@@ -657,6 +658,19 @@ fn assert_readable_transcription(env: &TestEnv, capture_id: &str, capture: &Valu
     assert_eq!(read["artifact"]["provider"]["name"], "whisper-cli");
     assert_eq!(read["reference"]["locator"], Value::Null);
     assert_eq!(read["content"]["text"], "faux contenu transcrit\n");
+}
+
+fn assert_capture_searches(env: &TestEnv, query: &str, capture_id: &str) {
+    let search: Value = serde_json::from_slice(
+        &env.command()
+            .args(["capture", "search", query])
+            .assert()
+            .success()
+            .get_output()
+            .stdout,
+    )
+    .expect("résultat de recherche JSON valide");
+    assert_eq!(search["captures"][0]["capture_id"], capture_id);
 }
 
 #[test]
@@ -1881,7 +1895,7 @@ fn capture_local_media_publishes_proof_and_located_extractions() {
     assert_eq!(capture["manifest"]["proof"]["mime"], "video/mp4");
     assert_eq!(
         capture["manifest"]["extractions"].as_array().map(Vec::len),
-        Some(2)
+        Some(3)
     );
     assert!(
         capture["manifest"]["extractions"]
@@ -1901,6 +1915,25 @@ fn capture_local_media_publishes_proof_and_located_extractions() {
         capture["manifest"]["extractions"]
             .as_array()
             .is_some_and(|extractions| extractions.iter().any(|extraction| {
+                extraction["artifact_id"] == "extraction-frame-0000-ocr"
+                    && extraction["path"] == "extractions/frames/frame-0000.ocr.txt"
+                    && extraction["locator"]["kind"] == "frame-regions"
+                    && extraction["locator"]["timestamps_secs"][0] == 0.0
+                    && extraction["locator"]["regions"][0]["left"] == 12
+                    && extraction["provider"]["name"] == "tesseract"
+            }))
+    );
+    assert!(
+        capture["manifest"]["capabilities"]
+            .as_array()
+            .is_some_and(|capabilities| capabilities.iter().any(|capability| {
+                capability["name"] == "frame-ocr" && capability["state"] == "succeeded"
+            }))
+    );
+    assert!(
+        capture["manifest"]["extractions"]
+            .as_array()
+            .is_some_and(|extractions| extractions.iter().any(|extraction| {
                 extraction["artifact_id"] == "extraction-frame-0000"
                     && extraction["locator"]["kind"] == "media-timestamp"
                     && extraction["provider"]["name"] == "ffmpeg"
@@ -1909,7 +1942,62 @@ fn capture_local_media_publishes_proof_and_located_extractions() {
             }))
     );
 
+    assert_capture_searches(&env, "Bonjour", capture_id);
+
     assert_readable_transcription(&env, capture_id, &capture);
+}
+
+#[test]
+fn capture_keeps_frames_when_frame_ocr_fails() {
+    let env = TestEnv::new("capture-frame-ocr-failure");
+    env.write_config(&env.work_dir.join("out"));
+    env.install_binary("tesseract", FAKE_TESSERACT_FAILURE);
+    let source = env.write_media_file("interview.mp4");
+    let created: Value = serde_json::from_slice(
+        &env.command()
+            .args([
+                "capture",
+                source.to_str().expect("chemin utf-8"),
+                "--policy",
+                "safe-local@1",
+            ])
+            .assert()
+            .success()
+            .get_output()
+            .stdout,
+    )
+    .expect("Job JSON valide");
+    let job_id = created["job"]["job_id"]
+        .as_str()
+        .expect("identifiant de Job");
+    let finished = wait_for_agent_job(&env, job_id);
+    assert_eq!(finished["state"], "partial");
+    let capture_id = finished["capture_id"]
+        .as_str()
+        .expect("identifiant de Capture");
+    let capture = inspect_agent_capture(&env, capture_id);
+    let extractions = capture["manifest"]["extractions"]
+        .as_array()
+        .expect("extractions média");
+    assert!(
+        extractions
+            .iter()
+            .any(|extraction| { extraction["artifact_id"] == "extraction-frame-0000" })
+    );
+    assert!(
+        !extractions
+            .iter()
+            .any(|extraction| { extraction["artifact_id"] == "extraction-frame-0000-ocr" })
+    );
+    assert!(
+        capture["manifest"]["capabilities"]
+            .as_array()
+            .is_some_and(|capabilities| capabilities.iter().any(|capability| {
+                capability["name"] == "frame-ocr"
+                    && capability["state"] == "failed"
+                    && capability["provider"]["name"] == "tesseract"
+            }))
+    );
 }
 
 #[test]
