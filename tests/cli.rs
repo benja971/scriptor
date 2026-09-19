@@ -1579,12 +1579,15 @@ fn capture_instagram_video_transcribes_extracts_frames_and_indexes_text() {
             && extraction["path"] == "extractions/media-0/frames/frame-0001-0.000s.jpg"
             && extraction["proof_artifact_id"] == "media-0"
     }));
-    assert!(extractions.iter().any(|extraction| {
-        extraction["artifact_id"] == "extraction-media-0-frame-0000-ocr"
-            && extraction["path"] == "extractions/ocr/extraction-media-0-frame-0000.txt"
-            && extraction["proof_artifact_id"] == "extraction-media-0-frame-0000"
-            && extraction["locator"]["kind"] == "image-regions"
-    }));
+    assert!(
+        extractions.iter().any(|extraction| {
+            extraction["artifact_id"] == "extraction-media-0-frame-0000-ocr"
+                && extraction["path"] == "extractions/ocr/extraction-media-0-frame-0000.txt"
+                && extraction["proof_artifact_id"] == "extraction-media-0-frame-0000"
+                && extraction["locator"]["kind"] == "image-regions"
+        }),
+        "{capture}"
+    );
     assert!(
         capture["manifest"]["capabilities"]
             .as_array()
