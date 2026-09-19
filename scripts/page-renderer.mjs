@@ -1,5 +1,7 @@
 import { mkdir, stat, writeFile } from "node:fs/promises";
 import { createRequire } from "node:module";
+import { createServer } from "node:net";
+import { spawn } from "node:child_process";
 import { fileURLToPath } from "node:url";
 import { join } from "node:path";
 
@@ -24,10 +26,11 @@ export const launchBrowser = async (name, proxyAddress) => {
     throw new Error(`web_renderer_${name}_unavailable: ${detail}`);
   }
 };
+const disableWebRtc = async (context) => context.addInitScript(() => {
+  for (const name of ["RTCPeerConnection", "webkitRTCPeerConnection", "RTCDataChannel"]) Object.defineProperty(globalThis, name, { configurable: false, value: undefined, writable: false });
+});
 export const protectContext = async (context, assertPublicUrl = assertPublic) => {
-  await context.addInitScript(() => {
-    for (const name of ["RTCPeerConnection", "webkitRTCPeerConnection", "RTCDataChannel"]) Object.defineProperty(globalThis, name, { configurable: false, value: undefined, writable: false });
-  });
+  await disableWebRtc(context);
   let rejection;
   await context.route("**/*", async (route) => {
     try { await assertPublicUrl(route.request().url()); await route.continue(); } catch (error) {
@@ -52,6 +55,69 @@ const settleLazyContent = async (page) => {
 };
 
 const option = (args, name, required = true) => { const index = args.indexOf(name); if (index < 0) { if (required) throw new Error(`missing ${name}`); return undefined; } if (!args[index + 1]) throw new Error(`missing ${name}`); return args[index + 1]; };
+const availablePort = async () => new Promise((resolve, reject) => {
+  const server = createServer();
+  server.once("error", reject);
+  server.listen(0, "127.0.0.1", () => {
+    const address = server.address();
+    if (!address || typeof address === "string") { server.close(); reject(new Error("lightpanda address unavailable")); return; }
+    server.close((error) => error ? reject(error) : resolve(address.port));
+  });
+});
+const pause = (milliseconds) => new Promise((resolve) => setTimeout(resolve, milliseconds));
+const stopLightpanda = async (child) => {
+  if (child.exitCode !== null) return;
+  await new Promise((resolve) => { child.once("close", resolve); child.kill(); });
+};
+const startLightpanda = async (proxyAddress) => {
+  const port = await availablePort();
+  let detail = "";
+  const child = spawn("lightpanda", ["serve", "--host", "127.0.0.1", "--port", String(port), "--http-proxy", proxyAddress, "--disable-metrics"], { env: { ...process.env, LIGHTPANDA_DISABLE_TELEMETRY: "true" }, stdio: ["ignore", "ignore", "pipe"] });
+  child.stderr.on("data", (chunk) => { detail = `${detail}${chunk}`.slice(-4096); });
+  let startupError;
+  child.once("error", (error) => { startupError = error; });
+  try {
+    for (let attempt = 0; attempt < 250; attempt += 1) {
+      if (startupError) throw startupError;
+      if (child.exitCode !== null) throw new Error(detail || "lightpanda exited during startup");
+      try { return { browser: await chromium.connectOverCDP(`http://127.0.0.1:${port}`), child }; } catch { await pause(20); }
+    }
+    throw new Error(detail || "lightpanda startup timed out");
+  } catch (error) {
+    await stopLightpanda(child);
+    const message = error instanceof Error ? error.message : String(error);
+    throw new Error(`web_renderer_lightpanda_unavailable: ${message}`);
+  }
+};
+const renderLightpanda = async ({ initialUrl, outputDir, proxy, assertPublicUrl, writeBudgeted }) => {
+  const { browser, child } = await startLightpanda(proxy.address);
+  let context;
+  try {
+    context = await browser.newContext({ serviceWorkers: "block", permissions: [] });
+    await disableWebRtc(context);
+    const page = await context.newPage();
+    const navigation = await page.goto(initialUrl, { waitUntil: "load", timeout: 30_000 });
+    const failure = proxy.failure(); if (failure) throw failure;
+    if (navigation && !navigation.ok()) throw new Error(`web_navigation_failed: ${navigation.status()}`);
+    await assertPublicUrl(page.url()); await settleLazyContent(page);
+    const lazyFailure = proxy.failure(); if (lazyFailure) throw lazyFailure;
+    const dom = await page.evaluate(() => document.documentElement.outerHTML);
+    const session = await context.newCDPSession(page);
+    const { markdown } = await session.send("LP.getMarkdown", {});
+    const redirects = []; for (let request = navigation?.request(); request; request = request.redirectedFrom()) redirects.unshift(request.url());
+    await writeBudgeted(join(outputDir, "proofs/dom.html"), dom); await writeBudgeted(join(outputDir, "extractions/page.md"), markdown); await writeBudgeted(join(outputDir, "provenance.json"), JSON.stringify({ initial_url: initialUrl, final_url: page.url(), redirect_chain: redirects, browser: "lightpanda" }));
+  } finally {
+    try {
+      if (context) await context.close();
+    } finally {
+      try {
+        await browser.close();
+      } finally {
+        await stopLightpanda(child);
+      }
+    }
+  }
+};
 export const render = async (args, dependencies = {}) => {
   const assertPublicUrl = dependencies.assertPublic ?? assertPublic;
   const createProxy = dependencies.createPinnedProxy ?? createPinnedProxy;
@@ -63,6 +129,10 @@ export const render = async (args, dependencies = {}) => {
   await assertPublicUrl(initialUrl); await mkdir(join(outputDir, "proofs"), { recursive: true }); await mkdir(join(outputDir, "extractions"), { recursive: true });
   const proxy = await createProxy(maxDownloadBytes); let browser;
   try {
+    if (browserName === "lightpanda") {
+      await renderLightpanda({ initialUrl, outputDir, proxy, assertPublicUrl, writeBudgeted });
+      return;
+    }
     browser = await launchBrowser(browserName, proxy.address);
     const context = await browser.newContext({ serviceWorkers: "block", viewport: { width: 1280, height: 720 }, permissions: [] });
     const routeRejection = await protectContext(context, assertPublicUrl); const page = await context.newPage();
@@ -74,6 +144,7 @@ export const render = async (args, dependencies = {}) => {
     const rejection = routeRejection() ?? proxy.failure(); if (rejection) throw rejection;
     if (navigation && !navigation.ok()) throw new Error(`web_navigation_failed: ${navigation.status()}`);
     await assertPublicUrl(page.url()); await settleLazyContent(page);
+    const lazyRejection = routeRejection() ?? proxy.failure(); if (lazyRejection) throw lazyRejection;
     const [dom, markdown, discoveries] = await page.evaluate(() => {
       const extensions = /\.(pdf|docx?|odt|rtf)$/i;
       const cssPath = (node) => { const parts = []; for (let current = node; current && current.nodeType === 1; current = current.parentElement) { const parent = current.parentElement; if (!parent) { parts.unshift(current.tagName.toLowerCase()); continue; } const siblings = [...parent.children].filter((item) => item.tagName === current.tagName); parts.unshift(`${current.tagName.toLowerCase()}:nth-of-type(${siblings.indexOf(current) + 1})`); } return parts.join(" > "); };

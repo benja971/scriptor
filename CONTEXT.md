@@ -27,6 +27,10 @@ avec ses références de Preuves ou Extractions.
 La forme typée et autorisée d’un Dérivé, appliquée à une Capture entière ou à
 des références sélectionnées.
 
+**Contexte d’inférence**:
+Le paquet borné et déclaré de Références d’une Capture qu’une Recette transmet
+réellement à un Provider pour produire un Dérivé.
+
 **Capacité**:
 L’opération indépendante enregistrée pour une Capture, avec son Provider, son
 état et, le cas échéant, son erreur structurée.

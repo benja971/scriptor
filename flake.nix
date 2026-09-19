@@ -11,6 +11,19 @@
         withWebkit = false;
         withChromiumHeadlessShell = true;
       };
+      lightpanda = pkgs.stdenvNoCC.mkDerivation {
+        pname = "lightpanda";
+        version = "1.0.0-nightly.9608+b1ffc164a";
+        src = pkgs.fetchurl {
+          url = "https://api.github.com/repos/lightpanda-io/browser/releases/assets/573931479";
+          hash = "sha256-G/yKqvOXE2cb0cqj4yBTc0M8VN4rkkLZYWy5AxyLMcg=";
+          curlOpts = "--header=Accept:application/octet-stream";
+        };
+        dontUnpack = true;
+        installPhase = ''
+          install -Dm755 "$src" "$out/bin/lightpanda"
+        '';
+      };
       webScripts = pkgs.runCommand "scriptor-web-scripts" { } ''
         mkdir -p "$out"
         cp ${./scripts/page-renderer.mjs} "$out/page-renderer.mjs"
@@ -19,7 +32,7 @@
       '';
       pageRenderer = pkgs.writeShellApplication {
         name = "scriptor-page-renderer";
-        runtimeInputs = [ pkgs.nodejs pkgs.curl pkgs.playwright-test playwrightBrowsers ];
+        runtimeInputs = [ pkgs.nodejs pkgs.curl pkgs.playwright-test playwrightBrowsers lightpanda ];
         text = ''
           export NODE_PATH="${pkgs.playwright-test}/lib/node_modules"
           export PLAYWRIGHT_BROWSERS_PATH="${playwrightBrowsers}"
@@ -28,7 +41,7 @@
       };
       pageRendererTest = pkgs.writeShellApplication {
         name = "scriptor-page-renderer-test";
-        runtimeInputs = [ pkgs.nodejs pkgs.curl pkgs.playwright-test playwrightBrowsers ];
+        runtimeInputs = [ pkgs.nodejs pkgs.curl pkgs.playwright-test playwrightBrowsers lightpanda ];
         text = ''
           export NODE_PATH="${pkgs.playwright-test}/lib/node_modules"
           export PLAYWRIGHT_BROWSERS_PATH="${playwrightBrowsers}"

@@ -153,7 +153,7 @@ const fixtureServer = createServer((request, response) => {
     return;
   }
   if (request.url === "/app.js") {
-    response.writeHead(200, { "content-type": "application/javascript" }).end("const canvas = document.querySelector('canvas'); canvas.getContext('2d').fillStyle = 'red'; canvas.getContext('2d').fillRect(0, 0, 100, 100); setTimeout(() => document.body.insertAdjacentHTML('beforeend', '<p>SPA loaded</p>'), 0); addEventListener('scroll', () => { if (innerHeight + scrollY >= document.documentElement.scrollHeight) document.body.insertAdjacentHTML('beforeend', '<p>Lazy loaded</p>'); }, { once: true })");
+    response.writeHead(200, { "content-type": "application/javascript" }).end("const canvas = document.querySelector('canvas'); canvas.getContext('2d').fillStyle = 'red'; canvas.getContext('2d').fillRect(0, 0, 100, 100); setTimeout(() => document.body.insertAdjacentHTML('beforeend', '<p>SPA loaded</p>'), 0); addEventListener('scroll', () => { if (innerHeight + scrollY >= document.documentElement.scrollHeight) { document.body.insertAdjacentHTML('beforeend', '<p>Lazy loaded</p>'); if (location.pathname === '/lazy-private') new Image().src = 'http://private.test/private'; } }, { once: true })");
     return;
   }
   if (request.url === "/frame") {
@@ -179,6 +179,7 @@ for (const browserName of ["firefox", "chromium"]) {
     assert.match(await readFile(join(outputDir, "proofs/dom.html"), "utf8"), /Fixture page/);
     assert.match(await readFile(join(outputDir, "extractions/page.md"), "utf8"), /SPA loaded/);
     assert.match(await readFile(join(outputDir, "extractions/page.md"), "utf8"), /Lazy loaded/);
+    assert.equal(JSON.parse(await readFile(join(outputDir, "provenance.json"), "utf8")).browser, browserName);
     const screenshot = await readFile(join(outputDir, "proofs/screenshot.png"));
     assert.ok(screenshot.length > 0);
     assert.ok(await redPixelsIn(browserName, screenshot) > 100);
@@ -188,6 +189,39 @@ for (const browserName of ["firefox", "chromium"]) {
   } finally {
     await rm(outputDir, { recursive: true, force: true });
   }
+}
+const lightpandaOutput = await mkdtemp(join(tmpdir(), "scriptor-render-lightpanda-"));
+try {
+  await render(["--output-dir", lightpandaOutput, "--url", fixtureUrl, "--browser", "lightpanda", "--max-output-bytes", "1048576", "--max-download-bytes", "1048576"], {
+    assertPublic: async () => undefined,
+    createPinnedProxy: (limit) => createPinnedProxy(limit, async (host) => {
+      if (host === "public.test") return "127.0.0.1";
+      throw new Error("web_private_target_refused");
+    }),
+  });
+  assert.match(await readFile(join(lightpandaOutput, "proofs/dom.html"), "utf8"), /Fixture page/);
+  assert.match(await readFile(join(lightpandaOutput, "extractions/page.md"), "utf8"), /Fixture page/);
+  assert.equal(JSON.parse(await readFile(join(lightpandaOutput, "provenance.json"), "utf8")).browser, "lightpanda");
+  await assert.rejects(readFile(join(lightpandaOutput, "proofs/screenshot.png")));
+  await assert.rejects(readFile(join(lightpandaOutput, "discoveries.json")));
+} finally {
+  await rm(lightpandaOutput, { recursive: true, force: true });
+}
+const lazyPrivateOutput = await mkdtemp(join(tmpdir(), "scriptor-render-lazy-private-"));
+try {
+  await assert.rejects(
+    render(["--output-dir", lazyPrivateOutput, "--url", `${fixtureUrl}lazy-private`, "--browser", "firefox", "--max-output-bytes", "1048576", "--max-download-bytes", "1048576"], {
+      assertPublic: async (value) => { if (new URL(value).hostname !== "public.test") throw new Error("web_private_target_refused"); },
+      createPinnedProxy: (limit) => createPinnedProxy(limit, async (host) => {
+        if (host === "public.test") return "127.0.0.1";
+        throw new Error("web_private_target_refused");
+      }),
+    }),
+    /web_private_target_refused/,
+    "a private request triggered by lazy loading must fail the render",
+  );
+} finally {
+  await rm(lazyPrivateOutput, { recursive: true, force: true });
 }
 const failedOutput = await mkdtemp(join(tmpdir(), "scriptor-render-failure-"));
 try {

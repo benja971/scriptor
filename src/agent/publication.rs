@@ -3,7 +3,8 @@ use std::path::{Path, PathBuf};
 
 use super::{
     Job, LedgerEvent, Manifest, RemoteProvenance, captures_dir, find_capture_by_source_hash,
-    lock_capture_key, now_secs, read_job, rebuild_search_index, record_index_degradation,
+    lock_capture_key, next_capture_version, now_secs, read_job, rebuild_search_index,
+    record_index_degradation,
 };
 use crate::resource::directory_size;
 use anyhow::{Context, Result, bail};
@@ -40,6 +41,10 @@ impl PreparedCapture {
         self.manifest.source.locator = locator;
         self.manifest.remote_provenance = Some(provenance);
         self
+    }
+
+    const fn set_capture_version(&mut self, capture_version: u64) {
+        self.manifest.capture_version = capture_version;
     }
 }
 
@@ -83,20 +88,27 @@ pub(super) fn publish(job: &Job, acquisition: &dyn Acquisition) -> Result<Public
         AcquisitionResult::Cancelled => return Ok(Publication::Cancelled),
     };
     let capture_lock = lock_capture_key(&source_hash)?;
-    if job.policy.snapshot.duplicate_mode == "reuse"
-        && let Some(capture_id) = find_capture_by_source_hash(&source_hash)?
-    {
-        drop(capture_lock);
-        return Ok(Publication::Published {
-            capture_id,
-            partial: false,
-            reused: true,
-        });
+    if let Some(capture_id) = find_capture_by_source_hash(&source_hash)? {
+        match job.policy.snapshot.duplicate_mode.as_str() {
+            "reuse" => {
+                drop(capture_lock);
+                return Ok(Publication::Published {
+                    capture_id,
+                    partial: false,
+                    reused: true,
+                });
+            }
+            "fail" => bail!("Capture already exists for this Source"),
+            "create" => {}
+            _ => bail!("invalid Policy duplicate_mode"),
+        }
     }
-    let prepared = match acquisition.acquire(&capture, &source_hash)? {
+    let capture_version = next_capture_version(&source_hash)?;
+    let mut prepared = match acquisition.acquire(&capture, &source_hash)? {
         AcquisitionResult::Ready(prepared) => prepared,
         AcquisitionResult::Cancelled => return Ok(Publication::Cancelled),
     };
+    prepared.set_capture_version(capture_version);
     if is_cancelled(job)? {
         return Ok(Publication::Cancelled);
     }

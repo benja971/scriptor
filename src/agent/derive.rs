@@ -11,8 +11,9 @@ use super::{
     ArtifactMetadata, Capability, Job, JobOperation, LedgerEvent, Manifest, Policy, Provider,
     Recipe, RecipeKind, RecipeTarget, Reference, append_job_event, append_json_line,
     artifact_for as capture_artifact_for, captures_dir, file_size, lock_capture_ledger, lock_job,
-    now_secs, provider_path, read_job, read_json, reference_for_artifact, sha256_file, unique_id,
-    unlock_job, write_job, write_json,
+    now_secs, provider_path, read_job, read_json, read_json_lines, rebuild_search_index,
+    record_index_degradation, reference_for_artifact, sha256_file, unique_id, unlock_job,
+    write_job, write_json,
 };
 use crate::resource::ResourceBudget;
 
@@ -24,6 +25,10 @@ pub(super) struct Derivative {
     recipe: Recipe,
     provider: Provider,
     inputs: Vec<Reference>,
+    #[serde(default)]
+    context: Option<ArtifactMetadata>,
+    #[serde(default)]
+    context_reference: Option<Reference>,
     artifact: ArtifactMetadata,
     reference: Reference,
     capability: Capability,
@@ -33,9 +38,16 @@ pub(super) struct Derivative {
 #[derive(Serialize)]
 struct ProviderRequest {
     version: u8,
+    context: ProviderContext,
     recipe: Recipe,
     parameters: Value,
     inputs: Vec<ProviderInput>,
+}
+
+#[derive(Serialize)]
+struct ProviderContext {
+    reference: Reference,
+    path: PathBuf,
 }
 
 #[derive(Serialize)]
@@ -45,10 +57,76 @@ struct ProviderInput {
     mime: String,
 }
 
+#[derive(Serialize)]
+struct InferenceContext {
+    format_version: u8,
+    recipe: Recipe,
+    budget: ContextBudget,
+    selected: Vec<ContextSelection>,
+    excluded_candidates: Vec<ExcludedCandidate>,
+}
+
+#[derive(Serialize)]
+struct ContextBudget {
+    duration_limit_secs: u64,
+    disk_byte_limit: u64,
+}
+
+#[derive(Serialize)]
+struct ContextSelection {
+    reference: Reference,
+    role: String,
+    selection_reason: String,
+}
+
+#[derive(Serialize, Clone)]
+struct ExcludedCandidate {
+    reference: Reference,
+    reason: String,
+}
+
+struct SelectedInput {
+    reference: Reference,
+    artifact: ArtifactMetadata,
+    role: String,
+    selection_reason: String,
+}
+
+struct InputSelection {
+    selected: Vec<SelectedInput>,
+    excluded_candidates: Vec<ExcludedCandidate>,
+}
+
 #[derive(Deserialize)]
 struct ProviderResponse {
     mime: String,
     effective_parameters: Value,
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct RecipeOutput {
+    format_version: u8,
+    recipe: RecipeKind,
+    claims: Vec<RecipeClaim>,
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct RecipeClaim {
+    kind: ClaimKind,
+    text: String,
+    citations: Vec<Reference>,
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "kebab-case")]
+enum ClaimKind {
+    Summary,
+    ImportantIdea,
+    VisibleText,
+    VisualObservation,
+    Uncertainty,
 }
 
 struct StagedPublication<'a> {
@@ -57,7 +135,8 @@ struct StagedPublication<'a> {
     recipe: &'a Recipe,
     provider_name: &'a str,
     parameters: &'a Value,
-    inputs: &'a [(Reference, ArtifactMetadata)],
+    inputs: &'a [SelectedInput],
+    excluded_candidates: &'a [ExcludedCandidate],
     capture_dir: &'a Path,
     staging: &'a Path,
     derive_id: &'a str,
@@ -95,7 +174,7 @@ pub(super) fn admit(
         bail!("local Derive Policy cannot allow remote calls");
     }
     let manifest = manifest(capture_id)?;
-    resolve_inputs(capture_id, &manifest, target).map(drop)
+    select_inputs(capture_id, &manifest, target).map(drop)
 }
 
 pub(super) fn admit_retry(
@@ -142,7 +221,7 @@ pub(super) fn publish(job: &Job) -> Result<()> {
         bail!("Derive Worker received a non-Derive Job");
     };
     let manifest = manifest(capture_id)?;
-    let inputs = resolve_inputs(capture_id, &manifest, &recipe.target)?;
+    let inputs = select_inputs(capture_id, &manifest, &recipe.target)?;
     let derive_id = format!("derive-{}", unique_id());
     let capture_dir = captures_dir()?.join(capture_id);
     let derivatives_dir = capture_dir.join("derivatives");
@@ -161,7 +240,8 @@ pub(super) fn publish(job: &Job) -> Result<()> {
         recipe,
         provider_name: provider,
         parameters,
-        inputs: &inputs,
+        inputs: &inputs.selected,
+        excluded_candidates: &inputs.excluded_candidates,
         capture_dir: &capture_dir,
         staging: &staging,
         derive_id: &derive_id,
@@ -180,24 +260,50 @@ fn publish_staged(publication: &StagedPublication<'_>) -> Result<bool> {
         provider_name,
         parameters,
         inputs,
+        excluded_candidates,
         capture_dir,
         staging,
         derive_id: _,
     } = publication;
     let provider_binary = provider_path(provider_name)?;
+    let context_path = staging.join("context.json");
+    let context = InferenceContext {
+        format_version: 1,
+        recipe: (*recipe).clone(),
+        budget: ContextBudget {
+            duration_limit_secs: job.policy.snapshot.limits.duration_limit_secs,
+            disk_byte_limit: job.policy.snapshot.limits.disk_byte_limit,
+        },
+        selected: inputs
+            .iter()
+            .map(|input| ContextSelection {
+                reference: input.reference.clone(),
+                role: input.role.clone(),
+                selection_reason: input.selection_reason.clone(),
+            })
+            .collect(),
+        excluded_candidates: excluded_candidates.to_vec(),
+    };
+    write_json(&context_path, &context)?;
+    let context_artifact = context_artifact(publication, &context_path)?;
+    let context_reference = reference_for_artifact(publication.capture_id, &context_artifact);
     let request_path = staging.join("request.json");
     let output_path = staging.join("content");
     let request = ProviderRequest {
         version: 1,
+        context: ProviderContext {
+            reference: context_reference.clone(),
+            path: context_path,
+        },
         recipe: (*recipe).clone(),
         parameters: (*parameters).clone(),
         inputs: inputs
             .iter()
-            .map(|(reference, artifact)| {
+            .map(|input| {
                 Ok(ProviderInput {
-                    reference: reference.clone(),
-                    path: artifact_path(capture_dir, artifact)?,
-                    mime: artifact.mime.clone(),
+                    reference: input.reference.clone(),
+                    path: artifact_path(capture_dir, &input.artifact)?,
+                    mime: input.artifact.mime.clone(),
                 })
             })
             .collect::<Result<Vec<_>>>()?,
@@ -219,10 +325,111 @@ fn publish_staged(publication: &StagedPublication<'_>) -> Result<bool> {
     {
         bail!("Derive Provider did not produce its output artifact");
     }
-    let derivative = build_derivative(publication, response, &provider_binary, &output_path)?;
+    validate_recipe_output(
+        &output_path,
+        &response,
+        recipe,
+        publication.capture_id,
+        inputs,
+    )?;
+    let derivative = build_derivative(
+        publication,
+        response,
+        &provider_binary,
+        &output_path,
+        context_artifact,
+        context_reference,
+    )?;
     write_json(&staging.join("manifest.json"), &derivative)?;
     fs::remove_file(&request_path).context("removing transient Derive request")?;
     commit_derivative(publication, &derivative)
+}
+
+fn validate_recipe_output(
+    output_path: &Path,
+    response: &ProviderResponse,
+    recipe: &Recipe,
+    capture_id: &str,
+    inputs: &[SelectedInput],
+) -> Result<()> {
+    if response.mime != "application/json" {
+        return Err(coded_error(
+            AgentErrorCode::InvalidRecipeOutput,
+            "Recipe output must use application/json MIME",
+        ));
+    }
+    let bytes = fs::read(output_path).context("reading Recipe output")?;
+    let output: RecipeOutput = serde_json::from_slice(&bytes).map_err(|error| {
+        coded_error(
+            AgentErrorCode::InvalidRecipeOutput,
+            format!("Recipe output is not valid structured JSON: {error}"),
+        )
+    })?;
+    if output.format_version != 1 {
+        return Err(coded_error(
+            AgentErrorCode::InvalidRecipeOutput,
+            format!(
+                "Recipe output format_version `{}` is unsupported",
+                output.format_version
+            ),
+        ));
+    }
+    if output.recipe != recipe.kind {
+        return Err(coded_error(
+            AgentErrorCode::InvalidRecipeOutput,
+            "Recipe output does not match the requested Recipe",
+        ));
+    }
+    for claim in output.claims {
+        if claim.text.trim().is_empty() {
+            return Err(coded_error(
+                AgentErrorCode::InvalidRecipeCitation,
+                format!("Recipe {} claim has empty text", claim.kind.as_str()),
+            ));
+        }
+        if claim.citations.is_empty() {
+            return Err(coded_error(
+                AgentErrorCode::InvalidRecipeCitation,
+                format!("Recipe {} claim has no citation", claim.kind.as_str()),
+            ));
+        }
+        for citation in claim.citations {
+            if citation.capture_id != capture_id {
+                return Err(coded_error(
+                    AgentErrorCode::InvalidRecipeCitation,
+                    "Recipe citation Capture is outside the inference corpus",
+                ));
+            }
+            let Some(selected) = inputs
+                .iter()
+                .find(|input| input.reference.artifact_id == citation.artifact_id)
+            else {
+                return Err(coded_error(
+                    AgentErrorCode::InvalidRecipeCitation,
+                    "Recipe citation artifact is not selected for inference",
+                ));
+            };
+            if selected.reference != citation {
+                return Err(coded_error(
+                    AgentErrorCode::InvalidRecipeCitation,
+                    "Recipe citation does not match the selected artifact Reference",
+                ));
+            }
+        }
+    }
+    Ok(())
+}
+
+impl ClaimKind {
+    const fn as_str(&self) -> &'static str {
+        match self {
+            Self::Summary => "summary",
+            Self::ImportantIdea => "important-idea",
+            Self::VisibleText => "visible-text",
+            Self::VisualObservation => "visual-observation",
+            Self::Uncertainty => "uncertainty",
+        }
+    }
 }
 
 fn build_derivative(
@@ -230,6 +437,8 @@ fn build_derivative(
     response: ProviderResponse,
     provider_binary: &Path,
     output_path: &Path,
+    context: ArtifactMetadata,
+    context_reference: Reference,
 ) -> Result<Derivative> {
     let created_at = now_secs();
     let provider = Provider {
@@ -260,8 +469,10 @@ fn build_derivative(
         inputs: publication
             .inputs
             .iter()
-            .map(|(reference, _)| reference.clone())
+            .map(|input| input.reference.clone())
             .collect(),
+        context: Some(context),
+        context_reference: Some(context_reference),
         artifact,
         reference,
         capability: Capability {
@@ -290,18 +501,7 @@ fn commit_derivative(publication: &StagedPublication<'_>, derivative: &Derivativ
         .with_context(|| format!("publishing Derivative {}", publication.derive_id))?;
     let append = append_json_line(
         &publication.capture_dir.join("ledger.jsonl"),
-        &LedgerEvent {
-            event: "derivative_published".to_string(),
-            at: derivative.created_at,
-            job_id: publication.job.id.clone(),
-            details: Some(json!({
-                "derive_id": publication.derive_id,
-                "recipe": publication.recipe,
-                "provider": derivative.provider,
-                "inputs": derivative.inputs,
-                "reference": derivative.reference,
-            })),
-        },
+        &derivative_published_event(derivative),
     );
     if let Err(error) = append {
         fs::rename(&final_dir, publication.staging)
@@ -310,17 +510,68 @@ fn commit_derivative(publication: &StagedPublication<'_>, derivative: &Derivativ
         unlock_job(&job_lock)?;
         return Err(error);
     }
+    unlock_job(&ledger_lock)?;
+    if let Err(error) = rebuild_search_index() {
+        record_index_degradation(&error);
+    }
     current_job.state = "succeeded".to_string();
     current_job.updated_at = now_secs();
     current_job.derive_id = Some(publication.derive_id.to_string());
     current_job.worker_pid = None;
     write_job(&current_job)?;
     append_job_event(&publication.job.id, "succeeded")?;
-    let unlock_ledger = unlock_job(&ledger_lock);
-    let unlock_job_result = unlock_job(&job_lock);
-    unlock_ledger?;
-    unlock_job_result?;
+    unlock_job(&job_lock)?;
     Ok(true)
+}
+
+pub(super) fn reconcile_published(job: &Job) -> Result<Option<String>> {
+    let JobOperation::Derive { capture_id, .. } = &job.operation else {
+        return Ok(None);
+    };
+    let Some(derivative) = list(capture_id)?
+        .into_iter()
+        .find(|derivative| derivative.job_id == job.id)
+    else {
+        return Ok(None);
+    };
+    let ledger_lock = lock_capture_ledger(capture_id)?;
+    let ledger_path = captures_dir()?.join(capture_id).join("ledger.jsonl");
+    let append = (|| -> Result<()> {
+        let events: Vec<LedgerEvent> = read_json_lines(&ledger_path)?;
+        let published = events.iter().any(|event| {
+            event.event == "derivative_published"
+                && event.job_id == job.id
+                && event
+                    .details
+                    .as_ref()
+                    .and_then(|details| details.get("derive_id"))
+                    .and_then(Value::as_str)
+                    == Some(derivative.derive_id.as_str())
+        });
+        if !published {
+            append_json_line(&ledger_path, &derivative_published_event(&derivative))?;
+        }
+        Ok(())
+    })();
+    unlock_job(&ledger_lock)?;
+    append?;
+    Ok(Some(derivative.derive_id))
+}
+
+fn derivative_published_event(derivative: &Derivative) -> LedgerEvent {
+    LedgerEvent {
+        event: "derivative_published".to_string(),
+        at: derivative.created_at,
+        job_id: derivative.job_id.clone(),
+        details: Some(json!({
+            "derive_id": derivative.derive_id,
+            "recipe": derivative.recipe,
+            "provider": derivative.provider,
+            "inputs": derivative.inputs,
+            "context_reference": derivative.context_reference,
+            "reference": derivative.reference,
+        })),
+    }
 }
 
 fn invoke_provider(
@@ -417,21 +668,34 @@ pub(super) fn artifact_for(
     capture_id: &str,
     artifact_id: &str,
 ) -> Result<Option<ArtifactMetadata>> {
+    Ok(list(capture_id)?.into_iter().find_map(|derivative| {
+        if derivative.artifact.artifact_id == artifact_id {
+            Some(derivative.artifact)
+        } else {
+            derivative
+                .context
+                .filter(|artifact| artifact.artifact_id == artifact_id)
+        }
+    }))
+}
+
+pub(super) fn search_artifacts(capture_id: &str) -> Result<Vec<ArtifactMetadata>> {
     Ok(list(capture_id)?
         .into_iter()
-        .find(|derivative| derivative.artifact.artifact_id == artifact_id)
-        .map(|derivative| derivative.artifact))
+        .map(|derivative| derivative.artifact)
+        .filter(|artifact| super::is_text_mime(&artifact.mime))
+        .collect())
 }
 
 fn manifest(capture_id: &str) -> Result<Manifest> {
     read_json(&captures_dir()?.join(capture_id).join("manifest.json"))
 }
 
-fn resolve_inputs(
+fn select_inputs(
     capture_id: &str,
     manifest: &Manifest,
     target: &RecipeTarget,
-) -> Result<Vec<(Reference, ArtifactMetadata)>> {
+) -> Result<InputSelection> {
     match target {
         RecipeTarget::Capture {
             capture_id: target_capture_id,
@@ -447,10 +711,33 @@ fn resolve_inputs(
                     .iter()
                     .map(super::artifact_from_extraction),
             );
-            artifacts
+            let verified = artifacts
                 .into_iter()
                 .map(|artifact| verified_input(capture_id, manifest, artifact))
-                .collect()
+                .collect::<Result<Vec<_>>>()?;
+            let (selected, excluded_candidates) = verified.into_iter().fold(
+                (Vec::new(), Vec::new()),
+                |(mut selected, mut excluded), (reference, artifact)| {
+                    if let Some((role, selection_reason)) = automatic_selection(&artifact) {
+                        selected.push(SelectedInput {
+                            reference,
+                            artifact,
+                            role: role.to_string(),
+                            selection_reason: selection_reason.to_string(),
+                        });
+                    } else {
+                        excluded.push(ExcludedCandidate {
+                            reference,
+                            reason: exclusion_reason(&artifact).to_string(),
+                        });
+                    }
+                    (selected, excluded)
+                },
+            );
+            Ok(InputSelection {
+                selected,
+                excluded_candidates,
+            })
         }
         RecipeTarget::References { references } => references
             .iter()
@@ -467,10 +754,79 @@ fn resolve_inputs(
                 if verified != *reference {
                     bail!("artifact metadata does not match its Reference");
                 }
-                Ok((verified, artifact))
+                Ok(SelectedInput {
+                    reference: verified,
+                    role: input_role(&artifact).to_string(),
+                    selection_reason: "explicit-selection".to_string(),
+                    artifact,
+                })
             })
-            .collect(),
+            .collect::<Result<Vec<_>>>()
+            .map(|selected| InputSelection {
+                selected,
+                excluded_candidates: Vec::new(),
+            }),
     }
+}
+
+fn automatic_selection(artifact: &ArtifactMetadata) -> Option<(&'static str, &'static str)> {
+    if super::is_text_mime(&artifact.mime) {
+        Some((input_role(artifact), text_selection_reason(artifact)))
+    } else if artifact.mime.starts_with("image/") {
+        Some(("visual-frame", "coverage"))
+    } else {
+        None
+    }
+}
+
+fn input_role(artifact: &ArtifactMetadata) -> &'static str {
+    if artifact.artifact_id.contains("caption") {
+        "caption"
+    } else if artifact.artifact_id.contains("transcription") {
+        "transcription"
+    } else if artifact.mime.starts_with("image/") {
+        "visual-frame"
+    } else {
+        "visible-text"
+    }
+}
+
+fn text_selection_reason(artifact: &ArtifactMetadata) -> &'static str {
+    if artifact.artifact_id.contains("ocr") {
+        "new-ocr-text"
+    } else {
+        "source-context"
+    }
+}
+
+fn exclusion_reason(artifact: &ArtifactMetadata) -> &'static str {
+    if artifact.mime.starts_with("video/") {
+        "raw-video-unsupported"
+    } else if artifact.mime.starts_with("audio/") {
+        "raw-audio-unsupported"
+    } else if artifact.mime.starts_with("application/") {
+        "raw-document-unsupported"
+    } else {
+        "not-admissible-for-whole-capture"
+    }
+}
+
+fn context_artifact(
+    publication: &StagedPublication<'_>,
+    context_path: &Path,
+) -> Result<ArtifactMetadata> {
+    Ok(ArtifactMetadata {
+        artifact_id: format!("{}-context", publication.derive_id),
+        path: format!("derivatives/{}/context.json", publication.derive_id),
+        mime: "application/json".to_string(),
+        sha256: sha256_file(context_path)?,
+        size_bytes: file_size(context_path)?,
+        locator: None,
+        created_at: now_secs(),
+        provider: None,
+        proof_artifact_id: None,
+        order: None,
+    })
 }
 
 fn verified_input(
@@ -486,7 +842,7 @@ fn verified_input(
     Ok((reference, artifact))
 }
 
-fn artifact_path(capture_dir: &Path, artifact: &ArtifactMetadata) -> Result<PathBuf> {
+pub(super) fn artifact_path(capture_dir: &Path, artifact: &ArtifactMetadata) -> Result<PathBuf> {
     let relative = Path::new(&artifact.path);
     if relative.is_absolute()
         || relative

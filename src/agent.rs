@@ -15,7 +15,7 @@ use serde_json::{Value, json};
 use sha2::{Digest, Sha256};
 use tantivy::collector::TopDocs;
 use tantivy::query::QueryParser;
-use tantivy::schema::{STORED, STRING, Schema, TEXT, Value as TantivyValue};
+use tantivy::schema::{Field, STORED, STRING, Schema, TEXT, Value as TantivyValue};
 use tantivy::{Index, TantivyDocument, doc};
 use url::Url;
 
@@ -38,8 +38,11 @@ use publication::{Acquisition, AcquisitionResult, PreparedCapture, Publication};
 const POLICY_NAME: &str = "safe-local@1";
 const DEFAULT_PAGE_LIMIT: usize = 20;
 const MAX_PAGE_LIMIT: usize = 100;
+const SEARCH_MAX_CANDIDATES: usize = 500;
+const SEARCH_INDEX_VERSION: u8 = 3;
 const DEFAULT_READ_LENGTH: usize = 8 * 1024;
 const MAX_READ_LENGTH: usize = 1024 * 1024;
+pub const MANIFEST_FORMAT_VERSION: u8 = 1;
 
 #[derive(Parser)]
 #[command(name = "scriptor")]
@@ -84,6 +87,10 @@ struct CaptureCommand {
     source: Option<PathBuf>,
     #[arg(long, global = true)]
     policy: Option<String>,
+    #[arg(long, value_enum)]
+    renderer: Option<WebRenderer>,
+    #[arg(long)]
+    retry_of: Option<String>,
     #[command(subcommand)]
     command: Option<CaptureSubcommand>,
 }
@@ -166,6 +173,7 @@ struct Policy {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 struct PolicySnapshot {
     duplicate_mode: String,
     limits: Limits,
@@ -176,6 +184,7 @@ struct PolicySnapshot {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 struct Limits {
     #[serde(rename = "max_depth")]
     depth_limit: u8,
@@ -189,6 +198,14 @@ struct Limits {
     duration_limit_secs: u64,
     #[serde(rename = "max_concurrency")]
     concurrency_limit: u8,
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct PolicyDocument {
+    id: String,
+    version: u8,
+    snapshot: PolicySnapshot,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -215,11 +232,13 @@ struct Job {
     error: Option<StructuredError>,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(tag = "kind", rename_all = "snake_case")]
 enum JobOperation {
-    #[default]
-    Capture,
+    Capture {
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        renderer: Option<WebRenderer>,
+    },
     Continue {
         parent_capture_id: String,
         discovery_ids: Vec<String>,
@@ -230,6 +249,18 @@ enum JobOperation {
         provider: String,
         parameters: Value,
     },
+}
+
+impl Default for JobOperation {
+    fn default() -> Self {
+        Self::Capture { renderer: None }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, ValueEnum)]
+#[serde(rename_all = "kebab-case")]
+enum WebRenderer {
+    Lightpanda,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, ValueEnum)]
@@ -302,7 +333,10 @@ struct CreatedJob<'a> {
 
 #[derive(Debug, Serialize, Deserialize)]
 struct Manifest {
+    #[serde(deserialize_with = "deserialize_manifest_format_version")]
+    format_version: u8,
     capture_id: String,
+    capture_version: u64,
     source: SourceIdentity,
     policy: Policy,
     published_at: u64,
@@ -317,6 +351,19 @@ struct Manifest {
     discoveries: Vec<Discovery>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     remote_provenance: Option<RemoteProvenance>,
+}
+
+fn deserialize_manifest_format_version<'de, D>(deserializer: D) -> std::result::Result<u8, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    let version = u8::deserialize(deserializer)?;
+    if version != MANIFEST_FORMAT_VERSION {
+        return Err(serde::de::Error::custom(format!(
+            "unsupported Capture manifest format version {version}"
+        )));
+    }
+    Ok(version)
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -483,7 +530,7 @@ struct RenderedDiscovery {
     kind: Option<String>,
 }
 
-#[derive(Serialize)]
+#[derive(Clone, Deserialize, Serialize)]
 struct CaptureSummary {
     capture_id: String,
     source: SourceIdentity,
@@ -495,6 +542,13 @@ struct CaptureSummary {
 struct CapturePage {
     captures: Vec<CaptureSummary>,
     next_cursor: Option<String>,
+}
+
+#[derive(Serialize)]
+struct SearchPage {
+    captures: Vec<CaptureSummary>,
+    next_cursor: Option<String>,
+    truncated: bool,
 }
 
 #[derive(Deserialize, Serialize)]
@@ -550,6 +604,27 @@ struct CursorBinding {
     query: Option<String>,
     snapshot: String,
     index_version: Option<u8>,
+}
+
+#[derive(Deserialize, Serialize)]
+struct SearchCursor {
+    version: u8,
+    query: String,
+    index_version: u8,
+    captures: Vec<CaptureSummary>,
+    position: usize,
+    truncated: bool,
+}
+
+struct SearchFields {
+    capture_id: Field,
+    source: Field,
+    source_sha256: Field,
+    published_at: Field,
+    artifact_id: Field,
+    artifact_sha256: Field,
+    artifact_locator: Field,
+    text: Field,
 }
 
 #[derive(Serialize)]
@@ -677,6 +752,8 @@ fn agent_error(error: &anyhow::Error) -> StructuredError {
         "invalid_cursor"
     } else if message.contains("requires --policy") {
         "policy_required"
+    } else if message.contains("Policy") || message.contains("policy JSON") {
+        "invalid_policy"
     } else if message.contains("limit must") {
         "invalid_pagination"
     } else if message.contains("length must") || message.contains("UTF-8 character boundary") {
@@ -743,6 +820,8 @@ fn run_capture_command(command: CaptureCommand) -> Result<()> {
                 .policy
                 .as_deref()
                 .context("capture requires --policy")?,
+            command.renderer,
+            command.retry_of,
         ),
     }
 }
@@ -786,10 +865,51 @@ fn run_job_command(command: JobCommand) -> Result<()> {
     }
 }
 
-fn create_capture_job(source: &Path, policy_name: &str) -> Result<()> {
+fn create_capture_job(
+    source: &Path,
+    policy_name: &str,
+    renderer: Option<WebRenderer>,
+    retry_of: Option<String>,
+) -> Result<()> {
     let policy = policy_for(policy_name)?;
-    let source = admission::admit(source, &policy)?.into_job_source();
-    create_job(source, policy, JobOperation::Capture, None)
+    let source = admission::admit(source, &policy)?;
+    if renderer.is_some() && !matches!(source, admission::Source::Web(_)) {
+        bail!("--renderer is only supported for a Web Source");
+    }
+    let source = source.into_job_source();
+    if let Some(job_id) = retry_of.as_deref() {
+        admit_capture_retry(job_id, &source, &policy, renderer)?;
+    }
+    create_job(source, policy, JobOperation::Capture { renderer }, retry_of)
+}
+
+fn admit_capture_retry(
+    job_id: &str,
+    source: &str,
+    policy: &Policy,
+    renderer: Option<WebRenderer>,
+) -> Result<()> {
+    let previous = reconcile_interrupted(job_id).context("reading retried Capture Job")?;
+    let JobOperation::Capture {
+        renderer: previous_renderer,
+    } = previous.operation
+    else {
+        return Err(coded_error(
+            AgentErrorCode::InvalidRetry,
+            "retry target is not a Capture Job",
+        ));
+    };
+    if previous.state != "interrupted"
+        || previous.source != source
+        || previous.policy.sha256 != policy.sha256
+        || previous_renderer != renderer
+    {
+        return Err(coded_error(
+            AgentErrorCode::InvalidRetry,
+            "retry target does not match an interrupted Capture request",
+        ));
+    }
+    Ok(())
 }
 
 fn create_job(
@@ -1235,6 +1355,7 @@ fn publish_web_discovery(
         &web_capture::WebAcquisition {
             job,
             url: &discovery.source,
+            renderer: None,
             forbidden_final_urls: &discovery.ancestors,
         },
     ) {
@@ -1392,7 +1513,7 @@ impl JobOperation {
     fn discovery_ids(&self) -> &[String] {
         match self {
             Self::Continue { discovery_ids, .. } => discovery_ids,
-            Self::Capture | Self::Derive { .. } => &[],
+            Self::Capture { .. } | Self::Derive { .. } => &[],
         }
     }
 }
@@ -1485,28 +1606,51 @@ fn publish_capture(job: &Job) -> Result<Publication> {
                 source: &source,
             },
         ),
-        admission::Source::Web(url) => social_capture::classify_url(&url).map_or_else(
+        admission::Source::Web(url) => selected_renderer(job).map_or_else(
             || {
+                social_capture::classify_url(&url).map_or_else(
+                    || {
+                        publication::publish(
+                            job,
+                            &web_capture::WebAcquisition {
+                                job,
+                                url: &url,
+                                renderer: None,
+                                forbidden_final_urls: &[],
+                            },
+                        )
+                    },
+                    |platform| {
+                        publication::publish(
+                            job,
+                            &social_capture::SocialAcquisition {
+                                job,
+                                url: &url,
+                                platform,
+                            },
+                        )
+                    },
+                )
+            },
+            |renderer| {
                 publication::publish(
                     job,
                     &web_capture::WebAcquisition {
                         job,
                         url: &url,
+                        renderer: Some(renderer),
                         forbidden_final_urls: &[],
                     },
                 )
             },
-            |platform| {
-                publication::publish(
-                    job,
-                    &social_capture::SocialAcquisition {
-                        job,
-                        url: &url,
-                        platform,
-                    },
-                )
-            },
         ),
+    }
+}
+
+const fn selected_renderer(job: &Job) -> Option<WebRenderer> {
+    match job.operation {
+        JobOperation::Capture { renderer } => renderer,
+        JobOperation::Continue { .. } | JobOperation::Derive { .. } => None,
     }
 }
 
@@ -1620,7 +1764,9 @@ impl Acquisition for LocalAcquisition<'_> {
             AcquisitionResult::Cancelled => return Ok(AcquisitionResult::Cancelled),
         };
         let mut manifest = Manifest {
+            format_version: MANIFEST_FORMAT_VERSION,
             capture_id: capture.capture_id().to_string(),
+            capture_version: 1,
             source: SourceIdentity {
                 locator: self.job.source.clone(),
                 sha256: source_hash.to_string(),
@@ -2917,6 +3063,9 @@ fn list_captures(cursor: Option<&str>, limit: usize) -> Result<()> {
 
 fn search_captures(query: &str, cursor: Option<&str>, limit: usize) -> Result<()> {
     validate_page_limit(limit)?;
+    if let Some(cursor) = cursor {
+        return print_json(&search_page(decode_search_cursor(cursor)?, query, limit)?);
+    }
     if let Some(error) = read_index_degradation()? {
         return print_json(&AgentError { error });
     }
@@ -2933,16 +3082,33 @@ fn search_captures(query: &str, cursor: Option<&str>, limit: usize) -> Result<()
         }
     };
     let schema = index.schema();
-    let capture_id = schema
-        .get_field("capture_id")
-        .context("reading capture_id Search field")?;
-    let source = schema
-        .get_field("source")
-        .context("reading source Search field")?;
-    let text = schema
-        .get_field("text")
-        .context("reading text Search field")?;
-    let mut parser = QueryParser::for_index(&index, vec![source, text]);
+    let fields = SearchFields {
+        capture_id: schema
+            .get_field("capture_id")
+            .context("reading capture_id Search field")?,
+        source: schema
+            .get_field("source")
+            .context("reading source Search field")?,
+        source_sha256: schema
+            .get_field("source_sha256")
+            .context("reading source_sha256 Search field")?,
+        published_at: schema
+            .get_field("published_at")
+            .context("reading published_at Search field")?,
+        artifact_id: schema
+            .get_field("artifact_id")
+            .context("reading artifact_id Search field")?,
+        artifact_sha256: schema
+            .get_field("artifact_sha256")
+            .context("reading artifact_sha256 Search field")?,
+        artifact_locator: schema
+            .get_field("artifact_locator")
+            .context("reading artifact_locator Search field")?,
+        text: schema
+            .get_field("text")
+            .context("reading text Search field")?,
+    };
+    let mut parser = QueryParser::for_index(&index, vec![fields.source, fields.text]);
     parser.set_conjunction_by_default();
     let parsed = parser
         .parse_query(query)
@@ -2953,31 +3119,77 @@ fn search_captures(query: &str, cursor: Option<&str>, limit: usize) -> Result<()
         .map_err(|error| anyhow::anyhow!(error))
         .context("opening Search reader")?;
     let searcher = reader.searcher();
-    let max_hits =
-        usize::try_from(searcher.num_docs()).context("converting Search result limit")?;
     let hits = searcher
-        .search(&parsed, &TopDocs::with_limit(max_hits).order_by_score())
+        .search(
+            &parsed,
+            &TopDocs::with_limit(SEARCH_MAX_CANDIDATES.saturating_add(1)).order_by_score(),
+        )
         .map_err(|error| anyhow::anyhow!(error))
         .context("searching Captures")?;
-    let mut manifests_by_id = list_manifests()?
+    let mut matches = hits
         .into_iter()
-        .map(|manifest| (manifest.capture_id.clone(), manifest))
-        .collect::<std::collections::BTreeMap<_, _>>();
-    let manifests = hits
-        .into_iter()
-        .filter_map(|(_, address)| {
-            let document: TantivyDocument = searcher.doc(address).ok()?;
-            let capture_id = document.get_first(capture_id)?.as_str()?;
-            manifests_by_id.remove(capture_id)
+        .map(|(score, address)| {
+            let document: TantivyDocument = searcher
+                .doc(address)
+                .map_err(|error| anyhow::anyhow!(error))
+                .context("reading Search result")?;
+            Ok((score, search_summary_for(&document, &fields)?))
         })
+        .collect::<Result<Vec<_>>>()?;
+    matches.sort_unstable_by(|(left_score, left), (right_score, right)| {
+        right_score
+            .total_cmp(left_score)
+            .then_with(|| left.capture_id.cmp(&right.capture_id))
+            .then_with(|| left.reference.artifact_id.cmp(&right.reference.artifact_id))
+    });
+    let truncated = matches.len() > SEARCH_MAX_CANDIDATES;
+    matches.truncate(SEARCH_MAX_CANDIDATES);
+    let captures = matches
+        .into_iter()
+        .map(|(_, capture)| capture)
         .collect::<Vec<_>>();
-    let binding = CursorBinding {
-        operation: "search",
-        query: Some(query.to_string()),
-        snapshot: snapshot_for(&manifests)?,
-        index_version: Some(2),
+    print_json(&search_page(
+        SearchCursor {
+            version: 1,
+            query: query.to_string(),
+            index_version: SEARCH_INDEX_VERSION,
+            captures,
+            position: 0,
+            truncated,
+        },
+        query,
+        limit,
+    )?)
+}
+
+fn search_page(mut cursor: SearchCursor, query: &str, limit: usize) -> Result<SearchPage> {
+    if cursor.version != 1
+        || cursor.index_version != SEARCH_INDEX_VERSION
+        || cursor.query != query
+        || cursor.position > cursor.captures.len()
+    {
+        bail!("pagination cursor does not match this operation or snapshot");
+    }
+    let end = cursor
+        .position
+        .saturating_add(limit)
+        .min(cursor.captures.len());
+    let captures = cursor
+        .captures
+        .get(cursor.position..end)
+        .context("reading bounded Search page")?
+        .to_vec();
+    let next_cursor = if end < cursor.captures.len() {
+        cursor.position = end;
+        Some(encode_search_cursor(&cursor)?)
+    } else {
+        None
     };
-    print_json(&capture_page(manifests, cursor, limit, &binding)?)
+    Ok(SearchPage {
+        captures,
+        next_cursor,
+        truncated: cursor.truncated,
+    })
 }
 
 fn read_artifact(
@@ -3004,7 +3216,7 @@ fn read_artifact(
     if !is_text_mime(&artifact.mime) {
         bail!("binary artifacts cannot be read on stdout");
     }
-    let path = directory.join(&artifact.path);
+    let path = derive::artifact_path(&directory, &artifact)?;
     if sha256_file(&path)? != artifact.sha256
         || request
             .expected_sha256
@@ -3109,10 +3321,17 @@ fn capture_page(
     {
         bail!("pagination cursor does not match this operation or snapshot");
     }
-    let start = after.as_ref().map_or(0, |cursor| {
-        let capture_id = cursor.capture_id.as_str();
-        manifests.partition_point(|manifest| manifest.capture_id.as_str() <= capture_id)
-    });
+    let start = after
+        .as_ref()
+        .map(|cursor| {
+            manifests
+                .iter()
+                .position(|manifest| manifest.capture_id == cursor.capture_id)
+                .map(|position| position.saturating_add(1))
+                .context("pagination cursor does not match this snapshot")
+        })
+        .transpose()?
+        .unwrap_or(0);
     let mut captures = manifests
         .into_iter()
         .skip(start)
@@ -3221,7 +3440,12 @@ fn write_search_index(manifests: &[Manifest]) -> Result<()> {
         .with_context(|| format!("creating Search Index {}", temporary.display()))?;
     let mut schema_builder = Schema::builder();
     let capture_id = schema_builder.add_text_field("capture_id", STRING | STORED);
-    let source = schema_builder.add_text_field("source", TEXT);
+    let source = schema_builder.add_text_field("source", TEXT | STORED);
+    let source_sha256 = schema_builder.add_text_field("source_sha256", STRING | STORED);
+    let published_at = schema_builder.add_text_field("published_at", STRING | STORED);
+    let artifact_id = schema_builder.add_text_field("artifact_id", STRING | STORED);
+    let artifact_sha256 = schema_builder.add_text_field("artifact_sha256", STRING | STORED);
+    let artifact_locator = schema_builder.add_text_field("artifact_locator", TEXT | STORED);
     let text = schema_builder.add_text_field("text", TEXT);
     let index = Index::create_in_dir(&temporary, schema_builder.build())
         .map_err(|error| anyhow::anyhow!(error))
@@ -3231,10 +3455,25 @@ fn write_search_index(manifests: &[Manifest]) -> Result<()> {
         .map_err(|error| anyhow::anyhow!(error))
         .context("creating Search writer")?;
     for manifest in manifests {
-        writer
-            .add_document(doc!(capture_id => manifest.capture_id.clone(), source => manifest.source.locator.clone(), text => search_text_for(manifest)?))
-            .map_err(|error| anyhow::anyhow!(error))
-            .context("indexing Capture")?;
+        let capture_dir = captures_dir()?.join(&manifest.capture_id);
+        for artifact in search_artifacts_for(manifest)? {
+            let locator = serde_json::to_string(&artifact.locator)
+                .context("serializing Search artifact Locator")?;
+            let text_content = search_text_for(&capture_dir, &artifact)?;
+            writer
+                .add_document(doc!(
+                    capture_id => manifest.capture_id.clone(),
+                    source => manifest.source.locator.clone(),
+                    source_sha256 => manifest.source.sha256.clone(),
+                    published_at => manifest.published_at.to_string(),
+                    artifact_id => artifact.artifact_id.clone(),
+                    artifact_sha256 => artifact.sha256.clone(),
+                    artifact_locator => locator,
+                    text => text_content,
+                ))
+                .map_err(|error| anyhow::anyhow!(error))
+                .context("indexing Capture artifact")?;
+        }
     }
     writer
         .commit()
@@ -3303,36 +3542,62 @@ fn snapshot_for(manifests: &[Manifest]) -> Result<String> {
     Ok(sha256_bytes(&data))
 }
 
-fn search_text_for(manifest: &Manifest) -> Result<String> {
-    let mut artifact_paths = Vec::new();
-    if is_text_mime(&manifest.proof.mime) {
-        artifact_paths.push(&manifest.proof.path);
-    }
-    artifact_paths.extend(
-        manifest
-            .extractions
-            .iter()
-            .filter(|extraction| is_text_mime(&extraction.mime))
-            .map(|extraction| &extraction.path),
-    );
-    let capture_dir = captures_dir()?.join(&manifest.capture_id);
-    let mut text = String::new();
-    for relative_path in artifact_paths {
-        let remaining = MAX_READ_LENGTH.saturating_sub(text.len());
-        if remaining == 0 {
-            break;
-        }
-        let path = capture_dir.join(relative_path);
-        let file = File::open(&path)
-            .with_context(|| format!("opening text artifact {}", path.display()))?;
-        let mut bytes = Vec::new();
-        file.take(u64::try_from(remaining).context("converting Index text limit")?)
-            .read_to_end(&mut bytes)
-            .with_context(|| format!("reading text artifact {}", path.display()))?;
-        text.push_str(&String::from_utf8(bytes).unwrap_or_default());
-        text.push('\n');
-    }
-    Ok(text)
+fn search_artifacts_for(manifest: &Manifest) -> Result<Vec<ArtifactMetadata>> {
+    let mut artifacts = vec![artifact_from_proof(&manifest.proof)];
+    artifacts.extend(manifest.artifacts.iter().map(artifact_from_proof));
+    artifacts.extend(manifest.extractions.iter().map(artifact_from_extraction));
+    artifacts.extend(derive::search_artifacts(&manifest.capture_id)?);
+    Ok(artifacts
+        .into_iter()
+        .filter(|artifact| is_text_mime(&artifact.mime))
+        .collect())
+}
+
+fn search_text_for(capture_dir: &Path, artifact: &ArtifactMetadata) -> Result<String> {
+    let path = derive::artifact_path(capture_dir, artifact)?;
+    let file =
+        File::open(&path).with_context(|| format!("opening text artifact {}", path.display()))?;
+    let mut bytes = Vec::new();
+    file.take(u64::try_from(MAX_READ_LENGTH).context("converting Index text limit")?)
+        .read_to_end(&mut bytes)
+        .with_context(|| format!("reading text artifact {}", path.display()))?;
+    Ok(String::from_utf8(bytes).unwrap_or_default())
+}
+
+fn search_summary_for(document: &TantivyDocument, fields: &SearchFields) -> Result<CaptureSummary> {
+    let capture_id = stored_search_string(document, fields.capture_id, "capture_id")?;
+    let source = SourceIdentity {
+        locator: stored_search_string(document, fields.source, "source")?,
+        sha256: stored_search_string(document, fields.source_sha256, "source_sha256")?,
+    };
+    let published_at = stored_search_string(document, fields.published_at, "published_at")?
+        .parse()
+        .context("parsing Search publication date")?;
+    let locator = serde_json::from_str(&stored_search_string(
+        document,
+        fields.artifact_locator,
+        "artifact_locator",
+    )?)
+    .context("parsing Search artifact Locator")?;
+    Ok(CaptureSummary {
+        capture_id: capture_id.clone(),
+        source,
+        published_at,
+        reference: Reference {
+            capture_id,
+            artifact_id: stored_search_string(document, fields.artifact_id, "artifact_id")?,
+            sha256: stored_search_string(document, fields.artifact_sha256, "artifact_sha256")?,
+            locator,
+        },
+    })
+}
+
+fn stored_search_string(document: &TantivyDocument, field: Field, name: &str) -> Result<String> {
+    document
+        .get_first(field)
+        .and_then(|value| TantivyValue::as_str(&value))
+        .map(str::to_string)
+        .with_context(|| format!("reading stored Search field `{name}`"))
 }
 
 fn summary_for(manifest: &Manifest) -> CaptureSummary {
@@ -3429,6 +3694,26 @@ fn decode_cursor(cursor: &str) -> Result<Cursor> {
     read_json(&cursor_path(id)?).context("invalid pagination cursor")
 }
 
+fn encode_search_cursor(cursor: &SearchCursor) -> Result<String> {
+    let id = unique_id();
+    write_json(&cursor_path(&id)?, cursor)?;
+    Ok(format!("v2-{id}"))
+}
+
+fn decode_search_cursor(cursor: &str) -> Result<SearchCursor> {
+    let id = cursor
+        .strip_prefix("v2-")
+        .context("invalid pagination cursor")?;
+    if id.is_empty()
+        || !id
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || byte == b'-')
+    {
+        bail!("invalid pagination cursor");
+    }
+    read_json(&cursor_path(id)?).context("invalid pagination cursor")
+}
+
 fn cursor_path(id: &str) -> Result<PathBuf> {
     let directory = repository_dir()?.join("cursors");
     fs::create_dir_all(&directory)
@@ -3464,24 +3749,31 @@ fn mime_for_source(source: &Path) -> &'static str {
 fn reconcile_interrupted(job_id: &str) -> Result<Job> {
     let lock = lock_job(job_id)?;
     let mut job = read_job(job_id)?;
-    if matches!(job.state.as_str(), "queued" | "running")
-        && job
-            .worker_pid
-            .is_some_and(|pid| !Path::new("/proc").join(pid.to_string()).exists())
-    {
-        job.state = "interrupted".to_string();
+    let has_no_live_worker = job
+        .worker_pid
+        .is_none_or(|pid| !Path::new("/proc").join(pid.to_string()).exists());
+    if matches!(job.state.as_str(), "queued" | "running") && has_no_live_worker {
+        let published_derive = derive::reconcile_published(&job)?;
+        job.state = if published_derive.is_some() {
+            "succeeded".to_string()
+        } else {
+            "interrupted".to_string()
+        };
         job.updated_at = now_secs();
         job.worker_pid = None;
+        job.derive_id = published_derive;
         write_job(&job)?;
-        append_job_event(&job.id, "interrupted")?;
+        append_job_event(&job.id, &job.state)?;
     }
     unlock_job(&lock)?;
     Ok(job)
 }
 
-fn policy_for(name: &str) -> Result<Policy> {
-    if name != POLICY_NAME && name != "safe-web@1" {
-        bail!("unsupported Policy `{name}`; expected `{POLICY_NAME}` or `safe-web@1`");
+fn policy_for(value: &str) -> Result<Policy> {
+    if value != POLICY_NAME && value != "safe-web@1" {
+        let document: PolicyDocument =
+            serde_json::from_str(value).context("parsing Policy JSON")?;
+        return normalize_policy(document.id, document.version, document.snapshot);
     }
     let limits = Limits {
         depth_limit: 2,
@@ -3499,7 +3791,7 @@ fn policy_for(name: &str) -> Result<Policy> {
         "pdfinfo".to_string(),
         "tesseract".to_string(),
     ];
-    let allowed_recipes = if name == POLICY_NAME {
+    let allowed_recipes = if value == POLICY_NAME {
         allowed_providers.push("scriptor-local-derive".to_string());
         vec![
             RecipeKind::StructuredSummary,
@@ -3511,6 +3803,7 @@ fn policy_for(name: &str) -> Result<Policy> {
     } else {
         allowed_providers.extend([
             "page-renderer".to_string(),
+            "lightpanda".to_string(),
             "instagram-provider".to_string(),
             "linkedin-provider".to_string(),
             "scriptor-binary-acquirer".to_string(),
@@ -3521,22 +3814,96 @@ fn policy_for(name: &str) -> Result<Policy> {
     let snapshot = PolicySnapshot {
         duplicate_mode: "reuse".to_string(),
         limits,
-        allows_remote_calls: name == "safe-web@1",
+        allows_remote_calls: value == "safe-web@1",
         allowed_providers,
         allowed_recipes,
     };
+    normalize_policy(
+        if value == POLICY_NAME {
+            "safe-local".to_string()
+        } else {
+            "safe-web".to_string()
+        },
+        1,
+        snapshot,
+    )
+}
+
+fn normalize_policy(id: String, version: u8, snapshot: PolicySnapshot) -> Result<Policy> {
+    const LOCAL_PROVIDERS: &[&str] = &[
+        "ffmpeg",
+        "ffprobe",
+        "whisper-cli",
+        "pdftotext",
+        "pdfinfo",
+        "tesseract",
+        "scriptor-local-derive",
+    ];
+    const WEB_PROVIDERS: &[&str] = &[
+        "ffmpeg",
+        "ffprobe",
+        "whisper-cli",
+        "pdftotext",
+        "pdfinfo",
+        "tesseract",
+        "page-renderer",
+        "lightpanda",
+        "instagram-provider",
+        "linkedin-provider",
+        "scriptor-binary-acquirer",
+        "yt-dlp",
+    ];
+    let valid_identity = matches!((id.as_str(), version), ("safe-local" | "safe-web", 1));
+    if !valid_identity {
+        bail!("invalid Policy identity {id}@{version}");
+    }
+    if !matches!(
+        snapshot.duplicate_mode.as_str(),
+        "reuse" | "create" | "fail"
+    ) {
+        bail!("invalid Policy duplicate_mode");
+    }
+    let limits = &snapshot.limits;
+    if limits.depth_limit == 0
+        || limits.source_limit == 0
+        || limits.download_byte_limit == 0
+        || limits.disk_byte_limit == 0
+        || limits.duration_limit_secs == 0
+        || limits.concurrency_limit == 0
+    {
+        bail!("invalid Policy limits");
+    }
+    let (allows_remote_calls, allowed_providers) = if id == "safe-local" {
+        (false, LOCAL_PROVIDERS)
+    } else {
+        (true, WEB_PROVIDERS)
+    };
+    if snapshot.allows_remote_calls != allows_remote_calls
+        || snapshot
+            .allowed_providers
+            .iter()
+            .any(|provider| !allowed_providers.contains(&provider.as_str()))
+        || (id == "safe-web" && !snapshot.allowed_recipes.is_empty())
+        || snapshot.allowed_recipes.iter().any(|recipe| {
+            !matches!(
+                recipe,
+                RecipeKind::StructuredSummary
+                    | RecipeKind::ProvenClaims
+                    | RecipeKind::Checklist
+                    | RecipeKind::MarkdownNote
+                    | RecipeKind::SourcedAnswer
+            )
+        })
+    {
+        bail!("inconsistent Policy allowlists");
+    }
     let canonical_snapshot =
         serde_json::to_value(&snapshot).context("normalizing Policy snapshot")?;
     let snapshot_bytes =
         serde_json::to_vec(&canonical_snapshot).context("serializing Policy snapshot")?;
     Ok(Policy {
-        id: if name == POLICY_NAME {
-            "safe-local"
-        } else {
-            "safe-web"
-        }
-        .to_string(),
-        version: 1,
+        id,
+        version,
         sha256: sha256_bytes(&snapshot_bytes),
         snapshot,
     })
@@ -3672,6 +4039,19 @@ fn find_capture_by_source_hash(source_hash: &str) -> Result<Option<String>> {
         }
     }
     Ok(None)
+}
+
+fn next_capture_version(source_hash: &str) -> Result<u64> {
+    list_manifests()?
+        .into_iter()
+        .filter(|manifest| manifest.source.sha256 == source_hash)
+        .map(|manifest| manifest.capture_version)
+        .max()
+        .map_or(Ok(1), |version| {
+            version
+                .checked_add(1)
+                .context("incrementing Capture version")
+        })
 }
 
 fn lock_capture_key(source_hash: &str) -> Result<File> {

@@ -10,13 +10,14 @@ pub(super) const FINAL_URL_CYCLE: &str = "web_final_url_cycle";
 
 use super::{
     Acquisition, AcquisitionResult, Discovery, Extraction, Job, Locator, Manifest, PreparedCapture,
-    Proof, Provider, Reference, RemoteProvenance, RenderedDiscovery, SourceIdentity, discovery_id,
-    now_secs, read_job, read_json, sha256_bytes, sha256_file,
+    Proof, Provider, Reference, RemoteProvenance, RenderedDiscovery, SourceIdentity, WebRenderer,
+    discovery_id, now_secs, read_job, read_json, sha256_bytes, sha256_file,
 };
 
 pub(super) struct WebAcquisition<'a> {
     pub(super) job: &'a Job,
     pub(super) url: &'a str,
+    pub(super) renderer: Option<WebRenderer>,
     pub(super) forbidden_final_urls: &'a [String],
 }
 
@@ -25,6 +26,7 @@ impl Acquisition for WebAcquisition<'_> {
         Ok(AcquisitionResult::Ready(sha256_bytes(self.url.as_bytes())))
     }
 
+    #[allow(clippy::too_many_lines)]
     fn acquire(
         &self,
         capture: &super::publication::StagedCapture,
@@ -47,6 +49,9 @@ impl Acquisition for WebAcquisition<'_> {
             deadline,
             self.job.policy.snapshot.limits.disk_byte_limit,
             self.job.policy.snapshot.limits.download_byte_limit,
+            self.renderer.map(|renderer| match renderer {
+                WebRenderer::Lightpanda => "lightpanda",
+            }),
             || Ok(read_job(&self.job.id)?.state == "cancelled"),
         )?;
         let provenance = match renderer_capture {
@@ -66,14 +71,20 @@ impl Acquisition for WebAcquisition<'_> {
         if read_job(&self.job.id)?.state == "cancelled" {
             return Ok(AcquisitionResult::Cancelled);
         }
-        let artifacts = [
-            ("proof-screenshot", "proofs/screenshot.png", "image/png"),
-            ("discoveries", "discoveries.json", "application/json"),
-            ("provenance", "provenance.json", "application/json"),
-        ]
-        .into_iter()
-        .map(|(artifact_id, path, mime)| proof_for(capture.staging(), artifact_id, path, mime))
-        .collect::<Result<Vec<_>>>()?;
+        let artifact_paths = if provenance.browser == "lightpanda" {
+            &[("provenance", "provenance.json", "application/json")][..]
+        } else {
+            &[
+                ("proof-screenshot", "proofs/screenshot.png", "image/png"),
+                ("discoveries", "discoveries.json", "application/json"),
+                ("provenance", "provenance.json", "application/json"),
+            ][..]
+        };
+        let artifacts = artifact_paths
+            .iter()
+            .copied()
+            .map(|(artifact_id, path, mime)| proof_for(capture.staging(), artifact_id, path, mime))
+            .collect::<Result<Vec<_>>>()?;
         let proof = proof_for(
             capture.staging(),
             "proof-dom",
@@ -82,9 +93,20 @@ impl Acquisition for WebAcquisition<'_> {
         )?;
         let proof_hash = proof.sha256.clone();
         let proof_size = proof.size_bytes;
-        let extraction = markdown_extraction(capture.staging(), &proof, &provenance.final_url)?;
-        let discoveries = discoveries(capture.staging(), capture.capture_id(), &proof)?;
+        let extraction = markdown_extraction(
+            capture.staging(),
+            &proof,
+            &provenance.final_url,
+            &provenance.browser,
+        )?;
+        let discoveries = if provenance.browser == "lightpanda" {
+            Vec::new()
+        } else {
+            discoveries(capture.staging(), capture.capture_id(), &proof)?
+        };
         let manifest = Manifest {
+            format_version: 1,
+            capture_version: 1,
             capture_id: capture.capture_id().to_string(),
             source: SourceIdentity {
                 locator: provenance.final_url.clone(),
@@ -126,7 +148,12 @@ impl Acquisition for WebAcquisition<'_> {
     }
 }
 
-fn markdown_extraction(staging: &Path, proof: &Proof, final_url: &str) -> Result<Extraction> {
+fn markdown_extraction(
+    staging: &Path,
+    proof: &Proof,
+    final_url: &str,
+    browser: &str,
+) -> Result<Extraction> {
     let path = staging.join("extractions/page.md");
     Ok(Extraction {
         artifact_id: "extraction-markdown".to_string(),
@@ -141,9 +168,13 @@ fn markdown_extraction(staging: &Path, proof: &Proof, final_url: &str) -> Result
         }),
         locator_provider: None,
         provider: Provider {
-            name: "page-renderer".to_string(),
+            name: if browser == "lightpanda" {
+                "lightpanda".to_string()
+            } else {
+                "page-renderer".to_string()
+            },
             version: "1".to_string(),
-            parameters: json!({ "browser": "firefox" }),
+            parameters: json!({ "browser": browser }),
             dependencies: Vec::new(),
         },
         proof_artifact_id: proof.artifact_id.clone(),

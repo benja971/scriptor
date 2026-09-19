@@ -46,6 +46,10 @@ impl TestRepository {
     }
 
     fn capture(&self, name: &str, contents: &[u8]) -> Value {
+        self.capture_with_policy(name, contents, "safe-local@1")
+    }
+
+    fn capture_with_policy(&self, name: &str, contents: &[u8], policy: &str) -> Value {
         let source = self.work.join(name);
         fs::write(&source, contents).expect("écriture de la Source");
         let created: Value = serde_json::from_slice(
@@ -55,7 +59,7 @@ impl TestRepository {
                     "capture",
                     source.to_str().expect("chemin UTF-8"),
                     "--policy",
-                    "safe-local@1",
+                    policy,
                 ])
                 .assert()
                 .success()
@@ -81,6 +85,68 @@ impl TestRepository {
     fn repository_path(&self) -> PathBuf {
         self.data.join("scriptor").join("v2")
     }
+
+    fn inspect(&self, capture_id: &str) -> Value {
+        serde_json::from_slice(
+            &self
+                .command()
+                .args(["capture", "inspect", capture_id])
+                .assert()
+                .success()
+                .get_output()
+                .stdout,
+        )
+        .expect("Capture inspectée JSON valide")
+    }
+
+    fn list(&self) -> Value {
+        serde_json::from_slice(
+            &self
+                .command()
+                .args(["capture", "list"])
+                .assert()
+                .success()
+                .get_output()
+                .stdout,
+        )
+        .expect("liste de Captures JSON valide")
+    }
+}
+
+fn explicit_local_policy(duplicate_mode: &str) -> String {
+    serde_json::json!({
+        "id": "safe-local",
+        "version": 1,
+        "snapshot": {
+            "duplicate_mode": duplicate_mode,
+            "limits": {
+                "max_depth": 2,
+                "max_sources": 50,
+                "max_download_bytes": 2 * 1024 * 1024 * 1024_u64,
+                "max_disk_bytes": 10 * 1024 * 1024 * 1024_u64,
+                "max_duration_secs": 30 * 60,
+                "max_concurrency": 2
+            },
+            "allows_remote_calls": false,
+            "allowed_providers": [
+                "ffmpeg",
+                "ffprobe",
+                "whisper-cli",
+                "pdftotext",
+                "pdfinfo",
+                "tesseract",
+                "scriptor-local-derive"
+            ],
+            "allowed_recipes": [
+                "structured-summary",
+                "proven-claims",
+                "checklist",
+                "markdown-note",
+                "sourced-answer"
+            ]
+        }
+    })
+    .to_string()
 }
 
 impl Drop for TestRepository {
@@ -100,6 +166,208 @@ fn capture_continue_requires_a_known_capture_and_an_explicit_policy() {
         .assert()
         .success()
         .stdout(predicate::str::contains("\"code\":\"policy_required\""));
+}
+
+#[test]
+fn duplicate_mode_create_publishes_versioned_observations() {
+    let repository = TestRepository::new("json-policy");
+    let policy = explicit_local_policy("create");
+    let first = repository.capture_with_policy("source.txt", b"same Source", &policy);
+    let second = repository.capture_with_policy("source.txt", b"same Source", &policy);
+
+    assert_eq!(first["state"], "succeeded");
+    assert_eq!(second["state"], "succeeded");
+    assert_ne!(first["capture_id"], second["capture_id"]);
+    assert_eq!(first["policy"]["id"], "safe-local");
+    assert_eq!(first["policy"]["version"], 1);
+    assert_eq!(first["policy"]["snapshot"]["duplicate_mode"], "create");
+    assert_eq!(first["policy"]["sha256"].as_str().map(str::len), Some(64));
+    let first_capture_id = first["capture_id"]
+        .as_str()
+        .expect("identifiant de première Capture");
+    let second_capture_id = second["capture_id"]
+        .as_str()
+        .expect("identifiant de seconde Capture");
+    assert_eq!(
+        repository.inspect(first_capture_id)["manifest"]["capture_version"],
+        1
+    );
+    assert_eq!(
+        repository.inspect(second_capture_id)["manifest"]["capture_version"],
+        2
+    );
+}
+
+#[test]
+fn duplicate_mode_reuse_keeps_the_existing_capture() {
+    let repository = TestRepository::new("duplicate-reuse");
+    let policy = explicit_local_policy("reuse");
+    let first = repository.capture_with_policy("source.txt", b"same Source", &policy);
+    let second = repository.capture_with_policy("source.txt", b"same Source", &policy);
+
+    assert_eq!(first["state"], "succeeded");
+    assert_eq!(second["state"], "succeeded");
+    assert_eq!(first["capture_id"], second["capture_id"]);
+    let capture_id = first["capture_id"]
+        .as_str()
+        .expect("identifiant de Capture réutilisée");
+    assert_eq!(
+        repository.inspect(capture_id)["manifest"]["capture_version"],
+        1
+    );
+    assert_eq!(
+        repository.list()["captures"]
+            .as_array()
+            .expect("liste de Captures")
+            .len(),
+        1
+    );
+}
+
+#[test]
+fn duplicate_mode_fail_returns_a_failed_job_without_publishing() {
+    let repository = TestRepository::new("duplicate-fail");
+    let first = repository.capture("source.txt", b"same Source");
+    let failed = repository.capture_with_policy(
+        "source.txt",
+        b"same Source",
+        &explicit_local_policy("fail"),
+    );
+
+    assert_eq!(failed["state"], "failed");
+    assert!(failed["capture_id"].is_null());
+    assert!(failed["error"]["code"].is_string());
+    assert!(
+        failed["error"]["message"]
+            .as_str()
+            .is_some_and(|message| message.contains("Capture already exists"))
+    );
+    assert_eq!(
+        repository.list()["captures"]
+            .as_array()
+            .expect("liste de Captures")
+            .len(),
+        1
+    );
+    assert_eq!(
+        repository.list()["captures"][0]["capture_id"],
+        first["capture_id"]
+    );
+}
+
+#[test]
+fn json_policy_rejects_unknown_fields_and_inconsistent_allowlists() {
+    let repository = TestRepository::new("json-policy-invalid");
+    let source = repository.work.join("source.txt");
+    fs::write(&source, b"Source").expect("écriture de la Source");
+    let mut policy: Value =
+        serde_json::from_str(&explicit_local_policy("reuse")).expect("Policy JSON valide");
+    policy["unexpected"] = Value::Bool(true);
+
+    repository
+        .command()
+        .args([
+            "capture",
+            source.to_str().expect("chemin UTF-8"),
+            "--policy",
+            &policy.to_string(),
+        ])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("\"code\":\"invalid_policy\""));
+
+    policy
+        .as_object_mut()
+        .expect("Policy objet")
+        .remove("unexpected");
+    policy["snapshot"]["allows_remote_calls"] = Value::Bool(true);
+    repository
+        .command()
+        .args([
+            "capture",
+            source.to_str().expect("chemin UTF-8"),
+            "--policy",
+            &policy.to_string(),
+        ])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("\"code\":\"invalid_policy\""));
+}
+
+#[test]
+fn policy_aliases_keep_their_existing_normalized_snapshot() {
+    let repository = TestRepository::new("policy-alias");
+    let capture = repository.capture("source.txt", b"alias policy");
+
+    assert_eq!(capture["policy"]["id"], "safe-local");
+    assert_eq!(capture["policy"]["version"], 1);
+    assert_eq!(capture["policy"]["snapshot"]["duplicate_mode"], "reuse");
+    assert_eq!(capture["policy"]["sha256"].as_str().map(str::len), Some(64));
+}
+
+#[test]
+fn published_capture_declares_its_format_version() {
+    let repository = TestRepository::new("manifest-format-version");
+    let capture = repository.capture("source.txt", b"versioned manifest");
+    let capture_id = capture["capture_id"]
+        .as_str()
+        .expect("identifiant de Capture");
+    let manifest: Value = serde_json::from_slice(
+        &fs::read(
+            repository
+                .repository_path()
+                .join("captures")
+                .join(capture_id)
+                .join("manifest.json"),
+        )
+        .expect("lecture du manifest"),
+    )
+    .expect("manifest JSON valide");
+
+    assert_eq!(manifest["format_version"], 1);
+}
+
+#[test]
+fn inspect_rejects_missing_or_unknown_capture_format_versions() {
+    for (label, version) in [("missing", None), ("unknown", Some(2))] {
+        let repository = TestRepository::new(&format!("manifest-format-{label}"));
+        let capture = repository.capture("source.txt", b"versioned manifest");
+        let capture_id = capture["capture_id"]
+            .as_str()
+            .expect("identifiant de Capture");
+        let manifest_path = repository
+            .repository_path()
+            .join("captures")
+            .join(capture_id)
+            .join("manifest.json");
+        let mut manifest: Value =
+            serde_json::from_slice(&fs::read(&manifest_path).expect("lecture du manifest"))
+                .expect("manifest JSON valide");
+        match version {
+            Some(version) => manifest["format_version"] = Value::from(version),
+            None => {
+                manifest
+                    .as_object_mut()
+                    .expect("objet manifest")
+                    .remove("format_version");
+            }
+        }
+        fs::write(
+            &manifest_path,
+            serde_json::to_vec(&manifest).expect("sérialisation du manifest"),
+        )
+        .expect("écriture du manifest corrompu");
+
+        repository
+            .command()
+            .args(["capture", "inspect", capture_id])
+            .assert()
+            .success()
+            .stdout(
+                predicate::str::contains("manifest format version")
+                    .or(predicate::str::contains("missing field `format_version`")),
+            );
+    }
 }
 
 #[test]
@@ -265,6 +533,59 @@ fn search_uses_its_projection_and_reports_when_it_is_unavailable() {
 }
 
 #[test]
+fn search_paginates_scored_results_without_skipping_captures() {
+    let repository = TestRepository::new("search-pagination");
+    repository.capture("first.txt", b"needle");
+    repository.capture("second.txt", b"needle needle needle");
+    repository.capture("third.txt", b"needle needle");
+    let expected: Value = serde_json::from_slice(
+        &repository
+            .command()
+            .args(["capture", "search", "needle", "--limit", "3"])
+            .assert()
+            .success()
+            .get_output()
+            .stdout,
+    )
+    .expect("résultats de recherche JSON valides");
+    let expected = expected["captures"]
+        .as_array()
+        .expect("résultats de recherche")
+        .iter()
+        .map(|capture| {
+            capture["capture_id"]
+                .as_str()
+                .expect("identifiant de Capture")
+                .to_string()
+        })
+        .collect::<Vec<_>>();
+
+    let mut cursor = None;
+    let mut found = Vec::new();
+    loop {
+        let mut command = repository.command();
+        command.args(["capture", "search", "needle", "--limit", "1"]);
+        if let Some(cursor) = cursor.as_deref() {
+            command.args(["--cursor", cursor]);
+        }
+        let page: Value = serde_json::from_slice(&command.assert().success().get_output().stdout)
+            .expect("page de recherche JSON valide");
+        found.push(
+            page["captures"][0]["capture_id"]
+                .as_str()
+                .expect("Capture trouvée")
+                .to_string(),
+        );
+        cursor = page["next_cursor"].as_str().map(str::to_string);
+        if cursor.is_none() {
+            break;
+        }
+    }
+
+    assert_eq!(found, expected);
+}
+
+#[test]
 fn rebuilding_skips_invalid_utf8_text_and_keeps_other_captures_searchable() {
     let repository = TestRepository::new("invalid-utf8-index");
     repository.capture("invalid.txt", b"invalid\xfftext");
@@ -382,6 +703,39 @@ fn read_returns_a_bounded_text_excerpt_and_never_writes_binary_content() {
         .assert()
         .success()
         .stdout(predicate::str::contains("\"code\":\"invalid_range\""))
+        .stderr(predicate::str::is_empty());
+}
+
+#[test]
+fn read_rejects_a_manifest_path_outside_its_capture() {
+    let repository = TestRepository::new("read-traversal");
+    let capture = repository.capture("outside.txt", b"outside the Capture directory");
+    let capture_id = capture["capture_id"]
+        .as_str()
+        .expect("identifiant de Capture");
+    let manifest_path = repository
+        .repository_path()
+        .join("captures")
+        .join(capture_id)
+        .join("manifest.json");
+    let mut manifest: Value =
+        serde_json::from_slice(&fs::read(&manifest_path).expect("lecture du manifest de test"))
+            .expect("manifest JSON valide");
+    manifest["proof"]["path"] = Value::String("../../../../../work/outside.txt".to_string());
+    fs::write(
+        &manifest_path,
+        serde_json::to_vec(&manifest).expect("sérialisation du manifest corrompu"),
+    )
+    .expect("écriture du manifest corrompu");
+
+    repository
+        .command()
+        .args(["capture", "read", capture_id, "proof-source"])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains(
+            "invalid artifact path in Capture manifest",
+        ))
         .stderr(predicate::str::is_empty());
 }
 

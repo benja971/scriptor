@@ -8,10 +8,24 @@ redirect: unsupported schemes,
 credentials, localhost, private, link-local, loopback, multicast and DNS
 answers containing non-public addresses are refused.
 
-The renderer disables service workers and runs Firefox by default. It never
-silently switches browser engines: an unavailable Firefox produces the
-structured `web_renderer_firefox_unavailable` Job error. Chromium remains an
-explicit renderer mode and applies its own WebRTC network restrictions.
+The renderer and binary acquirer receive a cleared environment with only the
+current `PATH`; caller variables, including credentials, cookies and tokens,
+are not forwarded.
+
+The renderer disables service workers and starts with Firefox. Only the
+structured `web_renderer_firefox_unavailable` error triggers a retry with
+Chromium; navigation and security failures never switch engines. The effective
+browser is recorded in the renderer provenance and Markdown Extraction
+Provider. Chromium applies its own WebRTC network restrictions.
+
+`capture <URL> --policy safe-web@1 --renderer lightpanda` is an explicit,
+text-only path. It starts a local Lightpanda CDP server with the same pinned
+Node proxy, disables Lightpanda telemetry, and obtains the rendered DOM plus
+`LP.getMarkdown` from one browser session. It does not produce a screenshot,
+resource inventory, or secondary resource acquisition. Lightpanda's own
+private-network flag cannot be enabled because it would reject the loopback
+address of that mandatory proxy; the proxy remains the network boundary and
+validates and pins every outgoing destination.
 
 WebRTC cannot escape the boundary: Firefox disables PeerConnection with launch
 preferences, while Chromium is launched with its non-proxied UDP policy and no
