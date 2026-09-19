@@ -335,7 +335,10 @@ struct CreatedJob<'a> {
 
 #[derive(Debug, Serialize, Deserialize)]
 pub struct Manifest {
-    #[serde(deserialize_with = "deserialize_manifest_format_version")]
+    #[serde(
+        default = "legacy_manifest_format_version",
+        deserialize_with = "deserialize_manifest_format_version"
+    )]
     format_version: u8,
     capture_id: String,
     capture_version: u64,
@@ -353,6 +356,10 @@ pub struct Manifest {
     discoveries: Vec<Discovery>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     remote_provenance: Option<RemoteProvenance>,
+}
+
+const fn legacy_manifest_format_version() -> u8 {
+    MANIFEST_FORMAT_VERSION
 }
 
 fn deserialize_manifest_format_version<'de, D>(deserializer: D) -> std::result::Result<u8, D::Error>

@@ -328,46 +328,63 @@ fn published_capture_declares_its_format_version() {
 }
 
 #[test]
-fn inspect_rejects_missing_or_unknown_capture_format_versions() {
-    for (label, version) in [("missing", None), ("unknown", Some(2))] {
-        let repository = TestRepository::new(&format!("manifest-format-{label}"));
-        let capture = repository.capture("source.txt", b"versioned manifest");
-        let capture_id = capture["capture_id"]
-            .as_str()
-            .expect("identifiant de Capture");
-        let manifest_path = repository
-            .repository_path()
-            .join("captures")
-            .join(capture_id)
-            .join("manifest.json");
-        let mut manifest: Value =
-            serde_json::from_slice(&fs::read(&manifest_path).expect("lecture du manifest"))
-                .expect("manifest JSON valide");
-        match version {
-            Some(version) => manifest["format_version"] = Value::from(version),
-            None => {
-                manifest
-                    .as_object_mut()
-                    .expect("objet manifest")
-                    .remove("format_version");
-            }
-        }
-        fs::write(
-            &manifest_path,
-            serde_json::to_vec(&manifest).expect("sérialisation du manifest"),
-        )
-        .expect("écriture du manifest corrompu");
+fn inspect_rejects_unknown_capture_format_versions() {
+    let repository = TestRepository::new("unknown-manifest-format");
+    let capture = repository.capture("source.txt", b"versioned manifest");
+    let capture_id = capture["capture_id"]
+        .as_str()
+        .expect("identifiant de Capture");
+    let manifest_path = repository
+        .repository_path()
+        .join("captures")
+        .join(capture_id)
+        .join("manifest.json");
+    let mut manifest: Value =
+        serde_json::from_slice(&fs::read(&manifest_path).expect("lecture du manifest"))
+            .expect("manifest JSON valide");
+    manifest["format_version"] = Value::from(2);
+    fs::write(
+        &manifest_path,
+        serde_json::to_vec(&manifest).expect("sérialisation du manifest"),
+    )
+    .expect("écriture du manifest corrompu");
 
-        repository
-            .command()
-            .args(["capture", "inspect", capture_id])
-            .assert()
-            .success()
-            .stdout(
-                predicate::str::contains("manifest format version")
-                    .or(predicate::str::contains("missing field `format_version`")),
-            );
-    }
+    repository
+        .command()
+        .args(["capture", "inspect", capture_id])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("manifest format version"));
+}
+
+#[test]
+fn legacy_unversioned_capture_does_not_block_a_new_capture() {
+    let repository = TestRepository::new("legacy-manifest");
+    let legacy = repository.capture("legacy.txt", b"legacy Capture");
+    let capture_id = legacy["capture_id"]
+        .as_str()
+        .expect("identifiant de Capture");
+    let manifest_path = repository
+        .repository_path()
+        .join("captures")
+        .join(capture_id)
+        .join("manifest.json");
+    let mut manifest: Value =
+        serde_json::from_slice(&fs::read(&manifest_path).expect("lecture du manifest"))
+            .expect("manifest JSON valide");
+    manifest
+        .as_object_mut()
+        .expect("objet manifest")
+        .remove("format_version");
+    fs::write(
+        &manifest_path,
+        serde_json::to_vec(&manifest).expect("sérialisation du manifest"),
+    )
+    .expect("écriture du manifest historique");
+
+    let fresh = repository.capture("fresh.txt", b"nouvelle Capture");
+
+    assert_eq!(fresh["state"], "succeeded");
 }
 
 #[test]
