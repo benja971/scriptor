@@ -138,6 +138,7 @@ impl Acquisition for WebAcquisition<'_> {
                 platform: None,
                 post_id: None,
                 author: None,
+                account_handle: None,
                 published_at: None,
                 media: Vec::new(),
             }),

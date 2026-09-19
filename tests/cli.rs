@@ -290,7 +290,7 @@ done
 for arg in "$@"; do
   [ "$arg" != "--version" ] || { printf '2026.08.19\n'; exit 0; }
 done
-printf '{"id":"post-1","webpage_url":"https://www.instagram.com/p/post-1/","uploader":"alice","upload_date":"20260914","description":"Caption Instagram complete","thumbnails":[{"url":"https://93.184.216.34/photo.jpg"}]}'
+printf '{"id":"post-1","webpage_url":"https://www.instagram.com/p/post-1/","uploader":"alice","channel":"alice_handle","upload_date":"20260914","description":"Caption Instagram complete","thumbnails":[{"url":"https://93.184.216.34/photo.jpg"}]}'
 "#;
 
 const FAKE_INSTAGRAM_VIDEO_YT_DLP: &str = r#"#!/bin/sh
@@ -303,7 +303,7 @@ done
 for arg in "$@"; do
   [ "$arg" != "--version" ] || { printf '2026.08.19\n'; exit 0; }
 done
-printf '{"id":"video-1","webpage_url":"https://www.instagram.com/reel/video-1/","uploader":"alice","upload_date":"20260914","description":"Caption Instagram video","formats":[{"url":"https://93.184.216.34/video.mp4","vcodec":"avc1"}]}'
+printf '{"id":"video-1","webpage_url":"https://www.instagram.com/reel/video-1/","uploader":"alice","channel":"alice_handle","upload_date":"20260914","description":"Caption Instagram video","formats":[{"url":"https://93.184.216.34/video.mp4","vcodec":"avc1"}]}'
 "#;
 
 const FAKE_INSTAGRAM_CAROUSEL_YT_DLP: &str = r#"#!/bin/sh
@@ -1472,6 +1472,24 @@ fn capture_instagram_photo_preserves_caption_and_media_without_renderer() {
     assert_eq!(manifest["artifacts"][0]["order"], 0);
     assert_eq!(manifest["artifacts"][0]["mime"], "image/jpeg");
     assert_eq!(manifest["remote_provenance"]["media"][0]["size_bytes"], 5);
+    assert_eq!(
+        manifest["remote_provenance"]["account_handle"],
+        "alice_handle"
+    );
+    let search: Value = serde_json::from_slice(
+        &env.command()
+            .args(["capture", "search", "account_handle:alice_handle"])
+            .assert()
+            .success()
+            .get_output()
+            .stdout,
+    )
+    .expect("Recherche JSON valide");
+    assert!(search["captures"].as_array().is_some_and(|captures| {
+        captures
+            .iter()
+            .any(|result| result["capture_id"] == capture_id)
+    }));
     assert_eq!(manifest["capabilities"][1]["state"], "succeeded");
     assert_eq!(
         manifest["capabilities"][0]["provider"]["parameters"]["ignore_config"],
