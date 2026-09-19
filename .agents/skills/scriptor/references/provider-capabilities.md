@@ -51,15 +51,17 @@ partial and does not invalidate the original hashed Preuve.
 
 ## Public Web
 
-The exposed PageRenderer uses Firefox. A complete successful Web Capture
-contains rendered DOM, semantic Markdown, a screenshot, provenance and
-inventoried Découvertes. The protected binary acquirer is used only by an
-explicit `capture continue` request.
+The exposed complete PageRenderer tries Firefox then Chromium only when Firefox
+is unavailable. A complete successful Web Capture contains rendered DOM,
+semantic Markdown, a screenshot, provenance and inventoried Découvertes. The
+protected binary acquirer is used only by an explicit `capture continue`
+request.
 
-The standalone renderer test validates both Firefox and Chromium contracts,
-but the current Contrat agent does not expose a Chromium selector or automatic
-fallback. WebKit and Lightpanda are not supported Providers. Never advertise or
-select them.
+`scriptor capture <url> --policy safe-web@1 --renderer lightpanda` explicitly
+selects the Lightpanda fast path. It records only the rendered DOM, semantic
+Markdown and `lightpanda` provenance from one CDP observation. It never creates
+a screenshot, resource inventory or Découvertes. The same protected proxy and
+public-target validation apply. WebKit remains unsupported.
 
 Authenticated pages, cookies, paywalls, private networks and business
 interactions are outside the supported scope.
@@ -86,7 +88,9 @@ unavailable; report the resulting terminal or partial state without fallback.
 
 `scriptor-local-derive` supports `structured-summary`, `proven-claims`,
 `checklist`, `markdown-note` and `sourced-answer`. It receives only the selected
-verified Références and returns one immutable Dérivé.
+verified Références and returns one immutable Dérivé. Son contenu JSON est
+indexé après publication: `capture search` renvoie la Référence de l'artefact
+de Dérivé qui a effectivement correspondu, pas la Preuve principale par défaut.
 
 The Provider engine is not distributed with Scriptor and must already exist in
 `PATH`. Its absence is a terminal Job error, not permission to install a model,

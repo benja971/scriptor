@@ -59,7 +59,19 @@ métier, donc le renderer ne ferme pas cette boîte. Le succès prouve le contra
 technique DOM, Markdown, screenshot, provenance et Découvertes, mais pas une
 Extraction complète du contenu de la publication.
 
-Firefox est le seul renderer exposé par le Contrat agent actuel. Chromium est
-validé directement par le wrapper mais ne peut pas être sélectionné dans une
-Capture. Les tests déterministes refusent WebKit et Lightpanda avec
-`web_renderer_unknown`; aucune validation live ne leur est attribuée.
+Le Contrat agent démarre par Firefox et ne relance Chromium que lorsque Firefox
+retourne l'erreur structurée `web_renderer_firefox_unavailable`. Cette relance
+ne s'applique jamais aux échecs de navigation ou de sécurité. Le moteur retenu
+est conservé dans `provenance.json` et dans le Provider de l'Extraction
+Markdown.
+
+## Lightpanda
+
+Lightpanda est disponible seulement par sélection explicite : `capture <URL>
+--policy safe-web@1 --renderer lightpanda`. Il produit le DOM et le Markdown
+depuis une unique session CDP via `LP.getMarkdown`, sans screenshot, inventaire
+ni acquisition secondaire de ressources. La suite déterministe
+`nix develop --command scriptor-page-renderer-test` valide ce périmètre avec le
+proxy épinglé, une fixture locale et l'absence des deux artefacts interdits.
+Cette validation n'est pas une mesure live comparable aux résultats Firefox et
+Chromium ci-dessus : elle ne leur attribue donc ni durée, ni mémoire, ni CPU.

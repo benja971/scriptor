@@ -129,7 +129,8 @@ Run each of these only when the user separately requests it after seeing the
 current result:
 
 - `capture continue`
-- retry via `--retry-of`
+- retry via `scriptor capture <source> --policy <policy> --retry-of <interrupted-job-id>`
+  ou `derive --retry-of <job-id>`
 - a new Capture of the same or another Source
 - another Recette or Dérivé
 - a remote Provider

@@ -25,6 +25,7 @@ pub struct Provenance {
     pub final_url: String,
     #[serde(default)]
     pub redirect_chain: Vec<String>,
+    pub browser: String,
 }
 
 pub enum Capture {
@@ -64,7 +65,7 @@ where
             output_dir.display()
         )
     })?;
-    let mut command = Command::new("scriptor-binary-acquirer");
+    let mut command = isolated_web_command("scriptor-binary-acquirer");
     command
         .process_group(0)
         .args(["--url", url, "--output-dir"])
@@ -151,78 +152,102 @@ pub fn capture<F>(
     deadline: SystemTime,
     disk_byte_limit: u64,
     download_byte_limit: u64,
+    renderer: Option<&str>,
     is_cancelled: F,
 ) -> Result<Capture>
 where
     F: Fn() -> Result<bool>,
 {
     validate_public_url(url)?;
-    let mut command = Command::new("scriptor-page-renderer");
-    command
-        .process_group(0)
-        .arg("--url")
-        .arg(url)
-        .arg("--output-dir")
-        .arg(staging)
-        .arg("--max-output-bytes")
-        .arg(disk_byte_limit.to_string())
-        .arg("--max-download-bytes")
-        .arg(download_byte_limit.to_string())
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped());
-    let mut child = command
-        .spawn()
-        .context("launching Playwright page renderer")?;
-    loop {
-        if is_cancelled()? {
-            terminate_process_group(&child)?;
-            child.wait().context("reaping cancelled page renderer")?;
-            return Ok(Capture::Cancelled);
+    let browsers = renderer.map_or_else(|| vec!["firefox", "chromium"], |renderer| vec![renderer]);
+    let mut completed = false;
+    for browser in browsers {
+        let mut command = isolated_web_command("scriptor-page-renderer");
+        command
+            .process_group(0)
+            .args(["--browser", browser, "--url", url, "--output-dir"])
+            .arg(staging)
+            .arg("--max-output-bytes")
+            .arg(disk_byte_limit.to_string())
+            .arg("--max-download-bytes")
+            .arg(download_byte_limit.to_string())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped());
+        let mut child = command
+            .spawn()
+            .context("launching Playwright page renderer")?;
+        loop {
+            if is_cancelled()? {
+                terminate_process_group(&child)?;
+                child.wait().context("reaping cancelled page renderer")?;
+                return Ok(Capture::Cancelled);
+            }
+            if SystemTime::now() >= deadline {
+                terminate_process_group(&child)?;
+                child.wait().context("reaping timed out page renderer")?;
+                bail!("Capture exceeds safe-web@1 duration budget");
+            }
+            if directory_size(staging)? > disk_byte_limit {
+                terminate_process_group(&child)?;
+                child.wait().context("reaping disk-limited page renderer")?;
+                bail!("Capture exceeds safe-web@1 disk budget");
+            }
+            if child
+                .try_wait()
+                .context("checking page renderer status")?
+                .is_some()
+            {
+                break;
+            }
+            thread::sleep(Duration::from_millis(20));
         }
-        if SystemTime::now() >= deadline {
-            terminate_process_group(&child)?;
-            child.wait().context("reaping timed out page renderer")?;
-            bail!("Capture exceeds safe-web@1 duration budget");
-        }
-        if directory_size(staging)? > disk_byte_limit {
-            terminate_process_group(&child)?;
-            child.wait().context("reaping disk-limited page renderer")?;
-            bail!("Capture exceeds safe-web@1 disk budget");
-        }
-        if child
-            .try_wait()
-            .context("checking page renderer status")?
-            .is_some()
-        {
+        let renderer_output = child
+            .wait_with_output()
+            .context("collecting page renderer output")?;
+        if renderer_output.status.success() {
+            completed = true;
             break;
         }
-        thread::sleep(Duration::from_millis(20));
-    }
-    let output = child
-        .wait_with_output()
-        .context("collecting page renderer output")?;
-    if !output.status.success() {
-        let stderr = String::from_utf8_lossy(&output.stderr);
+        let stderr = String::from_utf8_lossy(&renderer_output.stderr);
+        if should_retry_with_chromium(browser, &stderr) {
+            continue;
+        }
         if let Some(code) = renderer_error_code(&stderr) {
             return Err(crate::agent::coded_error(code, stderr.trim()));
         }
         bail!(
             "page renderer failed (exit code {:?}): {}",
-            output.status.code(),
+            renderer_output.status.code(),
             stderr.trim()
         );
+    }
+    if !completed {
+        bail!("all PageRenderers are unavailable");
     }
     let provenance: Provenance = serde_json::from_slice(
         &fs::read(staging.join("provenance.json")).context("reading Web provenance")?,
     )
     .context("parsing Web provenance")?;
+    if let Some(renderer) = renderer
+        && provenance.browser != renderer
+    {
+        bail!("page renderer did not use requested renderer {renderer}");
+    }
     validate_public_url(&provenance.final_url).context("validating final redirect target")?;
-    for path in [
-        staging.join("proofs/dom.html"),
-        staging.join("proofs/screenshot.png"),
-        staging.join("extractions/page.md"),
-        staging.join("discoveries.json"),
-    ] {
+    let paths = if provenance.browser == "lightpanda" {
+        vec![
+            staging.join("proofs/dom.html"),
+            staging.join("extractions/page.md"),
+        ]
+    } else {
+        vec![
+            staging.join("proofs/dom.html"),
+            staging.join("proofs/screenshot.png"),
+            staging.join("extractions/page.md"),
+            staging.join("discoveries.json"),
+        ]
+    };
+    for path in paths {
         if !path.is_file() {
             bail!("page renderer did not produce {}", path.display());
         }
@@ -235,6 +260,20 @@ fn renderer_error_code(stderr: &str) -> Option<AgentErrorCode> {
         let code = line.split_once(':').map_or(line, |(code, _)| code).trim();
         AgentErrorCode::from_renderer_code(code)
     })
+}
+
+fn should_retry_with_chromium(browser: &str, stderr: &str) -> bool {
+    browser == "firefox"
+        && renderer_error_code(stderr) == Some(AgentErrorCode::RendererFirefoxUnavailable)
+}
+
+fn isolated_web_command(program: &str) -> Command {
+    let mut command = Command::new(program);
+    command.env_clear();
+    if let Some(path) = std::env::var_os("PATH") {
+        command.env("PATH", path);
+    }
+    command
 }
 
 fn terminate_process_group(child: &Child) -> Result<()> {
@@ -349,7 +388,7 @@ mod tests {
 
     use crate::agent::AgentErrorCode;
 
-    use super::{renderer_error_code, validate_public_url};
+    use super::{renderer_error_code, should_retry_with_chromium, validate_public_url};
 
     #[test]
     fn refuses_non_http_private_and_credentialed_urls_before_renderer() {
@@ -380,5 +419,21 @@ mod tests {
             renderer_error_code("web_renderer_chromium_unavailable: browser missing\n"),
             Some(AgentErrorCode::RendererChromiumUnavailable)
         );
+    }
+
+    #[test]
+    fn retries_only_the_unavailable_firefox_renderer() {
+        assert!(should_retry_with_chromium(
+            "firefox",
+            "web_renderer_firefox_unavailable: browser missing"
+        ));
+        assert!(!should_retry_with_chromium(
+            "firefox",
+            "web_navigation_failed: 503"
+        ));
+        assert!(!should_retry_with_chromium(
+            "chromium",
+            "web_renderer_firefox_unavailable: browser missing"
+        ));
     }
 }

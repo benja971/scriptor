@@ -59,22 +59,34 @@ impl Acquisition for SocialAcquisition<'_> {
             .context("creating Instagram Proof directory")?;
         fs::create_dir_all(capture.staging().join("extractions"))
             .context("creating Instagram Extraction directory")?;
-        let version = Command::new("yt-dlp")
-            .arg("--version")
-            .output()
+        let is_cancelled = || Ok(read_job(&self.job.id)?.state == "cancelled");
+        let budget = ResourceBudget::new(
+            capture.staging(),
+            self.job.created_at,
+            self.job.policy.snapshot.limits.duration_limit_secs,
+            self.job.policy.snapshot.limits.disk_byte_limit,
+        )
+        .with_cancellation(&is_cancelled);
+        let mut version_command = Command::new("yt-dlp");
+        version_command.args(["--ignore-config", "--version"]);
+        let version = budget
+            .output(&mut version_command)
             .context("launching yt-dlp --version")?;
         if !version.status.success() {
             bail!("yt-dlp --version failed");
         }
         let version = String::from_utf8_lossy(&version.stdout).trim().to_string();
-        let output = Command::new("yt-dlp")
+        let mut metadata_command = Command::new("yt-dlp");
+        metadata_command
             .args([
+                "--ignore-config",
                 "--skip-download",
                 "--dump-single-json",
                 "--ignore-no-formats-error",
-                self.url,
             ])
-            .output()
+            .arg(self.url);
+        let output = budget
+            .output(&mut metadata_command)
             .context("launching yt-dlp Instagram metadata extraction")?;
         if !output.status.success() {
             bail!(
@@ -87,7 +99,7 @@ impl Acquisition for SocialAcquisition<'_> {
         let provider = Provider {
             name: "instagram-provider".to_string(),
             version: "1".to_string(),
-            parameters: json!({"yt_dlp_version":version, "skip_download":true, "dump_single_json":true, "ignore_no_formats_error":true}),
+            parameters: json!({"yt_dlp_version":version, "ignore_config":true, "skip_download":true, "dump_single_json":true, "ignore_no_formats_error":true}),
             dependencies: vec![ProviderDependency {
                 name: "yt-dlp".to_string(),
                 version,
@@ -146,17 +158,31 @@ impl Acquisition for SocialAcquisition<'_> {
             success("caption", provider.clone()),
         ];
         let mut partial = false;
+        let mut downloaded_bytes = 0_u64;
         for (index, media_url) in media_urls.iter().enumerate() {
             let order = u32::try_from(index).context("converting Instagram media order")?;
             let acquisition_staging = capture.staging().join(format!("media-acquisition-{order}"));
-            let acquired = crate::web::acquire_binary(
-                media_url,
-                &acquisition_staging,
-                deadline,
-                self.job.policy.snapshot.limits.disk_byte_limit,
-                self.job.policy.snapshot.limits.download_byte_limit,
-                || Ok(read_job(&self.job.id)?.state == "cancelled"),
-            );
+            let download_limit = self
+                .job
+                .policy
+                .snapshot
+                .limits
+                .download_byte_limit
+                .saturating_sub(downloaded_bytes);
+            let acquired = if download_limit == 0 {
+                Err(anyhow::anyhow!(
+                    "Capture exceeds safe-web@1 download budget"
+                ))
+            } else {
+                crate::web::acquire_binary(
+                    media_url,
+                    &acquisition_staging,
+                    deadline,
+                    self.job.policy.snapshot.limits.disk_byte_limit,
+                    download_limit,
+                    || Ok(read_job(&self.job.id)?.state == "cancelled"),
+                )
+            };
             let acquired = match acquired {
                 Ok(acquired) => acquired,
                 Err(error) => {
@@ -169,6 +195,9 @@ impl Acquisition for SocialAcquisition<'_> {
                     continue;
                 }
             };
+            downloaded_bytes = downloaded_bytes
+                .checked_add(acquired.size_bytes)
+                .context("summing Instagram download budget")?;
             let media_relative = format!("proofs/media-{order}.{}", extension(&acquired.mime));
             fs::copy(&acquired.path, capture.staging().join(&media_relative))
                 .context("materializing Instagram media")?;
@@ -204,7 +233,9 @@ impl Acquisition for SocialAcquisition<'_> {
             .clone()
             .unwrap_or_else(|| self.url.to_string());
         let mut manifest = Manifest {
+            format_version: 1,
             capture_id: capture.capture_id().to_string(),
+            capture_version: 1,
             source: SourceIdentity {
                 locator: final_url.clone(),
                 sha256: source_hash.to_string(),
@@ -268,6 +299,7 @@ fn acquire_linkedin(
     fs::create_dir_all(capture.staging().join("extractions"))
         .context("creating LinkedIn Extraction directory")?;
     let deadline = acquisition_deadline(job)?;
+    let mut downloaded_bytes = 0_u64;
     let metadata = crate::web::acquire_binary(
         url,
         capture.staging(),
@@ -276,11 +308,19 @@ fn acquire_linkedin(
         job.policy.snapshot.limits.download_byte_limit,
         || Ok(read_job(&job.id)?.state == "cancelled"),
     )?;
+    downloaded_bytes = downloaded_bytes
+        .checked_add(metadata.size_bytes)
+        .context("summing LinkedIn download budget")?;
     let raw_metadata = fs::read(&metadata.path).context("reading LinkedIn structured metadata")?;
     let mut post = linkedin_post(&raw_metadata).context("parsing LinkedIn structured metadata")?;
     if post.media_urls.is_empty() {
-        post.media_urls =
-            linkedin_document_media_urls(job, capture.staging(), deadline, &raw_metadata)?;
+        post.media_urls = linkedin_document_media_urls(
+            job,
+            capture.staging(),
+            deadline,
+            &raw_metadata,
+            &mut downloaded_bytes,
+        )?;
     }
     let provider = Provider {
         name: "linkedin-provider".to_string(),
@@ -331,14 +371,26 @@ fn acquire_linkedin(
     for (index, media_url) in post.media_urls.iter().enumerate() {
         let order = u32::try_from(index).context("converting LinkedIn media order")?;
         let acquisition_staging = capture.staging().join(format!("media-acquisition-{order}"));
-        let acquired = crate::web::acquire_binary(
-            media_url,
-            &acquisition_staging,
-            deadline,
-            job.policy.snapshot.limits.disk_byte_limit,
-            job.policy.snapshot.limits.download_byte_limit,
-            || Ok(read_job(&job.id)?.state == "cancelled"),
-        );
+        let download_limit = job
+            .policy
+            .snapshot
+            .limits
+            .download_byte_limit
+            .saturating_sub(downloaded_bytes);
+        let acquired = if download_limit == 0 {
+            Err(anyhow::anyhow!(
+                "Capture exceeds safe-web@1 download budget"
+            ))
+        } else {
+            crate::web::acquire_binary(
+                media_url,
+                &acquisition_staging,
+                deadline,
+                job.policy.snapshot.limits.disk_byte_limit,
+                download_limit,
+                || Ok(read_job(&job.id)?.state == "cancelled"),
+            )
+        };
         let acquired = match acquired {
             Ok(acquired) => acquired,
             Err(error) => {
@@ -351,6 +403,9 @@ fn acquire_linkedin(
                 continue;
             }
         };
+        downloaded_bytes = downloaded_bytes
+            .checked_add(acquired.size_bytes)
+            .context("summing LinkedIn download budget")?;
         let media_relative = format!("proofs/media-{order}.{}", extension(&acquired.mime));
         fs::copy(&acquired.path, capture.staging().join(&media_relative))
             .context("materializing LinkedIn media")?;
@@ -383,7 +438,9 @@ fn acquire_linkedin(
         .clone()
         .unwrap_or_else(|| metadata.final_url.clone());
     let mut manifest = Manifest {
+        format_version: 1,
         capture_id: capture.capture_id().to_string(),
+        capture_version: 1,
         source: SourceIdentity {
             locator: final_url.clone(),
             sha256: source_hash.to_string(),
@@ -441,6 +498,10 @@ fn enrich_video_extractions(
         if budget.is_cancelled()? {
             return Ok(true);
         }
+    }
+    super::enrich_image_ocr(job, staging, manifest, &budget)?;
+    if budget.is_cancelled()? {
+        return Ok(true);
     }
     Ok(false)
 }
@@ -538,18 +599,31 @@ fn linkedin_document_media_urls(
     staging: &Path,
     deadline: std::time::SystemTime,
     html: &[u8],
+    downloaded_bytes: &mut u64,
 ) -> Result<Vec<String>> {
     let html = std::str::from_utf8(html).context("decoding LinkedIn document configuration")?;
     let manifest_url = html_config_url(html, "manifestUrl")
         .context("LinkedIn document configuration has no manifest URL")?;
+    let download_limit = job
+        .policy
+        .snapshot
+        .limits
+        .download_byte_limit
+        .saturating_sub(*downloaded_bytes);
+    if download_limit == 0 {
+        bail!("Capture exceeds safe-web@1 download budget");
+    }
     let manifest = crate::web::acquire_binary(
         &manifest_url,
         &staging.join("document-manifest"),
         deadline,
         job.policy.snapshot.limits.disk_byte_limit,
-        job.policy.snapshot.limits.download_byte_limit,
+        download_limit,
         || Ok(read_job(&job.id)?.state == "cancelled"),
     )?;
+    *downloaded_bytes = downloaded_bytes
+        .checked_add(manifest.size_bytes)
+        .context("summing LinkedIn download budget")?;
     let value: Value = serde_json::from_slice(
         &fs::read(&manifest.path).context("reading LinkedIn document manifest")?,
     )
@@ -574,14 +648,26 @@ fn linkedin_document_media_urls(
         .and_then(|resolution| resolution.get("imageManifestUrl"))
         .and_then(Value::as_str);
     if let Some(image_manifest_url) = image_manifest_url {
+        let download_limit = job
+            .policy
+            .snapshot
+            .limits
+            .download_byte_limit
+            .saturating_sub(*downloaded_bytes);
+        if download_limit == 0 {
+            bail!("Capture exceeds safe-web@1 download budget");
+        }
         let images = crate::web::acquire_binary(
             image_manifest_url,
             &staging.join("document-pages-manifest"),
             deadline,
             job.policy.snapshot.limits.disk_byte_limit,
-            job.policy.snapshot.limits.download_byte_limit,
+            download_limit,
             || Ok(read_job(&job.id)?.state == "cancelled"),
         )?;
+        *downloaded_bytes = downloaded_bytes
+            .checked_add(images.size_bytes)
+            .context("summing LinkedIn download budget")?;
         let pages: Value = serde_json::from_slice(
             &fs::read(&images.path).context("reading LinkedIn document pages manifest")?,
         )

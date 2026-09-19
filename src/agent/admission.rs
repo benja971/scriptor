@@ -48,6 +48,7 @@ fn admit_web(source: &Path, policy: &Policy) -> Result<Source> {
         "pdfinfo",
         "tesseract",
         "page-renderer",
+        "lightpanda",
         "instagram-provider",
         "linkedin-provider",
         "scriptor-binary-acquirer",

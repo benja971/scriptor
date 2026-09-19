@@ -5,6 +5,8 @@ use anyhow::Error;
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum AgentErrorCode {
     InvalidDeriveTarget,
+    InvalidRecipeOutput,
+    InvalidRecipeCitation,
     InvalidRetry,
     ProviderNotAllowed,
     RecipeNotAllowed,
@@ -30,6 +32,8 @@ impl AgentErrorCode {
     pub const fn as_str(self) -> &'static str {
         match self {
             Self::InvalidDeriveTarget => "invalid_derive_target",
+            Self::InvalidRecipeOutput => "invalid_recipe_output",
+            Self::InvalidRecipeCitation => "invalid_recipe_citation",
             Self::InvalidRetry => "invalid_retry",
             Self::ProviderNotAllowed => "provider_not_allowed",
             Self::RecipeNotAllowed => "recipe_not_allowed",
