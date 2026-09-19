@@ -201,8 +201,8 @@ while IFS= read -r line || [ -n "$line" ]; do
 done < "$request"
 [ -n "$recipe" ]
 printf '{"format_version":1,"recipe":"%s","claims":[]}' "$recipe" > "$output"
-chmod a-w "$XDG_DATA_HOME/scriptor/v2/jobs"
 printf 'blocked' > "$XDG_CACHE_HOME/derive-job-write-blocked"
+while [ ! -f "$XDG_CACHE_HOME/derive-release" ]; do :; done
 printf '{"mime":"application/json","effective_parameters":{"style":"concise"}}'
 "#;
 
@@ -3711,10 +3711,6 @@ fn knowledge_card_rejects_invalid_core_contracts() {
 fn interrupted_derive_with_a_published_artifact_is_reconciled_as_succeeded() {
     let env = TestEnv::new("derive-reconciliation");
     env.install_binary(
-        "chmod",
-        "#!/bin/sh\nexec /run/current-system/sw/bin/chmod \"$@\"\n",
-    );
-    env.install_binary(
         "scriptor-local-derive",
         FAKE_LOCAL_DERIVE_PROVIDER_JOB_WRITE_FAILURE,
     );
@@ -3749,6 +3745,13 @@ fn interrupted_derive_with_a_published_artifact_is_reconciled_as_succeeded() {
         &env.xdg_cache.join("derive-job-write-blocked"),
         Duration::from_secs(5)
     ));
+    let mut permissions = fs::metadata(&jobs_dir)
+        .expect("métadonnées du répertoire de Jobs")
+        .permissions();
+    permissions.set_mode(0o555);
+    fs::set_permissions(&jobs_dir, permissions).expect("blocage de l'écriture des Jobs");
+    fs::write(env.xdg_cache.join("derive-release"), b"release")
+        .expect("déblocage du Provider de Derive");
     assert_eq!(
         fs::metadata(&jobs_dir)
             .expect("métadonnées du répertoire de Jobs bloqué")
