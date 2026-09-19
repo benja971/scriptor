@@ -803,6 +803,31 @@ fn inspect_agent_capture(env: &TestEnv, capture_id: &str) -> Value {
     .expect("Capture JSON valide")
 }
 
+fn artifact_reference(capture_id: &str, capture: &Value, artifact_id: &str) -> Value {
+    let manifest = &capture["manifest"];
+    let artifact = std::iter::once(&manifest["proof"])
+        .chain(
+            manifest["extractions"]
+                .as_array()
+                .expect("extractions de la Capture")
+                .iter(),
+        )
+        .chain(
+            manifest["artifacts"]
+                .as_array()
+                .expect("artefacts de la Capture")
+                .iter(),
+        )
+        .find(|artifact| artifact["artifact_id"] == artifact_id)
+        .expect("artefact de la Capture");
+    serde_json::json!({
+        "capture_id": capture_id,
+        "artifact_id": artifact["artifact_id"],
+        "sha256": artifact["sha256"],
+        "locator": artifact["locator"],
+    })
+}
+
 fn create_text_capture(env: &TestEnv) -> String {
     let source = env.work_dir.join("notes.txt");
     fs::write(&source, "Une preuve locale.\n").expect("ecriture de la Source texte");
@@ -3284,6 +3309,179 @@ fn knowledge_card_publishes_a_versioned_sourced_knowledge_core() {
 }
 
 #[test]
+#[allow(clippy::too_many_lines)]
+fn knowledge_card_covers_social_video_modalities_without_raw_binary() {
+    let env = TestEnv::new("knowledge-card-social-video");
+    env.write_config(&env.work_dir.join("unused"));
+    env.install_binary("yt-dlp", FAKE_INSTAGRAM_VIDEO_YT_DLP);
+    env.install_binary(
+        "scriptor-binary-acquirer",
+        FAKE_INSTAGRAM_VIDEO_BINARY_ACQUIRER,
+    );
+    env.install_binary("scriptor-page-renderer", "#!/bin/sh\nexit 99\n");
+    let capture_job: Value = serde_json::from_slice(
+        &env.command()
+            .args([
+                "capture",
+                "https://www.instagram.com/reel/video-1/",
+                "--policy",
+                "safe-web@1",
+            ])
+            .assert()
+            .success()
+            .get_output()
+            .stdout,
+    )
+    .expect("Job de Capture JSON valide");
+    let capture_job = wait_for_agent_job(
+        &env,
+        capture_job["job"]["job_id"]
+            .as_str()
+            .expect("identifiant de Job de Capture"),
+    );
+    assert_eq!(capture_job["state"], "succeeded", "{capture_job}");
+    let capture_id = capture_job["capture_id"]
+        .as_str()
+        .expect("identifiant de Capture");
+    let capture = inspect_agent_capture(&env, capture_id);
+    let metadata = artifact_reference(capture_id, &capture, "proof-instagram-metadata");
+    let caption = artifact_reference(capture_id, &capture, "extraction-caption");
+    let transcription =
+        artifact_reference(capture_id, &capture, "extraction-media-0-transcription");
+    let frame = artifact_reference(capture_id, &capture, "extraction-media-0-frame-0000");
+    let frame_ocr = artifact_reference(capture_id, &capture, "extraction-media-0-frame-0000-ocr");
+    let raw_video = artifact_reference(capture_id, &capture, "media-0");
+    let coverage = [&metadata, &caption, &transcription, &frame, &frame_ocr]
+        .iter()
+        .map(|reference| {
+            serde_json::json!({
+                "reference": reference,
+                "state": "examined",
+                "reason": "fixture-reviewed",
+            })
+        })
+        .chain(std::iter::once(serde_json::json!({
+            "reference": raw_video,
+            "state": "excluded",
+            "reason": "raw-video-unsupported",
+        })))
+        .collect::<Vec<_>>();
+    let output = serde_json::json!({
+        "format_version": 1,
+        "recipe": "knowledge-card",
+        "knowledge_core": {
+            "coverage": coverage,
+            "statements": [
+                {
+                    "id": "caption-declaration",
+                    "kind": "attributed-declaration",
+                    "text": "La caption attribuée décrit la vidéo.",
+                    "anchors": [{"reference": caption}],
+                },
+                {
+                    "id": "frame-observation",
+                    "kind": "observation",
+                    "text": "Une Frame horodatée est conservée.",
+                    "anchors": [{"reference": frame}],
+                },
+                {
+                    "id": "ocr-recommendation",
+                    "kind": "attributed-recommendation",
+                    "text": "Le texte OCR attribué porte une recommandation.",
+                    "anchors": [{"reference": frame_ocr}],
+                },
+                {
+                    "id": "combined-interpretation",
+                    "kind": "interpretation",
+                    "text": "Les éléments textuels et visuels se complètent.",
+                    "anchors": [{"reference": transcription}],
+                    "premises": ["caption-declaration", "frame-observation"],
+                },
+                {
+                    "id": "visual-uncertainty",
+                    "kind": "uncertainty",
+                    "text": "La Frame seule ne garantit pas tous les détails visuels.",
+                    "anchors": [{"reference": frame}],
+                    "limitation": "Le double contrôlé n’analyse pas les pixels de la Frame.",
+                },
+            ],
+        },
+    });
+
+    let finished = run_derive(&env, capture_id, "knowledge-card", &output);
+    assert_eq!(finished["state"], "succeeded", "{finished}");
+    let published_capture = inspect_agent_capture(&env, capture_id);
+    let derivative = published_capture["derivatives"]
+        .as_array()
+        .and_then(|derivatives| {
+            derivatives
+                .iter()
+                .find(|derivative| derivative["derive_id"] == finished["derive_id"])
+        })
+        .expect("Fiche publiée");
+    let context: Value = serde_json::from_str(
+        serde_json::from_slice::<Value>(
+            &env.command()
+                .args([
+                    "capture",
+                    "read",
+                    "--reference",
+                    &derivative["context_reference"].to_string(),
+                ])
+                .assert()
+                .success()
+                .get_output()
+                .stdout,
+        )
+        .expect("lecture du Contexte JSON valide")["content"]["text"]
+            .as_str()
+            .expect("Contexte texte"),
+    )
+    .expect("Contexte sérialisé valide");
+    assert_eq!(context["selected"].as_array().map(Vec::len), Some(5));
+    assert!(context["selected"].as_array().is_some_and(|inputs| {
+        inputs
+            .iter()
+            .any(|input| input["reference"] == caption && input["role"] == "caption")
+            && inputs.iter().any(|input| {
+                input["reference"] == transcription && input["role"] == "transcription"
+            })
+            && inputs
+                .iter()
+                .any(|input| input["reference"] == frame && input["role"] == "visual-frame")
+            && inputs.iter().any(|input| {
+                input["reference"] == frame_ocr && input["selection_reason"] == "new-ocr-text"
+            })
+    }));
+    assert!(
+        context["excluded_candidates"]
+            .as_array()
+            .is_some_and(|excluded| {
+                excluded.iter().any(|candidate| {
+                    candidate["reference"] == raw_video
+                        && candidate["reason"] == "raw-video-unsupported"
+                })
+            })
+    );
+    let statements = &output["knowledge_core"]["statements"];
+    assert_eq!(
+        statements
+            .as_array()
+            .expect("Énoncés")
+            .iter()
+            .map(|statement| statement["kind"].as_str())
+            .collect::<Vec<_>>(),
+        [
+            Some("attributed-declaration"),
+            Some("observation"),
+            Some("attributed-recommendation"),
+            Some("interpretation"),
+            Some("uncertainty"),
+        ]
+    );
+}
+
+#[test]
 fn shipped_local_provider_derives_an_extractive_knowledge_card() {
     let env = TestEnv::new("shipped-local-knowledge-card");
     env.install_local_derive_provider();
@@ -3435,12 +3633,26 @@ fn knowledge_card_rejects_invalid_core_contracts() {
             }],
         },
     });
+    let invalid_kind = serde_json::json!({
+        "format_version": 1,
+        "recipe": "knowledge-card",
+        "knowledge_core": {
+            "coverage": valid["knowledge_core"]["coverage"],
+            "statements": [{
+                "id": "statement-1",
+                "kind": "external-verdict",
+                "text": "Un type hors contrat.",
+                "anchors": valid["knowledge_core"]["statements"][0]["anchors"],
+            }],
+        },
+    });
 
     for output in [
         &no_anchor,
         &unknown_premise,
         &incomplete_coverage,
         &invalid_locator,
+        &invalid_kind,
     ] {
         let finished = run_derive(&env, &capture_id, "knowledge-card", output);
         assert_eq!(finished["state"], "failed", "{finished}");
