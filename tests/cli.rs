@@ -3351,6 +3351,37 @@ fn knowledge_card_covers_social_video_modalities_without_raw_binary() {
     let frame = artifact_reference(capture_id, &capture, "extraction-media-0-frame-0000");
     let frame_ocr = artifact_reference(capture_id, &capture, "extraction-media-0-frame-0000-ocr");
     let raw_video = artifact_reference(capture_id, &capture, "media-0");
+    env.install_binary("scriptor-local-derive", FAKE_LOCAL_DERIVE_PROVIDER);
+    let refused: Value = serde_json::from_slice(
+        &env.command()
+            .args([
+                "derive",
+                capture_id,
+                "--recipe",
+                "knowledge-card",
+                "--provider",
+                "scriptor-local-derive",
+                "--policy",
+                "safe-local@1",
+                "--reference",
+                &raw_video.to_string(),
+            ])
+            .assert()
+            .success()
+            .get_output()
+            .stdout,
+    )
+    .expect("Refus de Reference brute JSON valide");
+    assert!(
+        refused["error"]["message"]
+            .as_str()
+            .is_some_and(|message| message.contains("raw video, audio, or document")),
+        "{refused}"
+    );
+    assert!(
+        !env.xdg_cache.join("derive-request.json").exists(),
+        "le Provider ne reçoit jamais la video brute"
+    );
     let coverage = [&metadata, &caption, &transcription, &frame, &frame_ocr]
         .iter()
         .map(|reference| {

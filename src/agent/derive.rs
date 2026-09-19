@@ -230,7 +230,7 @@ pub(super) fn admit(
         bail!("local Derive Policy cannot allow remote calls");
     }
     let manifest = manifest(capture_id)?;
-    select_inputs(capture_id, &manifest, target).map(drop)
+    select_inputs(capture_id, &manifest, recipe, target).map(drop)
 }
 
 pub(super) fn admit_retry(
@@ -277,7 +277,7 @@ pub(super) fn publish(job: &Job) -> Result<()> {
         bail!("Derive Worker received a non-Derive Job");
     };
     let manifest = manifest(capture_id)?;
-    let inputs = select_inputs(capture_id, &manifest, &recipe.target)?;
+    let inputs = select_inputs(capture_id, &manifest, recipe.kind, &recipe.target)?;
     let derive_id = format!("derive-{}", unique_id());
     let capture_dir = captures_dir()?.join(capture_id);
     let derivatives_dir = capture_dir.join("derivatives");
@@ -915,6 +915,7 @@ fn manifest(capture_id: &str) -> Result<Manifest> {
 fn select_inputs(
     capture_id: &str,
     manifest: &Manifest,
+    recipe: RecipeKind,
     target: &RecipeTarget,
 ) -> Result<InputSelection> {
     match target {
@@ -975,6 +976,11 @@ fn select_inputs(
                 if verified != *reference {
                     bail!("artifact metadata does not match its Reference");
                 }
+                if recipe == RecipeKind::KnowledgeCard && !knowledge_card_input_allowed(&artifact) {
+                    bail!(
+                        "knowledge-card Reference cannot select raw video, audio, or document artifacts"
+                    );
+                }
                 Ok(SelectedInput {
                     reference: verified,
                     role: input_role(&artifact).to_string(),
@@ -988,6 +994,10 @@ fn select_inputs(
                 excluded_candidates: Vec::new(),
             }),
     }
+}
+
+fn knowledge_card_input_allowed(artifact: &ArtifactMetadata) -> bool {
+    super::is_text_mime(&artifact.mime) || artifact.mime.starts_with("image/")
 }
 
 fn automatic_selection(artifact: &ArtifactMetadata) -> Option<(&'static str, &'static str)> {

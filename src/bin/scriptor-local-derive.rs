@@ -80,11 +80,15 @@ fn run() -> Result<()> {
 
     for (index, input) in request.inputs.iter().enumerate() {
         let id = index.checked_add(1).context("numbering local statements")?;
-        if is_text_mime(&input.mime)
-            && let Some(text) = fs::read_to_string(&input.path)
-                .ok()
-                .and_then(|text| first_nonempty_line(&text))
-        {
+        let text =
+            if is_text_mime(&input.mime) {
+                Some(fs::read_to_string(&input.path).with_context(|| {
+                    format!("reading selected text input {}", input.path.display())
+                })?)
+            } else {
+                None
+            };
+        if let Some(text) = text.as_deref().and_then(first_nonempty_line) {
             coverage.push(json!({
                 "reference": input.reference,
                 "state": "examined",
