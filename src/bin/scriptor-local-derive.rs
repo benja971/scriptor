@@ -4,7 +4,7 @@ use std::process::ExitCode;
 
 use anyhow::{Context, Result};
 use clap::Parser;
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 
 #[derive(Parser)]
@@ -42,6 +42,19 @@ struct Input {
 #[derive(Deserialize)]
 struct InferenceContext {
     excluded_candidates: Vec<ExcludedCandidate>,
+}
+
+#[derive(Serialize)]
+struct KnowledgeCard {
+    format_version: u8,
+    recipe: &'static str,
+    knowledge_core: KnowledgeCore,
+}
+
+#[derive(Serialize)]
+struct KnowledgeCore {
+    statements: Vec<Value>,
+    coverage: Vec<Value>,
 }
 
 #[derive(Deserialize)]
@@ -151,14 +164,14 @@ fn run() -> Result<()> {
             "reason": candidate.reason,
         })
     }));
-    let output = json!({
-        "format_version": 1,
-        "recipe": "knowledge-card",
-        "knowledge_core": {
-            "coverage": coverage,
-            "statements": statements,
+    let output = KnowledgeCard {
+        format_version: 1,
+        recipe: "knowledge-card",
+        knowledge_core: KnowledgeCore {
+            statements,
+            coverage,
         },
-    });
+    };
     write_output(&cli.output, &output)
 }
 
@@ -173,7 +186,7 @@ fn write_empty_recipe_output(path: &PathBuf, recipe: &str) -> Result<()> {
     )
 }
 
-fn write_output(path: &PathBuf, output: &Value) -> Result<()> {
+fn write_output(path: &PathBuf, output: &impl Serialize) -> Result<()> {
     fs::write(
         path,
         serde_json::to_vec(&output).context("serializing knowledge-card output")?,
@@ -277,7 +290,9 @@ fn push_paragraph(excerpts: &mut Vec<String>, paragraph: &mut Vec<&str>) {
 
 #[cfg(test)]
 mod tests {
-    use super::caption_excerpts;
+    use super::{KnowledgeCard, KnowledgeCore, caption_excerpts};
+    use anyhow::{Context, Result};
+    use serde_json::json;
 
     #[test]
     fn caption_excerpts_keep_paragraphs_and_bullets_atomic() {
@@ -292,5 +307,25 @@ mod tests {
                 "Deuxième tactique"
             ]
         );
+    }
+
+    #[test]
+    fn knowledge_card_serializes_statements_before_coverage() -> Result<()> {
+        let card = KnowledgeCard {
+            format_version: 1,
+            recipe: "knowledge-card",
+            knowledge_core: KnowledgeCore {
+                statements: vec![json!({"text":"utile"})],
+                coverage: vec![json!({"reason":"détaillé"})],
+            },
+        };
+        let output = serde_json::to_string(&card)?;
+        let statements = output.find("statements").context("finding statements")?;
+        let coverage = output.find("coverage").context("finding coverage")?;
+        if statements < coverage {
+            Ok(())
+        } else {
+            anyhow::bail!("statements must precede coverage")
+        }
     }
 }

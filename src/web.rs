@@ -57,6 +57,29 @@ pub fn acquire_binary<F>(
 where
     F: Fn() -> Result<bool>,
 {
+    acquire_binary_with_headers(
+        url,
+        staging,
+        deadline,
+        disk_byte_limit,
+        download_byte_limit,
+        &[],
+        is_cancelled,
+    )
+}
+
+pub fn acquire_binary_with_headers<F>(
+    url: &str,
+    staging: &Path,
+    deadline: SystemTime,
+    disk_byte_limit: u64,
+    download_byte_limit: u64,
+    headers: &[String],
+    is_cancelled: F,
+) -> Result<BinaryAcquisition>
+where
+    F: Fn() -> Result<bool>,
+{
     validate_public_url(url)?;
     let output_dir = staging.join("binary-acquisition");
     fs::create_dir_all(&output_dir).with_context(|| {
@@ -73,6 +96,9 @@ where
         .args(["--max-download-bytes", &download_byte_limit.to_string()])
         .stdout(Stdio::piped())
         .stderr(Stdio::piped());
+    for header in headers {
+        command.args(["--header", header]);
+    }
     let mut child = command.spawn().context("launching binary acquirer")?;
     loop {
         if is_cancelled()? {

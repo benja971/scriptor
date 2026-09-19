@@ -15,6 +15,8 @@ const option = (args, name) => {
   return args[index + 1];
 };
 
+const options = (args, name) => args.flatMap((value, index) => value === name && args[index + 1] ? [args[index + 1]] : []);
+
 export const acquire = async (args, dependencies = {}) => {
   const assertPublicUrl = dependencies.assertPublic ?? assertPublic;
   const createProxy = dependencies.createPinnedProxy ?? createPinnedProxy;
@@ -36,6 +38,7 @@ export const acquire = async (args, dependencies = {}) => {
         "--location", "--max-redirs", "5",
         "--proto", "=http,https", "--proto-redir", "=http,https",
         "--fail", "--silent", "--show-error",
+        ...options(args, "--header").flatMap((header) => ["--header", header]),
         "--output", payload,
         "--dump-header", headers,
         "--write-out", "%{content_type}\\n%{url_effective}",

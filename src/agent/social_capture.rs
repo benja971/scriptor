@@ -174,12 +174,13 @@ impl Acquisition for SocialAcquisition<'_> {
                     "Capture exceeds safe-web@1 download budget"
                 ))
             } else {
-                crate::web::acquire_binary(
+                crate::web::acquire_binary_with_headers(
                     media_url,
                     &acquisition_staging,
                     deadline,
                     self.job.policy.snapshot.limits.disk_byte_limit,
                     download_limit,
+                    &instagram_request_headers(),
                     || Ok(read_job(&self.job.id)?.state == "cancelled"),
                 )
             };
@@ -752,6 +753,13 @@ fn instagram_media_url(metadata: &Value) -> Option<&str> {
                 .get("url")?
                 .as_str()
         })
+}
+
+fn instagram_request_headers() -> Vec<String> {
+    vec![
+        "Referer: https://www.instagram.com/".to_string(),
+        "User-Agent: Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/148.0.0.0 Safari/537.36".to_string(),
+    ]
 }
 fn extension(mime: &str) -> &'static str {
     match mime {
