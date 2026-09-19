@@ -341,6 +341,7 @@ pub struct Manifest {
     )]
     format_version: u8,
     capture_id: String,
+    #[serde(default = "legacy_capture_version")]
     capture_version: u64,
     source: SourceIdentity,
     policy: Policy,
@@ -360,6 +361,10 @@ pub struct Manifest {
 
 const fn legacy_manifest_format_version() -> u8 {
     MANIFEST_FORMAT_VERSION
+}
+
+const fn legacy_capture_version() -> u64 {
+    1
 }
 
 fn deserialize_manifest_format_version<'de, D>(deserializer: D) -> std::result::Result<u8, D::Error>

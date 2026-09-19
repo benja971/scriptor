@@ -376,6 +376,10 @@ fn legacy_unversioned_capture_does_not_block_a_new_capture() {
         .as_object_mut()
         .expect("objet manifest")
         .remove("format_version");
+    manifest
+        .as_object_mut()
+        .expect("objet manifest")
+        .remove("capture_version");
     fs::write(
         &manifest_path,
         serde_json::to_vec(&manifest).expect("sérialisation du manifest"),
