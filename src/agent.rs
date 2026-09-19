@@ -266,6 +266,7 @@ enum WebRenderer {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, ValueEnum)]
 #[serde(rename_all = "kebab-case")]
 enum RecipeKind {
+    KnowledgeCard,
     StructuredSummary,
     ProvenClaims,
     Checklist,
@@ -276,6 +277,7 @@ enum RecipeKind {
 impl RecipeKind {
     const fn as_str(self) -> &'static str {
         match self {
+            Self::KnowledgeCard => "knowledge-card",
             Self::StructuredSummary => "structured-summary",
             Self::ProvenClaims => "proven-claims",
             Self::Checklist => "checklist",
@@ -3794,6 +3796,7 @@ fn policy_for(value: &str) -> Result<Policy> {
     let allowed_recipes = if value == POLICY_NAME {
         allowed_providers.push("scriptor-local-derive".to_string());
         vec![
+            RecipeKind::KnowledgeCard,
             RecipeKind::StructuredSummary,
             RecipeKind::ProvenClaims,
             RecipeKind::Checklist,
@@ -3887,7 +3890,8 @@ fn normalize_policy(id: String, version: u8, snapshot: PolicySnapshot) -> Result
         || snapshot.allowed_recipes.iter().any(|recipe| {
             !matches!(
                 recipe,
-                RecipeKind::StructuredSummary
+                RecipeKind::KnowledgeCard
+                    | RecipeKind::StructuredSummary
                     | RecipeKind::ProvenClaims
                     | RecipeKind::Checklist
                     | RecipeKind::MarkdownNote

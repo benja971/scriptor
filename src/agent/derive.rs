@@ -108,7 +108,63 @@ struct ProviderResponse {
 struct RecipeOutput {
     format_version: u8,
     recipe: RecipeKind,
+    #[serde(default)]
     claims: Vec<RecipeClaim>,
+    #[serde(default)]
+    knowledge_core: Option<KnowledgeCore>,
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct KnowledgeCore {
+    coverage: Vec<CoverageEntry>,
+    statements: Vec<KnowledgeStatement>,
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct CoverageEntry {
+    reference: Reference,
+    state: CoverageState,
+    reason: String,
+}
+
+#[derive(Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "kebab-case")]
+enum CoverageState {
+    Examined,
+    Excluded,
+    Unusable,
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct KnowledgeStatement {
+    id: String,
+    kind: StatementKind,
+    text: String,
+    #[serde(default)]
+    anchors: Vec<ProofAnchor>,
+    #[serde(default)]
+    premises: Vec<String>,
+    #[serde(default)]
+    limitation: Option<String>,
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct ProofAnchor {
+    reference: Reference,
+}
+
+#[derive(Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "kebab-case")]
+enum StatementKind {
+    AttributedDeclaration,
+    Observation,
+    AttributedRecommendation,
+    Interpretation,
+    Uncertainty,
 }
 
 #[derive(Deserialize)]
@@ -331,6 +387,7 @@ fn publish_staged(publication: &StagedPublication<'_>) -> Result<bool> {
         recipe,
         publication.capture_id,
         inputs,
+        excluded_candidates,
     )?;
     let derivative = build_derivative(
         publication,
@@ -351,6 +408,7 @@ fn validate_recipe_output(
     recipe: &Recipe,
     capture_id: &str,
     inputs: &[SelectedInput],
+    excluded_candidates: &[ExcludedCandidate],
 ) -> Result<()> {
     if response.mime != "application/json" {
         return Err(coded_error(
@@ -379,6 +437,18 @@ fn validate_recipe_output(
             AgentErrorCode::InvalidRecipeOutput,
             "Recipe output does not match the requested Recipe",
         ));
+    }
+    if recipe.kind == RecipeKind::KnowledgeCard {
+        if !output.claims.is_empty() {
+            return invalid_recipe_output("knowledge-card output must not contain generic claims");
+        }
+        let Some(knowledge_core) = output.knowledge_core else {
+            return invalid_recipe_output("knowledge-card output must contain a knowledge_core");
+        };
+        return validate_knowledge_core(knowledge_core, capture_id, inputs, excluded_candidates);
+    }
+    if output.knowledge_core.is_some() {
+        return invalid_recipe_output("only knowledge-card output may contain a knowledge_core");
     }
     for claim in output.claims {
         if claim.text.trim().is_empty() {
@@ -413,6 +483,157 @@ fn validate_recipe_output(
                 return Err(coded_error(
                     AgentErrorCode::InvalidRecipeCitation,
                     "Recipe citation does not match the selected artifact Reference",
+                ));
+            }
+        }
+    }
+    Ok(())
+}
+
+fn invalid_recipe_output<T>(message: impl Into<String>) -> Result<T> {
+    Err(coded_error(AgentErrorCode::InvalidRecipeOutput, message))
+}
+
+fn validate_knowledge_core(
+    knowledge_core: KnowledgeCore,
+    capture_id: &str,
+    inputs: &[SelectedInput],
+    excluded_candidates: &[ExcludedCandidate],
+) -> Result<()> {
+    validate_coverage(
+        knowledge_core.coverage,
+        capture_id,
+        inputs,
+        excluded_candidates,
+    )?;
+    validate_statements(knowledge_core.statements, capture_id, inputs)
+}
+
+fn validate_coverage(
+    coverage: Vec<CoverageEntry>,
+    capture_id: &str,
+    inputs: &[SelectedInput],
+    excluded_candidates: &[ExcludedCandidate],
+) -> Result<()> {
+    let mut covered_selected = std::collections::HashSet::new();
+    let mut covered_excluded = std::collections::HashSet::new();
+    for entry in coverage {
+        if entry.reason.trim().is_empty() {
+            return invalid_recipe_output("knowledge-card coverage has an empty reason");
+        }
+        if entry.reference.capture_id != capture_id {
+            return invalid_recipe_output(
+                "knowledge-card coverage is outside the inference corpus",
+            );
+        }
+        if let Some(input) = inputs
+            .iter()
+            .find(|input| input.reference == entry.reference)
+        {
+            if entry.state == CoverageState::Excluded {
+                return invalid_recipe_output("selected artifact cannot be excluded from coverage");
+            }
+            if !covered_selected.insert(input.reference.artifact_id.as_str()) {
+                return invalid_recipe_output(
+                    "knowledge-card coverage repeats a selected artifact",
+                );
+            }
+            continue;
+        }
+        if let Some(excluded) = excluded_candidates
+            .iter()
+            .find(|excluded| excluded.reference == entry.reference)
+        {
+            if entry.state != CoverageState::Excluded || entry.reason != excluded.reason {
+                return invalid_recipe_output(
+                    "excluded artifact coverage does not match its exclusion",
+                );
+            }
+            if !covered_excluded.insert(excluded.reference.artifact_id.as_str()) {
+                return invalid_recipe_output(
+                    "knowledge-card coverage repeats an excluded artifact",
+                );
+            }
+            continue;
+        }
+        return invalid_recipe_output("knowledge-card coverage references an unselected artifact");
+    }
+    if inputs
+        .iter()
+        .any(|input| !covered_selected.contains(input.reference.artifact_id.as_str()))
+        || excluded_candidates
+            .iter()
+            .any(|excluded| !covered_excluded.contains(excluded.reference.artifact_id.as_str()))
+    {
+        return invalid_recipe_output("knowledge-card coverage does not describe every input");
+    }
+
+    Ok(())
+}
+
+fn validate_statements(
+    statements: Vec<KnowledgeStatement>,
+    capture_id: &str,
+    inputs: &[SelectedInput],
+) -> Result<()> {
+    let statement_ids = statements
+        .iter()
+        .map(|statement| statement.id.clone())
+        .collect::<std::collections::HashSet<_>>();
+    if statement_ids.len() != statements.len()
+        || statement_ids.iter().any(|id| id.trim().is_empty())
+    {
+        return invalid_recipe_output("knowledge-card statement ids must be unique and non-empty");
+    }
+    for statement in statements {
+        if statement.text.trim().is_empty() {
+            return invalid_recipe_output("knowledge-card statement has empty text");
+        }
+        let is_uncertainty = statement.kind == StatementKind::Uncertainty;
+        let is_interpretation = statement.kind == StatementKind::Interpretation;
+        if is_uncertainty {
+            if statement
+                .limitation
+                .as_deref()
+                .is_none_or(|limitation| limitation.trim().is_empty())
+            {
+                return invalid_recipe_output(
+                    "knowledge-card uncertainty has no concrete limitation",
+                );
+            }
+        } else if statement.anchors.is_empty() {
+            return invalid_recipe_output("knowledge-card statement has no proof anchor");
+        } else if statement.limitation.is_some() {
+            return invalid_recipe_output("only uncertainty may have a limitation");
+        }
+        if is_interpretation {
+            if statement.premises.is_empty()
+                || statement
+                    .premises
+                    .iter()
+                    .any(|premise| !statement_ids.contains(premise))
+            {
+                return invalid_recipe_output(
+                    "knowledge-card interpretation has an unknown premise",
+                );
+            }
+        } else if !statement.premises.is_empty() {
+            return invalid_recipe_output("only interpretation may have premises");
+        }
+        for anchor in statement.anchors {
+            if anchor.reference.capture_id != capture_id {
+                return Err(coded_error(
+                    AgentErrorCode::InvalidRecipeCitation,
+                    "knowledge-card proof anchor is outside the inference corpus",
+                ));
+            }
+            if !inputs
+                .iter()
+                .any(|input| input.reference == anchor.reference)
+            {
+                return Err(coded_error(
+                    AgentErrorCode::InvalidRecipeCitation,
+                    "knowledge-card proof anchor is not a selected artifact Reference",
                 ));
             }
         }

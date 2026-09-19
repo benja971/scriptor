@@ -733,7 +733,7 @@ printf '{{"mime":"application/json","effective_parameters":{{"style":"concise"}}
     )
 }
 
-fn run_structured_derive(env: &TestEnv, capture_id: &str, output: &Value) -> Value {
+fn run_derive(env: &TestEnv, capture_id: &str, recipe: &str, output: &Value) -> Value {
     env.install_binary("scriptor-local-derive", &structured_derive_provider(output));
     let created: Value = serde_json::from_slice(
         &env.command()
@@ -741,7 +741,7 @@ fn run_structured_derive(env: &TestEnv, capture_id: &str, output: &Value) -> Val
                 "derive",
                 capture_id,
                 "--recipe",
-                "structured-summary",
+                recipe,
                 "--provider",
                 "scriptor-local-derive",
                 "--policy",
@@ -760,6 +760,10 @@ fn run_structured_derive(env: &TestEnv, capture_id: &str, output: &Value) -> Val
             .as_str()
             .expect("identifiant de Job de Derive"),
     )
+}
+
+fn run_structured_derive(env: &TestEnv, capture_id: &str, output: &Value) -> Value {
+    run_derive(env, capture_id, "structured-summary", output)
 }
 
 fn continue_safe_web_capture(env: &TestEnv, capture_id: &str) -> Value {
@@ -3184,6 +3188,168 @@ fn derive_rejects_unversioned_recipe_output() {
     let finished = run_structured_derive(&env, &capture_id, &output);
     assert_eq!(finished["state"], "failed", "{finished}");
     assert_eq!(finished["error"]["code"], "invalid_recipe_output");
+    assert!(
+        inspect_agent_capture(&env, &capture_id)["derivatives"]
+            .as_array()
+            .is_some_and(Vec::is_empty)
+    );
+}
+
+#[test]
+fn knowledge_card_publishes_a_versioned_sourced_knowledge_core() {
+    let env = TestEnv::new("knowledge-card-output");
+    let capture_id = create_text_capture(&env);
+    let capture = inspect_agent_capture(&env, &capture_id);
+    let reference = serde_json::json!({
+        "capture_id": capture_id,
+        "artifact_id": capture["manifest"]["proof"]["artifact_id"],
+        "sha256": capture["manifest"]["proof"]["sha256"],
+        "locator": capture["manifest"]["proof"]["locator"],
+    });
+    let output = serde_json::json!({
+        "format_version": 1,
+        "recipe": "knowledge-card",
+        "knowledge_core": {
+            "coverage": [{
+                "reference": reference,
+                "state": "examined",
+                "reason": "source-context",
+            }],
+            "statements": [{
+                "id": "statement-1",
+                "kind": "attributed-declaration",
+                "text": "La Source affirme contenir une preuve locale.",
+                "anchors": [{"reference": reference}],
+            }],
+        },
+    });
+
+    let finished = run_derive(&env, &capture_id, "knowledge-card", &output);
+    assert_eq!(finished["state"], "succeeded", "{finished}");
+    let capture = inspect_agent_capture(&env, &capture_id);
+    let derivative = capture["derivatives"]
+        .as_array()
+        .and_then(|derivatives| derivatives.first())
+        .expect("Fiche publiee");
+    let read: Value = serde_json::from_slice(
+        &env.command()
+            .args([
+                "capture",
+                "read",
+                "--reference",
+                &derivative["reference"].to_string(),
+            ])
+            .assert()
+            .success()
+            .get_output()
+            .stdout,
+    )
+    .expect("lecture JSON valide");
+    let published: Value =
+        serde_json::from_str(read["content"]["text"].as_str().expect("Fiche texte"))
+            .expect("Fiche JSON valide");
+    assert_eq!(published, output);
+}
+
+#[test]
+#[allow(clippy::too_many_lines)]
+fn knowledge_card_rejects_invalid_core_contracts() {
+    let env = TestEnv::new("knowledge-card-invalid-output");
+    let capture_id = create_text_capture(&env);
+    let capture = inspect_agent_capture(&env, &capture_id);
+    let reference = serde_json::json!({
+        "capture_id": capture_id,
+        "artifact_id": capture["manifest"]["proof"]["artifact_id"],
+        "sha256": capture["manifest"]["proof"]["sha256"],
+        "locator": capture["manifest"]["proof"]["locator"],
+    });
+    let valid = serde_json::json!({
+        "format_version": 1,
+        "recipe": "knowledge-card",
+        "knowledge_core": {
+            "coverage": [{
+                "reference": reference,
+                "state": "examined",
+                "reason": "source-context",
+            }],
+            "statements": [{
+                "id": "statement-1",
+                "kind": "attributed-declaration",
+                "text": "La Source affirme contenir une preuve locale.",
+                "anchors": [{"reference": reference}],
+            }],
+        },
+    });
+    let no_anchor = serde_json::json!({
+        "format_version": 1,
+        "recipe": "knowledge-card",
+        "knowledge_core": {
+            "coverage": valid["knowledge_core"]["coverage"],
+            "statements": [{
+                "id": "statement-1",
+                "kind": "observation",
+                "text": "Une observation sans ancrage.",
+                "anchors": [],
+            }],
+        },
+    });
+    let unknown_premise = serde_json::json!({
+        "format_version": 1,
+        "recipe": "knowledge-card",
+        "knowledge_core": {
+            "coverage": valid["knowledge_core"]["coverage"],
+            "statements": [{
+                "id": "statement-1",
+                "kind": "interpretation",
+                "text": "Une interpretation sans premise publiee.",
+                "anchors": valid["knowledge_core"]["statements"][0]["anchors"],
+                "premises": ["missing"],
+            }],
+        },
+    });
+    let incomplete_coverage = serde_json::json!({
+        "format_version": 1,
+        "recipe": "knowledge-card",
+        "knowledge_core": {
+            "coverage": [],
+            "statements": valid["knowledge_core"]["statements"],
+        },
+    });
+    let invalid_locator = serde_json::json!({
+        "format_version": 1,
+        "recipe": "knowledge-card",
+        "knowledge_core": {
+            "coverage": valid["knowledge_core"]["coverage"],
+            "statements": [{
+                "id": "statement-1",
+                "kind": "observation",
+                "text": "Un ancrage incompatible.",
+                "anchors": [{"reference": {
+                    "capture_id": capture_id,
+                    "artifact_id": reference["artifact_id"],
+                    "sha256": reference["sha256"],
+                    "locator": {"kind": "url", "value": "https://invalid.example/"},
+                }}],
+            }],
+        },
+    });
+
+    for output in [
+        &no_anchor,
+        &unknown_premise,
+        &incomplete_coverage,
+        &invalid_locator,
+    ] {
+        let finished = run_derive(&env, &capture_id, "knowledge-card", output);
+        assert_eq!(finished["state"], "failed", "{finished}");
+        assert!(
+            matches!(
+                finished["error"]["code"].as_str(),
+                Some("invalid_recipe_output" | "invalid_recipe_citation")
+            ),
+            "{finished}"
+        );
+    }
     assert!(
         inspect_agent_capture(&env, &capture_id)["derivatives"]
             .as_array()
