@@ -209,7 +209,7 @@ struct PolicyDocument {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
-struct Job {
+pub struct Job {
     #[serde(rename = "job_id")]
     id: String,
     state: String,
@@ -334,7 +334,7 @@ struct CreatedJob<'a> {
 }
 
 #[derive(Debug, Serialize, Deserialize)]
-struct Manifest {
+pub struct Manifest {
     #[serde(deserialize_with = "deserialize_manifest_format_version")]
     format_version: u8,
     capture_id: String,
@@ -2014,67 +2014,19 @@ fn extract_image_document(
     budget: &ResourceBudget<'_>,
 ) -> std::result::Result<(), DocumentFailure> {
     const CAPABILITY: &str = "image-ocr";
-    if !policy_allows(&job.policy, "tesseract") {
-        return Err(document_failure(
-            CAPABILITY,
-            unresolved_provider("tesseract"),
-            "provider_not_allowed",
-            denied_provider_error("tesseract"),
-        ));
-    }
-    let provider =
-        document_provider("tesseract", json!({ "format": "tsv" }), budget).map_err(|error| {
-            document_failure(
-                CAPABILITY,
-                unresolved_provider("tesseract"),
-                "extraction_failed",
-                error,
-            )
-        })?;
-    let mut command = Command::new("tesseract");
-    command.args([proof_path, Path::new("stdout"), Path::new("tsv")]);
-    let output = budget.output(&mut command).map_err(|error| {
-        document_failure(CAPABILITY, provider.clone(), "extraction_failed", error)
-    })?;
-    provider_succeeded("tesseract", &output).map_err(|error| {
-        document_failure(CAPABILITY, provider.clone(), "extraction_failed", error)
-    })?;
-    let (text, regions) = parse_tesseract_tsv(&output.stdout).map_err(|error| {
-        document_failure(CAPABILITY, provider.clone(), "extraction_failed", error)
-    })?;
-    let output_dir = staging.join("extractions");
-    fs::create_dir_all(&output_dir)
-        .with_context(|| format!("creating OCR Extraction directory {}", output_dir.display()))
-        .map_err(|error| {
-            document_failure(CAPABILITY, provider.clone(), "extraction_failed", error)
-        })?;
-    let output_path = output_dir.join("ocr.txt");
-    budget
-        .check_disk_capacity(
-            u64::try_from(text.len())
-                .context("converting OCR output size")
-                .map_err(|error| {
-                    document_failure(CAPABILITY, provider.clone(), "extraction_failed", error)
-                })?,
-        )
-        .map_err(|error| {
-            document_failure(CAPABILITY, provider.clone(), "extraction_failed", error)
-        })?;
-    fs::write(&output_path, text)
-        .with_context(|| format!("writing OCR Extraction {}", output_path.display()))
-        .map_err(|error| {
-            document_failure(CAPABILITY, provider.clone(), "extraction_failed", error)
-        })?;
-    let extraction = document_extraction(
-        "extraction-image-ocr",
+    let (extraction, provider) = ocr_image(
+        job,
+        proof_path,
+        staging,
         "extractions/ocr.txt",
-        &output_path,
-        Locator::ImageRegions { regions },
-        None,
-        provider.clone(),
+        "extraction-image-ocr",
+        "proof-source",
         budget,
     )
-    .map_err(|error| (CAPABILITY, provider.clone(), "extraction_failed", error))?;
+    .map_err(|error| {
+        let (provider, code, error) = *error;
+        document_failure(CAPABILITY, provider, code, error)
+    })?;
     manifest.extractions.push(extraction);
     manifest.capabilities.push(Capability {
         name: CAPABILITY.to_string(),
@@ -2083,6 +2035,157 @@ fn extract_image_document(
         error: None,
     });
     Ok(())
+}
+
+type OcrFailure = Box<(Provider, &'static str, anyhow::Error)>;
+
+#[allow(clippy::too_many_arguments)]
+fn ocr_image(
+    job: &Job,
+    image_path: &Path,
+    staging: &Path,
+    relative_path: &str,
+    artifact_id: &str,
+    proof_artifact_id: &str,
+    budget: &ResourceBudget<'_>,
+) -> std::result::Result<(Extraction, Provider), OcrFailure> {
+    if !policy_allows(&job.policy, "tesseract") {
+        return Err(Box::new((
+            unresolved_provider("tesseract"),
+            "provider_not_allowed",
+            denied_provider_error("tesseract"),
+        )));
+    }
+    let provider =
+        document_provider("tesseract", json!({ "format": "tsv" }), budget).map_err(|error| {
+            Box::new((unresolved_provider("tesseract"), "extraction_failed", error))
+        })?;
+    let mut command = Command::new("tesseract");
+    command.args([image_path, Path::new("stdout"), Path::new("tsv")]);
+    let output = budget
+        .output(&mut command)
+        .map_err(|error| Box::new((provider.clone(), "extraction_failed", error)))?;
+    provider_succeeded("tesseract", &output)
+        .map_err(|error| Box::new((provider.clone(), "extraction_failed", error)))?;
+    let (text, regions) = parse_tesseract_tsv(&output.stdout)
+        .map_err(|error| Box::new((provider.clone(), "extraction_failed", error)))?;
+    let output_path = staging.join(relative_path);
+    let output_dir = output_path
+        .parent()
+        .context("resolving OCR Extraction directory")
+        .map_err(|error| Box::new((provider.clone(), "extraction_failed", error)))?;
+    fs::create_dir_all(output_dir)
+        .with_context(|| format!("creating OCR Extraction directory {}", output_dir.display()))
+        .map_err(|error| Box::new((provider.clone(), "extraction_failed", error)))?;
+    budget
+        .check_disk_capacity(
+            u64::try_from(text.len())
+                .context("converting OCR output size")
+                .map_err(|error| Box::new((provider.clone(), "extraction_failed", error)))?,
+        )
+        .map_err(|error| Box::new((provider.clone(), "extraction_failed", error)))?;
+    fs::write(&output_path, text)
+        .with_context(|| format!("writing OCR Extraction {}", output_path.display()))
+        .map_err(|error| Box::new((provider.clone(), "extraction_failed", error)))?;
+    let mut extraction = document_extraction(
+        artifact_id,
+        relative_path,
+        &output_path,
+        Locator::ImageRegions { regions },
+        None,
+        provider.clone(),
+        budget,
+    )
+    .map_err(|error| Box::new((provider.clone(), "extraction_failed", error)))?;
+    extraction.proof_artifact_id = proof_artifact_id.to_string();
+    Ok((extraction, provider))
+}
+
+pub fn enrich_image_ocr(
+    job: &Job,
+    staging: &Path,
+    manifest: &mut Manifest,
+    budget: &ResourceBudget<'_>,
+) {
+    let already_extracted = |artifact_id: &str| {
+        manifest
+            .extractions
+            .iter()
+            .any(|extraction| extraction.artifact_id == format!("{artifact_id}-ocr"))
+    };
+    let mut images = manifest
+        .artifacts
+        .iter()
+        .filter(|artifact| {
+            artifact.mime.starts_with("image/") && !already_extracted(&artifact.artifact_id)
+        })
+        .map(|artifact| {
+            (
+                artifact.artifact_id.clone(),
+                artifact.path.clone(),
+                artifact.artifact_id.clone(),
+            )
+        })
+        .collect::<Vec<_>>();
+    images.extend(
+        manifest
+            .extractions
+            .iter()
+            .filter(|artifact| {
+                artifact.mime.starts_with("image/") && !already_extracted(&artifact.artifact_id)
+            })
+            .map(|artifact| {
+                (
+                    artifact.artifact_id.clone(),
+                    artifact.path.clone(),
+                    artifact.artifact_id.clone(),
+                )
+            }),
+    );
+    for (source_artifact_id, source_path, proof_artifact_id) in images {
+        if budget.is_cancelled().is_ok_and(|cancelled| cancelled) {
+            return;
+        }
+        let capability = format!("image-ocr-{source_artifact_id}");
+        let artifact_id = format!("{source_artifact_id}-ocr");
+        let relative_path = format!("extractions/ocr/{source_artifact_id}.txt");
+        match ocr_image(
+            job,
+            &staging.join(source_path),
+            staging,
+            &relative_path,
+            &artifact_id,
+            &proof_artifact_id,
+            budget,
+        ) {
+            Ok((extraction, provider)) => {
+                manifest.extractions.push(extraction);
+                manifest.capabilities.push(Capability {
+                    name: capability,
+                    state: "succeeded".to_string(),
+                    provider,
+                    error: None,
+                });
+            }
+            Err(error) => {
+                let (provider, code, error) = *error;
+                manifest.capabilities.push(Capability {
+                    name: capability,
+                    state: if code == "provider_not_allowed" {
+                        "not_attempted".to_string()
+                    } else {
+                        "failed".to_string()
+                    },
+                    provider,
+                    error: Some(StructuredError {
+                        code: code.to_string(),
+                        message: format!("{error:#}"),
+                        capability: None,
+                    }),
+                });
+            }
+        }
+    }
 }
 
 fn document_provider(
@@ -2282,6 +2385,7 @@ fn capture_local_media(
         &media_capability_name(media_order, "frames"),
         media_order,
     );
+    enrich_image_ocr(job, staging, manifest, budget);
     cleanup_work_dir(&work_dir, manifest);
 }
 

@@ -499,6 +499,10 @@ fn enrich_video_extractions(
             return Ok(true);
         }
     }
+    super::enrich_image_ocr(job, staging, manifest, &budget);
+    if budget.is_cancelled()? {
+        return Ok(true);
+    }
     Ok(false)
 }
 

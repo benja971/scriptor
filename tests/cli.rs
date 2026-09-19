@@ -535,6 +535,7 @@ impl TestEnv {
         write_executable(&bin_dir, "ffmpeg", FAKE_FFMPEG);
         write_executable(&bin_dir, "ffprobe", FAKE_FFPROBE);
         write_executable(&bin_dir, "whisper-cli", FAKE_WHISPER_CLI);
+        write_executable(&bin_dir, "tesseract", FAKE_TESSERACT);
 
         Self {
             bin_dir,
@@ -1540,6 +1541,20 @@ fn capture_instagram_video_transcribes_extracts_frames_and_indexes_text() {
             && extraction["path"] == "extractions/media-0/frames/frame-0001-0.000s.jpg"
             && extraction["proof_artifact_id"] == "media-0"
     }));
+    assert!(extractions.iter().any(|extraction| {
+        extraction["artifact_id"] == "extraction-media-0-frame-0000-ocr"
+            && extraction["path"] == "extractions/ocr/extraction-media-0-frame-0000.txt"
+            && extraction["proof_artifact_id"] == "extraction-media-0-frame-0000"
+            && extraction["locator"]["kind"] == "image-regions"
+    }));
+    assert!(
+        capture["manifest"]["capabilities"]
+            .as_array()
+            .is_some_and(|capabilities| capabilities.iter().any(|capability| {
+                capability["name"] == "image-ocr-extraction-media-0-frame-0000"
+                    && capability["state"] == "succeeded"
+            }))
+    );
     let search: Value = serde_json::from_slice(
         &env.command()
             .args(["capture", "search", "faux contenu transcrit"])
@@ -2409,7 +2424,7 @@ fn capture_local_media_publishes_proof_and_located_extractions() {
     assert_eq!(capture["manifest"]["proof"]["mime"], "video/mp4");
     assert_eq!(
         capture["manifest"]["extractions"].as_array().map(Vec::len),
-        Some(2)
+        Some(3)
     );
     assert!(
         capture["manifest"]["extractions"]
@@ -3002,7 +3017,11 @@ fn derive_whole_capture_selects_multimodal_context_without_raw_video() {
         .collect();
     assert_eq!(
         provider_inputs,
-        ["extraction-transcription", "extraction-frame-0000"]
+        [
+            "extraction-transcription",
+            "extraction-frame-0000",
+            "extraction-frame-0000-ocr"
+        ]
     );
 
     let capture = inspect_agent_capture(&env, &capture_id);
@@ -3037,7 +3056,8 @@ fn derive_whole_capture_selects_multimodal_context_without_raw_video() {
             .collect::<Vec<_>>(),
         [
             Some("extraction-transcription"),
-            Some("extraction-frame-0000")
+            Some("extraction-frame-0000"),
+            Some("extraction-frame-0000-ocr")
         ]
     );
     assert!(context["selected"].as_array().is_some_and(|selected| {
