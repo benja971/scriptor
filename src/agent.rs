@@ -473,11 +473,26 @@ struct ProviderDependency {
 #[serde(tag = "kind", rename_all = "kebab-case")]
 enum Locator {
     File,
-    Url { value: String },
-    MediaTimestamp { timestamps_secs: Vec<f64> },
-    PdfPages { first_page: u32, last_page: u32 },
-    ImageRegions { regions: Vec<ImageRegion> },
-    CssSelector { value: String },
+    Url {
+        value: String,
+    },
+    MediaTimestamp {
+        timestamps_secs: Vec<f64>,
+    },
+    FrameRegions {
+        timestamps_secs: Vec<f64>,
+        regions: Vec<ImageRegion>,
+    },
+    PdfPages {
+        first_page: u32,
+        last_page: u32,
+    },
+    ImageRegions {
+        regions: Vec<ImageRegion>,
+    },
+    CssSelector {
+        value: String,
+    },
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -2034,6 +2049,7 @@ fn extract_image_document(
             relative_path: "extractions/ocr.txt",
             artifact_id: "extraction-image-ocr",
             proof_artifact_id: "proof-source",
+            frame_timestamp: None,
         },
         budget,
     )
@@ -2063,6 +2079,7 @@ struct OcrTarget<'a> {
     relative_path: &'a str,
     artifact_id: &'a str,
     proof_artifact_id: &'a str,
+    frame_timestamp: Option<f64>,
 }
 
 const fn ocr_extraction_failure(provider: Provider, error: anyhow::Error) -> OcrFailure {
@@ -2124,7 +2141,13 @@ fn ocr_image(
         target.artifact_id,
         target.relative_path,
         &output_path,
-        Locator::ImageRegions { regions },
+        match target.frame_timestamp {
+            Some(timestamp) => Locator::FrameRegions {
+                timestamps_secs: vec![timestamp],
+                regions,
+            },
+            None => Locator::ImageRegions { regions },
+        },
         None,
         provider.clone(),
         budget,
@@ -2157,6 +2180,7 @@ pub fn enrich_image_ocr(
                 artifact.artifact_id.clone(),
                 artifact.path.clone(),
                 artifact.artifact_id.clone(),
+                None,
             )
         })
         .collect::<Vec<_>>();
@@ -2172,10 +2196,16 @@ pub fn enrich_image_ocr(
                     artifact.artifact_id.clone(),
                     artifact.path.clone(),
                     artifact.artifact_id.clone(),
+                    match artifact.locator.as_ref() {
+                        Some(Locator::MediaTimestamp { timestamps_secs }) => {
+                            timestamps_secs.first().copied()
+                        }
+                        _ => None,
+                    },
                 )
             }),
     );
-    for (source_artifact_id, source_path, proof_artifact_id) in images {
+    for (source_artifact_id, source_path, proof_artifact_id, frame_timestamp) in images {
         if budget.is_cancelled()? {
             return Ok(());
         }
@@ -2190,6 +2220,7 @@ pub fn enrich_image_ocr(
                 relative_path: &relative_path,
                 artifact_id: &artifact_id,
                 proof_artifact_id: &proof_artifact_id,
+                frame_timestamp,
             },
             budget,
         ) {

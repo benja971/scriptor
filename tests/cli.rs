@@ -1584,7 +1584,8 @@ fn capture_instagram_video_transcribes_extracts_frames_and_indexes_text() {
             extraction["artifact_id"] == "extraction-media-0-frame-0000-ocr"
                 && extraction["path"] == "extractions/ocr/extraction-media-0-frame-0000.txt"
                 && extraction["proof_artifact_id"] == "extraction-media-0-frame-0000"
-                && extraction["locator"]["kind"] == "image-regions"
+                && extraction["locator"]["kind"] == "frame-regions"
+                && extraction["locator"]["timestamps_secs"] == serde_json::json!([0.0])
         }),
         "{capture}"
     );
