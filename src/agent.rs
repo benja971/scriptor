@@ -479,15 +479,15 @@ enum Locator {
     MediaTimestamp {
         timestamps_secs: Vec<f64>,
     },
-    FrameRegions {
-        timestamps_secs: Vec<f64>,
-        regions: Vec<ImageRegion>,
-    },
     PdfPages {
         first_page: u32,
         last_page: u32,
     },
     ImageRegions {
+        regions: Vec<ImageRegion>,
+    },
+    FrameRegions {
+        timestamps_secs: Vec<f64>,
         regions: Vec<ImageRegion>,
     },
     CssSelector {
@@ -2049,7 +2049,6 @@ fn extract_image_document(
             relative_path: "extractions/ocr.txt",
             artifact_id: "extraction-image-ocr",
             proof_artifact_id: "proof-source",
-            frame_timestamp: None,
         },
         budget,
     )
@@ -2079,7 +2078,6 @@ struct OcrTarget<'a> {
     relative_path: &'a str,
     artifact_id: &'a str,
     proof_artifact_id: &'a str,
-    frame_timestamp: Option<f64>,
 }
 
 const fn ocr_extraction_failure(provider: Provider, error: anyhow::Error) -> OcrFailure {
@@ -2141,13 +2139,7 @@ fn ocr_image(
         target.artifact_id,
         target.relative_path,
         &output_path,
-        match target.frame_timestamp {
-            Some(timestamp) => Locator::FrameRegions {
-                timestamps_secs: vec![timestamp],
-                regions,
-            },
-            None => Locator::ImageRegions { regions },
-        },
+        Locator::ImageRegions { regions },
         None,
         provider.clone(),
         budget,
@@ -2180,7 +2172,6 @@ pub fn enrich_image_ocr(
                 artifact.artifact_id.clone(),
                 artifact.path.clone(),
                 artifact.artifact_id.clone(),
-                None,
             )
         })
         .collect::<Vec<_>>();
@@ -2196,16 +2187,10 @@ pub fn enrich_image_ocr(
                     artifact.artifact_id.clone(),
                     artifact.path.clone(),
                     artifact.artifact_id.clone(),
-                    match artifact.locator.as_ref() {
-                        Some(Locator::MediaTimestamp { timestamps_secs }) => {
-                            timestamps_secs.first().copied()
-                        }
-                        _ => None,
-                    },
                 )
             }),
     );
-    for (source_artifact_id, source_path, proof_artifact_id, frame_timestamp) in images {
+    for (source_artifact_id, source_path, proof_artifact_id) in images {
         if budget.is_cancelled()? {
             return Ok(());
         }
@@ -2220,7 +2205,6 @@ pub fn enrich_image_ocr(
                 relative_path: &relative_path,
                 artifact_id: &artifact_id,
                 proof_artifact_id: &proof_artifact_id,
-                frame_timestamp,
             },
             budget,
         ) {
@@ -2716,51 +2700,23 @@ fn capture_frames(
         Ok(frame_count) => {
             let destination = media_extraction_path(staging, "frames", media_order);
             if frame_count > 0 {
-                budget.check()?;
-                fs::create_dir_all(&destination).with_context(|| {
-                    format!(
-                        "creating Frames Extraction directory {}",
-                        destination.display()
-                    )
-                })?;
-                let mut frames = fs::read_dir(&frames_dir)
-                    .with_context(|| format!("reading Frames {}", frames_dir.display()))?
-                    .map(|entry| entry.map(|entry| entry.path()))
-                    .collect::<std::io::Result<Vec<_>>>()
-                    .context("reading Frame paths")?;
-                frames.sort();
-                for (index, frame) in frames.iter().enumerate() {
-                    budget.check()?;
-                    let filename = frame.file_name().context("reading Frame filename")?;
-                    let filename = filename.to_string_lossy();
-                    let timestamp = frame_timestamp(&filename)?;
-                    let extraction_path = destination.join(filename.as_ref());
-                    copy_extraction(frame, &extraction_path, budget)?;
-                    budget.check()?;
-                    let artifact_id = media_order.map_or_else(
-                        || format!("extraction-frame-{index:04}"),
-                        |order| format!("extraction-media-{order}-frame-{index:04}"),
-                    );
-                    let path = media_order.map_or_else(
-                        || format!("extractions/frames/{filename}"),
-                        |order| format!("extractions/media-{order}/frames/{filename}"),
-                    );
-                    let mut extraction = extraction(
-                        &artifact_id,
-                        &path,
-                        "image/jpeg",
-                        &extraction_path,
-                        Some(Locator::MediaTimestamp {
-                            timestamps_secs: vec![timestamp],
-                        }),
-                        frames_provider.clone(),
-                        budget,
-                    )?;
-                    if let Some(order) = media_order {
-                        extraction.proof_artifact_id = format!("media-{order}");
-                    }
-                    manifest.extractions.push(extraction);
-                    budget.check()?;
+                let frame_ocr_provider = frame_ocr_provider(manifest, budget, media_order);
+                let frame_ocr_succeeded = capture_frame_extractions(
+                    &frames_dir,
+                    &destination,
+                    manifest,
+                    &frames_provider,
+                    frame_ocr_provider.as_ref(),
+                    budget,
+                    media_order,
+                )?;
+                if let Some(provider) = frame_ocr_provider.filter(|_| frame_ocr_succeeded) {
+                    manifest.capabilities.push(Capability {
+                        name: media_capability_name(media_order, "frame-ocr"),
+                        state: "succeeded".to_string(),
+                        provider,
+                        error: None,
+                    });
                 }
             }
             manifest.capabilities.push(Capability {
@@ -2779,6 +2735,164 @@ fn capture_frames(
         }
     }
     Ok(())
+}
+
+fn capture_frame_extractions(
+    frames_dir: &Path,
+    destination: &Path,
+    manifest: &mut Manifest,
+    frames_provider: &Provider,
+    frame_ocr_provider: Option<&Provider>,
+    budget: &ResourceBudget<'_>,
+    media_order: Option<u32>,
+) -> Result<bool> {
+    budget.check()?;
+    fs::create_dir_all(destination).with_context(|| {
+        format!(
+            "creating Frames Extraction directory {}",
+            destination.display()
+        )
+    })?;
+    let mut frames = fs::read_dir(frames_dir)
+        .with_context(|| format!("reading Frames {}", frames_dir.display()))?
+        .map(|entry| entry.map(|entry| entry.path()))
+        .collect::<std::io::Result<Vec<_>>>()
+        .context("reading Frame paths")?;
+    frames.sort();
+    let mut frame_ocr_succeeded = true;
+    for (index, frame) in frames.iter().enumerate() {
+        budget.check()?;
+        let filename = frame.file_name().context("reading Frame filename")?;
+        let filename = filename.to_string_lossy();
+        let timestamp = frame_timestamp(&filename)?;
+        let extraction_path = destination.join(filename.as_ref());
+        copy_extraction(frame, &extraction_path, budget)?;
+        let artifact_id = media_order.map_or_else(
+            || format!("extraction-frame-{index:04}"),
+            |order| format!("extraction-media-{order}-frame-{index:04}"),
+        );
+        let path = media_order.map_or_else(
+            || format!("extractions/frames/{filename}"),
+            |order| format!("extractions/media-{order}/frames/{filename}"),
+        );
+        let mut extraction = extraction(
+            &artifact_id,
+            &path,
+            "image/jpeg",
+            &extraction_path,
+            Some(Locator::MediaTimestamp {
+                timestamps_secs: vec![timestamp],
+            }),
+            frames_provider.clone(),
+            budget,
+        )?;
+        if let Some(order) = media_order {
+            extraction.proof_artifact_id = format!("media-{order}");
+        }
+        manifest.extractions.push(extraction);
+        if let Some(provider) = frame_ocr_provider {
+            frame_ocr_succeeded &= capture_frame_ocr(
+                &extraction_path,
+                destination,
+                index,
+                timestamp,
+                media_order,
+                provider,
+                manifest,
+                budget,
+            );
+        }
+    }
+    Ok(frame_ocr_succeeded)
+}
+
+fn frame_ocr_provider(
+    manifest: &mut Manifest,
+    budget: &ResourceBudget<'_>,
+    media_order: Option<u32>,
+) -> Option<Provider> {
+    if !policy_allows(&manifest.policy, "tesseract") {
+        let error = denied_provider_error("tesseract");
+        manifest.capabilities.push(blocked_capability(
+            &media_capability_name(media_order, "frame-ocr"),
+            unresolved_provider("tesseract"),
+            &error,
+        ));
+        return None;
+    }
+    match provider("tesseract", json!({ "format": "tsv" }), &[], budget) {
+        Ok(provider) => Some(provider),
+        Err(error) => {
+            manifest.capabilities.push(failed_capability(
+                &media_capability_name(media_order, "frame-ocr"),
+                unresolved_provider("tesseract"),
+                &error,
+            ));
+            None
+        }
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+fn capture_frame_ocr(
+    frame_path: &Path,
+    destination: &Path,
+    frame_index: usize,
+    timestamp: f64,
+    media_order: Option<u32>,
+    provider: &Provider,
+    manifest: &mut Manifest,
+    budget: &ResourceBudget<'_>,
+) -> bool {
+    let result = (|| -> Result<()> {
+        let mut command = Command::new("tesseract");
+        command.args([frame_path, Path::new("stdout"), Path::new("tsv")]);
+        let output = budget.output(&mut command)?;
+        provider_succeeded("tesseract", &output)?;
+        let (text, regions) = parse_tesseract_tsv(&output.stdout)?;
+        let output_path = destination.join(format!("frame-{frame_index:04}.ocr.txt"));
+        budget.check_disk_capacity(
+            u64::try_from(text.len()).context("converting OCR output size")?,
+        )?;
+        fs::write(&output_path, text)
+            .with_context(|| format!("writing Frame OCR Extraction {}", output_path.display()))?;
+        let artifact_id = media_order.map_or_else(
+            || format!("extraction-frame-{frame_index:04}-ocr"),
+            |order| format!("extraction-media-{order}-frame-{frame_index:04}-ocr"),
+        );
+        let path = media_order.map_or_else(
+            || format!("extractions/frames/frame-{frame_index:04}.ocr.txt"),
+            |order| format!("extractions/media-{order}/frames/frame-{frame_index:04}.ocr.txt"),
+        );
+        let mut extraction = extraction(
+            &artifact_id,
+            &path,
+            "text/plain; charset=utf-8",
+            &output_path,
+            Some(Locator::FrameRegions {
+                timestamps_secs: vec![timestamp],
+                regions,
+            }),
+            provider.clone(),
+            budget,
+        )?;
+        if let Some(order) = media_order {
+            extraction.proof_artifact_id = format!("media-{order}");
+        }
+        manifest.extractions.push(extraction);
+        Ok(())
+    })();
+    match result {
+        Ok(()) => true,
+        Err(error) => {
+            manifest.capabilities.push(failed_capability(
+                &media_capability_name(media_order, "frame-ocr"),
+                provider.clone(),
+                &error,
+            ));
+            false
+        }
+    }
 }
 
 fn failed_capability(name: &str, provider: Provider, error: &anyhow::Error) -> Capability {
