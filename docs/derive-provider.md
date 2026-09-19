@@ -4,7 +4,7 @@ Le Contrat agent crée un Dérivé avec une sélection explicite :
 
 ```console
 scriptor derive <capture_id> \
-  --recipe markdown-note \
+  --recipe knowledge-card \
   --provider scriptor-local-derive \
   --policy safe-local@1 \
   --whole-capture
@@ -33,6 +33,7 @@ le binaire `scriptor-local-derive` et les Recettes suivantes :
 - `checklist`
 - `markdown-note`
 - `sourced-answer`
+- `knowledge-card`
 
 ## Interface du Provider
 
@@ -64,6 +65,41 @@ non vide de `citations`. Chaque Citation est une Référence complète : son
 `capture_id` doit appartenir au corpus transmis et sa Référence doit correspondre
 exactement à un artefact retenu. Une sortie sans claim reste valide, mais aucun
 claim ne peut être non sourcé.
+
+Pour `knowledge-card`, le Provider produit à la place un `knowledge_core` et
+aucun `claims`. Son `coverage` liste exactement chaque Artefact transmis ou
+exclu du Contexte, avec son état (`examined`, `unusable` ou `excluded`) et son
+motif. Ses `statements` sont des Énoncés atomiques `attributed-declaration`,
+`observation`, `attributed-recommendation`, `interpretation` ou `uncertainty`.
+Chaque Énoncé non-incertitude porte un Ancrage de preuve vers une Référence
+transmise. Une Incertitude déclare une `limitation` concrète et peut être
+ancrée lorsqu'un Artefact concerné existe. Une `interpretation` liste les
+identifiants de ses `premises`.
+
+```json
+{
+  "format_version": 1,
+  "recipe": "knowledge-card",
+  "knowledge_core": {
+    "coverage": [{
+      "reference": {
+        "capture_id": "capture-example",
+        "artifact_id": "extraction-transcription",
+        "sha256": "...",
+        "locator": null
+      },
+      "state": "examined",
+      "reason": "local-text-extraction"
+    }],
+    "statements": [{
+      "id": "statement-1",
+      "kind": "attributed-declaration",
+      "text": "La Source indique : L'entretien présente le projet.",
+      "anchors": [{ "reference": { "capture_id": "capture-example", "artifact_id": "extraction-transcription", "sha256": "...", "locator": null } }]
+    }]
+  }
+}
+```
 
 ```json
 {
@@ -115,5 +151,8 @@ autorisés sont `language`, `model`, `model_sha256` et `style`. `max_tokens` et
 Tout autre champ, objet imbriqué ou type est refusé avant persistance. Ce schéma
 exclut notamment secrets, jetons, mots de passe, cookies et autorisations.
 
-Le moteur local derrière `scriptor-local-derive` n'est pas distribué par ce
-projet. Il doit respecter cette interface et être présent dans `PATH`.
+Le binaire livré `scriptor-local-derive` produit `knowledge-card` sans modèle
+ni appel distant. Il transforme le texte local sélectionné en Déclarations
+attribuées extractives et publie une Incertitude explicite pour une entrée sans
+texte exploitable. Pour préserver le contrat générique des autres Recettes, il
+retourne une liste de claims vide et versionnée.
