@@ -830,7 +830,8 @@ fn artifact_reference(capture_id: &str, capture: &Value, artifact_id: &str) -> V
 
 fn create_text_capture(env: &TestEnv) -> String {
     let source = env.work_dir.join("notes.txt");
-    fs::write(&source, "Une preuve locale.\n").expect("ecriture de la Source texte");
+    fs::write(&source, "Une preuve locale.\nEt son contexte utile.\n")
+        .expect("ecriture de la Source texte");
     let created: Value = serde_json::from_slice(
         &env.command()
             .args([
@@ -3574,6 +3575,10 @@ fn shipped_local_provider_derives_an_extractive_knowledge_card() {
     assert_eq!(
         published["knowledge_core"]["statements"][0]["kind"],
         "attributed-declaration"
+    );
+    assert_eq!(
+        published["knowledge_core"]["statements"][0]["text"],
+        "La Source indique : Une preuve locale. Et son contexte utile."
     );
     assert!(
         published["knowledge_core"]["statements"][0]["anchors"]
