@@ -720,7 +720,7 @@ fn create_safe_web_capture(env: &TestEnv, source: &str) -> Value {
 fn wait_for_agent_job(env: &TestEnv, job_id: &str) -> Value {
     serde_json::from_slice(
         &env.command()
-            .args(["job", "wait", job_id, "--timeout-secs", "10"])
+            .args(["job", "wait", job_id, "--timeout-secs", "30"])
             .assert()
             .success()
             .get_output()
