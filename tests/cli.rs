@@ -574,18 +574,6 @@ impl TestEnv {
         write_executable(&self.bin_dir, name, script);
     }
 
-    fn install_local_derive_provider(&self) {
-        let provider = Command::cargo_bin("scriptor-local-derive")
-            .expect("binaire scriptor-local-derive introuvable");
-        let destination = self.bin_dir.join("scriptor-local-derive");
-        fs::copy(provider.get_program(), &destination).expect("copie du Provider local");
-        let mut permissions = fs::metadata(&destination)
-            .expect("lecture des permissions du Provider local")
-            .permissions();
-        permissions.set_mode(0o755);
-        fs::set_permissions(destination, permissions).expect("chmod du Provider local");
-    }
-
     fn write_media_file(&self, name: &str) -> PathBuf {
         let path = self.work_dir.join(name);
         fs::write(&path, b"faux contenu video").expect("écriture du faux fichier média");
@@ -4119,7 +4107,6 @@ fn knowledge_card_covers_social_video_modalities_without_raw_binary() {
 #[test]
 fn shipped_local_provider_derives_an_extractive_knowledge_card() {
     let env = TestEnv::new("shipped-local-knowledge-card");
-    env.install_local_derive_provider();
     let capture_id = create_text_capture(&env);
 
     let created: Value = serde_json::from_slice(
