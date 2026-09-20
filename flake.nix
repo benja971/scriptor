@@ -13,11 +13,10 @@
       };
       lightpanda = pkgs.stdenvNoCC.mkDerivation {
         pname = "lightpanda";
-        version = "1.0.0-nightly.9608+b1ffc164a";
+        version = "0.4.1";
         src = pkgs.fetchurl {
-          url = "https://api.github.com/repos/lightpanda-io/browser/releases/assets/573931479";
-          hash = "sha256-G/yKqvOXE2cb0cqj4yBTc0M8VN4rkkLZYWy5AxyLMcg=";
-          curlOpts = "--header=Accept:application/octet-stream";
+          url = "https://github.com/lightpanda-io/browser/releases/download/0.4.1/lightpanda-x86_64-linux";
+          hash = "sha256-HUCAHnLAvGGyy9PzVivPxG3nt54FaPM/aGtk8uWHYQo=";
         };
         dontUnpack = true;
         installPhase = ''

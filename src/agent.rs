@@ -1,8 +1,9 @@
+use std::collections::HashMap;
 use std::ffi::OsString;
 use std::fs::{self, File, OpenOptions};
 use std::io::{BufReader, Read, Seek, SeekFrom, Write};
 use std::os::unix::process::CommandExt;
-use std::path::{Path, PathBuf};
+use std::path::{Component, Path, PathBuf};
 use std::process::{Command, Stdio};
 use std::thread;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
@@ -14,9 +15,14 @@ use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use sha2::{Digest, Sha256};
 use tantivy::collector::TopDocs;
-use tantivy::query::QueryParser;
-use tantivy::schema::{Field, STORED, STRING, Schema, TEXT, Value as TantivyValue};
+use tantivy::query::{BooleanQuery, BoostQuery, Occur, PhraseQuery, QueryParser, TermQuery};
+use tantivy::schema::{
+    Field, IndexRecordOption, STORED, STRING, Schema, TEXT, Term, TextFieldIndexing, TextOptions,
+    Value as TantivyValue,
+};
+use tantivy::tokenizer::{LowerCaser, SimpleTokenizer, TextAnalyzer};
 use tantivy::{Index, TantivyDocument, doc};
+use unicode_normalization::{UnicodeNormalization, char::is_combining_mark};
 use url::Url;
 
 use crate::config::Config;
@@ -40,6 +46,9 @@ const DEFAULT_PAGE_LIMIT: usize = 20;
 const MAX_PAGE_LIMIT: usize = 100;
 const SEARCH_MAX_CANDIDATES: usize = 500;
 const SEARCH_INDEX_VERSION: u8 = 4;
+const KNOWLEDGE_INDEX_VERSION: u8 = 1;
+const KNOWLEDGE_ANALYZER_VERSION: &str = "knowledge_v1";
+const KNOWLEDGE_PHRASE_BOOST: f32 = 2.0;
 const DEFAULT_READ_LENGTH: usize = 8 * 1024;
 const MAX_READ_LENGTH: usize = 1024 * 1024;
 pub const MANIFEST_FORMAT_VERSION: u8 = 1;
@@ -54,6 +63,7 @@ struct AgentCli {
 #[derive(Subcommand)]
 enum AgentCommand {
     Capture(CaptureCommand),
+    Knowledge(KnowledgeCommand),
     Derive(DeriveCommand),
     Job(JobCommand),
     #[command(name = "capture-worker", hide = true)]
@@ -61,6 +71,35 @@ enum AgentCommand {
         #[arg(long)]
         job_id: String,
     },
+}
+
+#[derive(Args)]
+struct KnowledgeCommand {
+    #[command(subcommand)]
+    command: KnowledgeSubcommand,
+}
+
+#[derive(Subcommand)]
+enum KnowledgeSubcommand {
+    Search {
+        query: String,
+        #[arg(long)]
+        cursor: Option<String>,
+        #[arg(long, default_value_t = DEFAULT_PAGE_LIMIT)]
+        limit: usize,
+    },
+    Index(KnowledgeIndexCommand),
+}
+
+#[derive(Args)]
+struct KnowledgeIndexCommand {
+    #[command(subcommand)]
+    command: KnowledgeIndexSubcommand,
+}
+
+#[derive(Subcommand)]
+enum KnowledgeIndexSubcommand {
+    Rebuild,
 }
 
 #[derive(Args)]
@@ -659,9 +698,120 @@ struct SearchFields {
     text: Field,
 }
 
+struct KnowledgeFields {
+    text: Field,
+    statement_text: Field,
+    statement_kind: Field,
+    reference: Field,
+    statement_id: Field,
+    source_locator: Field,
+    remote_published_at: Field,
+    capture_published_at: Field,
+}
+
+#[derive(Clone, Deserialize, Serialize)]
+struct KnowledgeReference {
+    capture_id: String,
+    artifact_id: String,
+    sha256: String,
+    locator: Option<Locator>,
+}
+
+#[derive(Clone, Deserialize, Serialize)]
+struct KnowledgeResult {
+    text: String,
+    kind: String,
+    reference: KnowledgeReference,
+    statement_id: String,
+    source: KnowledgeSourceSummary,
+    #[serde(skip)]
+    remote_published_at: Option<String>,
+    #[serde(skip)]
+    capture_published_at: u64,
+}
+
+#[derive(Clone, Deserialize, Serialize)]
+struct KnowledgeSourceSummary {
+    locator: String,
+}
+
+#[derive(Serialize)]
+struct KnowledgePage {
+    results: Vec<KnowledgeResult>,
+    next_cursor: Option<String>,
+}
+
+#[derive(Deserialize, Serialize)]
+struct KnowledgeCursor {
+    version: u8,
+    query: String,
+    snapshot: String,
+    position: usize,
+    results: Vec<KnowledgeResult>,
+}
+
+#[derive(Deserialize, Serialize)]
+struct KnowledgeIndexMetadata {
+    version: u8,
+    analyzer: String,
+    snapshot: String,
+}
+
+#[derive(Deserialize)]
+struct KnowledgeDerivativeManifest {
+    recipe: KnowledgeRecipe,
+    artifact: KnowledgeArtifact,
+    reference: KnowledgeReference,
+    created_at: u64,
+}
+
+#[derive(Deserialize, Serialize)]
+struct KnowledgeRecipe {
+    kind: String,
+    target: Value,
+}
+
+#[derive(Deserialize)]
+struct KnowledgeArtifact {
+    path: String,
+}
+
+#[derive(Deserialize)]
+struct KnowledgeCard {
+    format_version: u8,
+    recipe: String,
+    knowledge_core: KnowledgeCore,
+}
+
+#[derive(Deserialize)]
+struct KnowledgeCore {
+    statements: Vec<KnowledgeStatement>,
+}
+
+#[derive(Deserialize)]
+struct KnowledgeStatement {
+    id: String,
+    kind: String,
+    text: String,
+}
+
+struct KnowledgeCardRecord {
+    derivative: KnowledgeDerivativeManifest,
+    statements: Vec<KnowledgeStatement>,
+    supersession_key: String,
+    source_locator: String,
+    remote_published_at: Option<String>,
+    capture_published_at: u64,
+}
+
 #[derive(Serialize)]
 struct RebuiltSearchIndex {
     captures: usize,
+}
+
+#[derive(Serialize)]
+struct RebuiltKnowledgeIndex {
+    cards: usize,
 }
 
 struct ReadRequest {
@@ -677,6 +827,7 @@ pub fn run(arguments: Vec<OsString>) -> Result<()> {
     };
     let result = match cli.command {
         AgentCommand::Capture(command) => run_capture_command(command),
+        AgentCommand::Knowledge(command) => run_knowledge_command(command),
         AgentCommand::Derive(command) => run_derive_command(command),
         AgentCommand::Job(command) => run_job_command(command),
         AgentCommand::CaptureWorker { job_id } => run_worker(&job_id),
@@ -685,6 +836,21 @@ pub fn run(arguments: Vec<OsString>) -> Result<()> {
         Ok(()) => Ok(()),
         Err(error) => print_json(&AgentError {
             error: agent_error(&error),
+        }),
+    }
+}
+
+fn run_knowledge_command(command: KnowledgeCommand) -> Result<()> {
+    match command.command {
+        KnowledgeSubcommand::Search {
+            query,
+            cursor,
+            limit,
+        } => search_knowledge(&query, cursor.as_deref(), limit),
+        KnowledgeSubcommand::Index(KnowledgeIndexCommand {
+            command: KnowledgeIndexSubcommand::Rebuild,
+        }) => print_json(&RebuiltKnowledgeIndex {
+            cards: rebuild_knowledge_index()?,
         }),
     }
 }
@@ -3500,6 +3666,198 @@ fn search_page(mut cursor: SearchCursor, query: &str, limit: usize) -> Result<Se
     })
 }
 
+#[allow(clippy::too_many_lines)]
+fn search_knowledge(query: &str, cursor: Option<&str>, limit: usize) -> Result<()> {
+    validate_page_limit(limit)?;
+    let tokens = knowledge_tokens(query);
+    if tokens.is_empty() {
+        return print_json(&AgentError {
+            error: StructuredError {
+                code: "invalid_request".to_string(),
+                message: "knowledge search query must contain at least one token".to_string(),
+                capability: None,
+            },
+        });
+    }
+    let normalized_query = tokens.join(" ");
+    if let Some(cursor) = cursor {
+        let cursor = decode_knowledge_cursor(cursor)?;
+        let lock = lock_knowledge_index_shared()?;
+        let metadata = read_knowledge_metadata()?;
+        if cursor.version != 1
+            || cursor.query != normalized_query
+            || cursor.snapshot != metadata.snapshot
+            || cursor.position > cursor.results.len()
+        {
+            unlock_knowledge_index(&lock)?;
+            bail!("pagination cursor does not match this operation or snapshot");
+        }
+        let page = knowledge_page(cursor, limit)?;
+        unlock_knowledge_index(&lock)?;
+        return print_json(&page);
+    }
+    let lock = lock_knowledge_index_shared()?;
+    if let Some(error) = read_knowledge_degradation()? {
+        unlock_knowledge_index(&lock)?;
+        return print_json(&AgentError { error });
+    }
+    let metadata = match read_knowledge_metadata() {
+        Ok(metadata) => metadata,
+        Err(error) => {
+            unlock_knowledge_index(&lock)?;
+            return print_json(&AgentError {
+                error: StructuredError {
+                    code: "index_unavailable".to_string(),
+                    message: format!("knowledge Index is unavailable: {error:#}"),
+                    capability: None,
+                },
+            });
+        }
+    };
+    if metadata.version != KNOWLEDGE_INDEX_VERSION
+        || metadata.analyzer != KNOWLEDGE_ANALYZER_VERSION
+    {
+        unlock_knowledge_index(&lock)?;
+        return print_json(&AgentError {
+            error: StructuredError {
+                code: "index_degraded".to_string(),
+                message: "knowledge Index has an unsupported format or analyzer".to_string(),
+                capability: None,
+            },
+        });
+    }
+    let index = match Index::open_in_dir(knowledge_index_path()?) {
+        Ok(index) => index,
+        Err(error) => {
+            unlock_knowledge_index(&lock)?;
+            return print_json(&AgentError {
+                error: StructuredError {
+                    code: "index_unavailable".to_string(),
+                    message: format!("knowledge Index is unavailable: {error}"),
+                    capability: None,
+                },
+            });
+        }
+    };
+    register_knowledge_analyzer(&index);
+    let fields = knowledge_fields(&index.schema())?;
+    let query = knowledge_query(&fields, &tokens);
+    let reader = index
+        .reader()
+        .map_err(|error| anyhow::anyhow!(error))
+        .context("opening knowledge Index reader")?;
+    let searcher = reader.searcher();
+    let result_limit =
+        usize::try_from(searcher.num_docs()).context("counting knowledge statements")?;
+    let hits = searcher
+        .search(&query, &TopDocs::with_limit(result_limit).order_by_score())
+        .map_err(|error| anyhow::anyhow!(error))
+        .context("searching knowledge statements")?;
+    let mut results = hits
+        .into_iter()
+        .map(|(score, address)| {
+            let document: TantivyDocument = searcher
+                .doc(address)
+                .map_err(|error| anyhow::anyhow!(error))
+                .context("reading knowledge Search result")?;
+            Ok((score, knowledge_result_for(&document, &fields)?))
+        })
+        .collect::<Result<Vec<_>>>()?;
+    results.sort_unstable_by(|(left_score, left), (right_score, right)| {
+        right_score
+            .total_cmp(left_score)
+            .then_with(|| knowledge_result_date(right).cmp(&knowledge_result_date(left)))
+            .then_with(|| left.reference.artifact_id.cmp(&right.reference.artifact_id))
+            .then_with(|| left.statement_id.cmp(&right.statement_id))
+    });
+    let page = knowledge_page(
+        KnowledgeCursor {
+            version: 1,
+            query: normalized_query,
+            snapshot: metadata.snapshot,
+            position: 0,
+            results: results.into_iter().map(|(_, result)| result).collect(),
+        },
+        limit,
+    )?;
+    unlock_knowledge_index(&lock)?;
+    print_json(&page)
+}
+
+fn knowledge_page(mut cursor: KnowledgeCursor, limit: usize) -> Result<KnowledgePage> {
+    let end = cursor
+        .position
+        .saturating_add(limit)
+        .min(cursor.results.len());
+    let results = cursor
+        .results
+        .get(cursor.position..end)
+        .context("reading bounded knowledge Search page")?
+        .to_vec();
+    let next_cursor = if end < cursor.results.len() {
+        cursor.position = end;
+        Some(encode_knowledge_cursor(&cursor)?)
+    } else {
+        None
+    };
+    Ok(KnowledgePage {
+        results,
+        next_cursor,
+    })
+}
+
+fn knowledge_result_date(result: &KnowledgeResult) -> (Option<&str>, u64) {
+    (
+        result.remote_published_at.as_deref(),
+        result.capture_published_at,
+    )
+}
+
+fn knowledge_query(fields: &KnowledgeFields, tokens: &[String]) -> BooleanQuery {
+    let mut clauses = tokens
+        .iter()
+        .map(|token| {
+            let query: Box<dyn tantivy::query::Query> = Box::new(TermQuery::new(
+                Term::from_field_text(fields.text, token),
+                IndexRecordOption::WithFreqsAndPositions,
+            ));
+            (Occur::Must, query)
+        })
+        .collect::<Vec<_>>();
+    if tokens.len() > 1 {
+        let phrase = PhraseQuery::new(
+            tokens
+                .iter()
+                .map(|token| Term::from_field_text(fields.text, token))
+                .collect(),
+        );
+        clauses.push((
+            Occur::Should,
+            Box::new(BoostQuery::new(Box::new(phrase), KNOWLEDGE_PHRASE_BOOST)),
+        ));
+    }
+    BooleanQuery::new(clauses)
+}
+
+fn knowledge_tokens(value: &str) -> Vec<String> {
+    let normalized = value
+        .nfd()
+        .filter(|character| !is_combining_mark(*character));
+    let mut tokens = Vec::new();
+    let mut token = String::new();
+    for character in normalized.flat_map(char::to_lowercase) {
+        if character.is_alphanumeric() {
+            token.push(character);
+        } else if !token.is_empty() {
+            tokens.push(std::mem::take(&mut token));
+        }
+    }
+    if !token.is_empty() {
+        tokens.push(token);
+    }
+    tokens
+}
+
 fn read_artifact(
     capture_id: Option<&str>,
     artifact_id: Option<&str>,
@@ -3716,6 +4074,380 @@ fn rebuild_search_index() -> Result<usize> {
     clear_index_degradation()?;
     unlock_search_index(&lock)?;
     Ok(count)
+}
+
+fn rebuild_knowledge_index() -> Result<usize> {
+    let lock = lock_knowledge_index()?;
+    let result = (|| {
+        let records = knowledge_card_records()?;
+        let count = records.len();
+        write_knowledge_index(&records)?;
+        clear_knowledge_degradation()?;
+        Ok(count)
+    })();
+    unlock_knowledge_index(&lock)?;
+    result
+}
+
+fn knowledge_index_path() -> Result<PathBuf> {
+    Ok(repository_dir()?.join("knowledge-index"))
+}
+
+fn knowledge_metadata_path() -> Result<PathBuf> {
+    Ok(knowledge_index_path()?.join("metadata.json"))
+}
+
+fn knowledge_status_path() -> Result<PathBuf> {
+    Ok(repository_dir()?.join("knowledge-index-status.json"))
+}
+
+fn lock_knowledge_index() -> Result<File> {
+    let directory = repository_dir()?;
+    fs::create_dir_all(&directory)
+        .with_context(|| format!("creating knowledge Index directory {}", directory.display()))?;
+    let path = directory.join("knowledge-index.lock");
+    let file = OpenOptions::new()
+        .create(true)
+        .truncate(false)
+        .write(true)
+        .open(&path)
+        .with_context(|| format!("opening knowledge Index lock {}", path.display()))?;
+    file.lock_exclusive().context("locking knowledge Index")?;
+    Ok(file)
+}
+
+fn lock_knowledge_index_shared() -> Result<File> {
+    let directory = repository_dir()?;
+    fs::create_dir_all(&directory)
+        .with_context(|| format!("creating knowledge Index directory {}", directory.display()))?;
+    let path = directory.join("knowledge-index.lock");
+    let file = OpenOptions::new()
+        .create(true)
+        .truncate(false)
+        .read(true)
+        .write(true)
+        .open(&path)
+        .with_context(|| format!("opening knowledge Index lock {}", path.display()))?;
+    file.lock_shared()
+        .context("locking knowledge Index for reading")?;
+    Ok(file)
+}
+
+fn unlock_knowledge_index(file: &File) -> Result<()> {
+    FileExt::unlock(file).context("unlocking knowledge Index")
+}
+
+fn knowledge_card_records() -> Result<Vec<KnowledgeCardRecord>> {
+    let mut records = Vec::new();
+    for manifest in list_manifests()? {
+        let derivatives_dir = captures_dir()?
+            .join(&manifest.capture_id)
+            .join("derivatives");
+        if !derivatives_dir.try_exists().with_context(|| {
+            format!(
+                "checking Derivative directory {}",
+                derivatives_dir.display()
+            )
+        })? {
+            continue;
+        }
+        for entry in fs::read_dir(&derivatives_dir)
+            .with_context(|| format!("listing Derivatives in {}", derivatives_dir.display()))?
+        {
+            let entry = entry.context("reading Derivative directory entry")?;
+            if !entry
+                .file_type()
+                .context("reading Derivative entry type")?
+                .is_dir()
+                || entry.file_name().to_string_lossy().starts_with('.')
+            {
+                continue;
+            }
+            let derivative: KnowledgeDerivativeManifest =
+                read_json(&entry.path().join("manifest.json"))?;
+            if derivative.recipe.kind != "knowledge-card" {
+                continue;
+            }
+            let artifact_path = knowledge_artifact_path(
+                &captures_dir()?.join(&manifest.capture_id),
+                &derivative.artifact.path,
+            )?;
+            let card: KnowledgeCard = read_json(&artifact_path)?;
+            if card.format_version != 1 || card.recipe != "knowledge-card" {
+                bail!("knowledge Index has an unsupported knowledge-card format");
+            }
+            let supersession_key = knowledge_supersession_key(&manifest)?;
+            records.push(KnowledgeCardRecord {
+                derivative,
+                statements: card.knowledge_core.statements,
+                supersession_key,
+                source_locator: manifest.source.locator.clone(),
+                remote_published_at: manifest
+                    .remote_provenance
+                    .as_ref()
+                    .and_then(|remote| remote.published_at.clone()),
+                capture_published_at: manifest.published_at,
+            });
+        }
+    }
+    Ok(active_knowledge_cards(records))
+}
+
+fn knowledge_artifact_path(capture_dir: &Path, artifact_path: &str) -> Result<PathBuf> {
+    let relative = Path::new(artifact_path);
+    if relative.is_absolute()
+        || relative
+            .components()
+            .any(|component| !matches!(component, Component::Normal(_)))
+    {
+        bail!("invalid artifact path in knowledge Derivative manifest");
+    }
+    Ok(capture_dir.join(relative))
+}
+
+fn active_knowledge_cards(mut records: Vec<KnowledgeCardRecord>) -> Vec<KnowledgeCardRecord> {
+    records.sort_unstable_by(|left, right| {
+        left.supersession_key
+            .cmp(&right.supersession_key)
+            .then_with(|| left.derivative.created_at.cmp(&right.derivative.created_at))
+            .then_with(|| {
+                left.derivative
+                    .reference
+                    .artifact_id
+                    .cmp(&right.derivative.reference.artifact_id)
+            })
+    });
+    let mut active = HashMap::new();
+    for record in records {
+        active.insert(record.supersession_key.clone(), record);
+    }
+    active.into_values().collect()
+}
+
+fn knowledge_supersession_key(manifest: &Manifest) -> Result<String> {
+    let source_identity = manifest
+        .remote_provenance
+        .as_ref()
+        .and_then(|remote| {
+            remote
+                .platform
+                .as_ref()
+                .zip(remote.post_id.as_ref())
+                .map(|(platform, post_id)| format!("social:{platform}:{post_id}"))
+        })
+        .unwrap_or_else(|| format!("source:{}", manifest.source.sha256));
+    let mut proof_hashes = vec![manifest.proof.sha256.clone()];
+    proof_hashes.extend(manifest.artifacts.iter().map(|proof| proof.sha256.clone()));
+    proof_hashes.sort_unstable();
+    let observed_state = sha256_bytes(
+        &serde_json::to_vec(&proof_hashes).context("serializing knowledge observed state")?,
+    );
+    // The target is an execution detail (and may contain References to a
+    // Capture), not part of the Recipe identity used for supersession.
+    Ok(format!(
+        "knowledge-card@1|{source_identity}|{observed_state}"
+    ))
+}
+
+fn write_knowledge_index(records: &[KnowledgeCardRecord]) -> Result<()> {
+    let path = knowledge_index_path()?;
+    let temporary = path.with_file_name(format!(".knowledge-index-{}", unique_id()));
+    fs::create_dir_all(&temporary)
+        .with_context(|| format!("creating knowledge Index {}", temporary.display()))?;
+    let result = (|| {
+        let mut schema_builder = Schema::builder();
+        let text_options = TextOptions::default().set_indexing_options(
+            TextFieldIndexing::default()
+                .set_tokenizer(KNOWLEDGE_ANALYZER_VERSION)
+                .set_index_option(IndexRecordOption::WithFreqsAndPositions),
+        );
+        let text = schema_builder.add_text_field("text", text_options);
+        let statement_text = schema_builder.add_text_field("statement_text", STORED);
+        let statement_kind = schema_builder.add_text_field("statement_kind", STRING | STORED);
+        let reference = schema_builder.add_text_field("reference", STORED);
+        let statement_id = schema_builder.add_text_field("statement_id", STRING | STORED);
+        let source_locator = schema_builder.add_text_field("source_locator", STORED);
+        let remote_published_at = schema_builder.add_text_field("remote_published_at", STORED);
+        let capture_published_at = schema_builder.add_u64_field("capture_published_at", STORED);
+        let index = Index::create_in_dir(&temporary, schema_builder.build())
+            .map_err(|error| anyhow::anyhow!(error))
+            .context("creating knowledge Index")?;
+        register_knowledge_analyzer(&index);
+        let mut writer = index
+            .writer(50_000_000)
+            .map_err(|error| anyhow::anyhow!(error))
+            .context("creating knowledge Index writer")?;
+        for record in records {
+            let remote_published_at_value =
+                record.remote_published_at.as_deref().unwrap_or_default();
+            let reference_json = serde_json::to_string(&record.derivative.reference)
+                .context("serializing knowledge Card Reference")?;
+            for statement in &record.statements {
+                let text_tokens = knowledge_tokens(&statement.text);
+                if text_tokens.is_empty() {
+                    continue;
+                }
+                writer
+                    .add_document(doc!(
+                        text => text_tokens.join(" "),
+                        statement_text => statement.text.clone(),
+                        statement_kind => statement.kind.clone(),
+                        reference => reference_json.clone(),
+                        statement_id => statement.id.clone(),
+                        source_locator => record.source_locator.clone(),
+                        remote_published_at => remote_published_at_value,
+                        capture_published_at => record.capture_published_at,
+                    ))
+                    .map_err(|error| anyhow::anyhow!(error))
+                    .context("indexing knowledge statement")?;
+            }
+        }
+        writer
+            .commit()
+            .map_err(|error| anyhow::anyhow!(error))
+            .context("publishing knowledge Index")?;
+        let metadata = KnowledgeIndexMetadata {
+            version: KNOWLEDGE_INDEX_VERSION,
+            analyzer: KNOWLEDGE_ANALYZER_VERSION.to_string(),
+            snapshot: unique_id(),
+        };
+        write_json(&temporary.join("metadata.json"), &metadata)
+            .context("writing knowledge Index metadata")?;
+        if path
+            .try_exists()
+            .context("checking previous knowledge Index")?
+        {
+            let previous =
+                path.with_file_name(format!(".knowledge-index-previous-{}", unique_id()));
+            fs::rename(&path, &previous)
+                .with_context(|| format!("staging previous knowledge Index {}", path.display()))?;
+            fs::rename(&temporary, &path)
+                .with_context(|| format!("publishing knowledge Index {}", path.display()))?;
+            fs::remove_dir_all(&previous).with_context(|| {
+                format!("removing previous knowledge Index {}", previous.display())
+            })?;
+        } else {
+            fs::rename(&temporary, &path)
+                .with_context(|| format!("publishing knowledge Index {}", path.display()))?;
+        }
+        Ok(())
+    })();
+    if result.is_err() {
+        drop(fs::remove_dir_all(&temporary));
+    }
+    result
+}
+
+fn register_knowledge_analyzer(index: &Index) {
+    index.tokenizers().register(
+        KNOWLEDGE_ANALYZER_VERSION,
+        TextAnalyzer::builder(SimpleTokenizer::default())
+            .filter(LowerCaser)
+            .build(),
+    );
+}
+
+fn knowledge_fields(schema: &Schema) -> Result<KnowledgeFields> {
+    Ok(KnowledgeFields {
+        text: schema
+            .get_field("text")
+            .context("reading knowledge text field")?,
+        statement_text: schema
+            .get_field("statement_text")
+            .context("reading knowledge statement_text field")?,
+        statement_kind: schema
+            .get_field("statement_kind")
+            .context("reading knowledge statement_kind field")?,
+        reference: schema
+            .get_field("reference")
+            .context("reading knowledge reference field")?,
+        statement_id: schema
+            .get_field("statement_id")
+            .context("reading knowledge statement_id field")?,
+        source_locator: schema
+            .get_field("source_locator")
+            .context("reading knowledge source_locator field")?,
+        remote_published_at: schema
+            .get_field("remote_published_at")
+            .context("reading knowledge remote_published_at field")?,
+        capture_published_at: schema
+            .get_field("capture_published_at")
+            .context("reading knowledge capture_published_at field")?,
+    })
+}
+
+fn knowledge_result_for(
+    document: &TantivyDocument,
+    fields: &KnowledgeFields,
+) -> Result<KnowledgeResult> {
+    let remote_published_at =
+        stored_search_string(document, fields.remote_published_at, "remote_published_at")?;
+    Ok(KnowledgeResult {
+        text: stored_search_string(document, fields.statement_text, "statement_text")?,
+        kind: stored_search_string(document, fields.statement_kind, "statement_kind")?,
+        reference: serde_json::from_str(&stored_search_string(
+            document,
+            fields.reference,
+            "reference",
+        )?)
+        .context("parsing knowledge Card Reference")?,
+        statement_id: stored_search_string(document, fields.statement_id, "statement_id")?,
+        source: KnowledgeSourceSummary {
+            locator: stored_search_string(document, fields.source_locator, "source_locator")?,
+        },
+        remote_published_at: (!remote_published_at.is_empty()).then_some(remote_published_at),
+        capture_published_at: document
+            .get_first(fields.capture_published_at)
+            .and_then(|value| TantivyValue::as_u64(&value))
+            .context("reading stored knowledge capture_published_at")?,
+    })
+}
+
+fn read_knowledge_metadata() -> Result<KnowledgeIndexMetadata> {
+    read_json(&knowledge_metadata_path()?).context("reading knowledge Index metadata")
+}
+
+#[allow(dead_code)]
+fn record_knowledge_degradation(error: &anyhow::Error) {
+    let result = (|| -> Result<()> {
+        let directory = repository_dir()?;
+        fs::create_dir_all(&directory).context("creating knowledge Index status directory")?;
+        write_json(
+            &knowledge_status_path()?,
+            &AgentError {
+                error: StructuredError {
+                    code: "index_degraded".to_string(),
+                    message: format!("{error:#}"),
+                    capability: None,
+                },
+            },
+        )
+    })();
+    drop(result);
+}
+
+fn clear_knowledge_degradation() -> Result<()> {
+    let path = knowledge_status_path()?;
+    if path
+        .try_exists()
+        .context("checking knowledge Index status")?
+    {
+        fs::remove_file(&path)
+            .with_context(|| format!("clearing knowledge Index status {}", path.display()))?;
+    }
+    Ok(())
+}
+
+fn read_knowledge_degradation() -> Result<Option<StructuredError>> {
+    let path = knowledge_status_path()?;
+    if !path
+        .try_exists()
+        .context("checking knowledge Index status")?
+    {
+        return Ok(None);
+    }
+    let status: AgentError = read_json(&path)?;
+    Ok(Some(status.error))
 }
 
 fn search_index_path() -> Result<PathBuf> {
@@ -4013,6 +4745,26 @@ fn encode_search_cursor(cursor: &SearchCursor) -> Result<String> {
 fn decode_search_cursor(cursor: &str) -> Result<SearchCursor> {
     let id = cursor
         .strip_prefix("v2-")
+        .context("invalid pagination cursor")?;
+    if id.is_empty()
+        || !id
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || byte == b'-')
+    {
+        bail!("invalid pagination cursor");
+    }
+    read_json(&cursor_path(id)?).context("invalid pagination cursor")
+}
+
+fn encode_knowledge_cursor(cursor: &KnowledgeCursor) -> Result<String> {
+    let id = unique_id();
+    write_json(&cursor_path(&id)?, cursor)?;
+    Ok(format!("v3-{id}"))
+}
+
+fn decode_knowledge_cursor(cursor: &str) -> Result<KnowledgeCursor> {
+    let id = cursor
+        .strip_prefix("v3-")
         .context("invalid pagination cursor")?;
     if id.is_empty()
         || !id

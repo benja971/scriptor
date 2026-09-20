@@ -775,6 +775,42 @@ fn run_derive(env: &TestEnv, capture_id: &str, recipe: &str, output: &Value) -> 
     )
 }
 
+fn run_derive_reference(
+    env: &TestEnv,
+    capture_id: &str,
+    recipe: &str,
+    reference: &Value,
+    output: &Value,
+) -> Value {
+    env.install_binary("scriptor-local-derive", &structured_derive_provider(output));
+    let created: Value = serde_json::from_slice(
+        &env.command()
+            .args([
+                "derive",
+                capture_id,
+                "--recipe",
+                recipe,
+                "--provider",
+                "scriptor-local-derive",
+                "--policy",
+                "safe-local@1",
+                "--reference",
+                &reference.to_string(),
+            ])
+            .assert()
+            .success()
+            .get_output()
+            .stdout,
+    )
+    .expect("Job de Derive référencé JSON valide");
+    wait_for_agent_job(
+        env,
+        created["job"]["job_id"]
+            .as_str()
+            .expect("identifiant de Job de Derive référencé"),
+    )
+}
+
 fn run_structured_derive(env: &TestEnv, capture_id: &str, output: &Value) -> Value {
     run_derive(env, capture_id, "structured-summary", output)
 }
@@ -829,9 +865,16 @@ fn artifact_reference(capture_id: &str, capture: &Value, artifact_id: &str) -> V
 }
 
 fn create_text_capture(env: &TestEnv) -> String {
-    let source = env.work_dir.join("notes.txt");
-    fs::write(&source, "Une preuve locale.\nEt son contexte utile.\n")
-        .expect("ecriture de la Source texte");
+    create_text_capture_with_content(
+        env,
+        "notes.txt",
+        "Une preuve locale.\nEt son contexte utile.\n",
+    )
+}
+
+fn create_text_capture_with_content(env: &TestEnv, name: &str, content: &str) -> String {
+    let source = env.work_dir.join(name);
+    fs::write(&source, content).expect("ecriture de la Source texte");
     let created: Value = serde_json::from_slice(
         &env.command()
             .args([
@@ -855,6 +898,103 @@ fn create_text_capture(env: &TestEnv) -> String {
         .as_str()
         .expect("identifiant de Capture")
         .to_string()
+}
+
+fn create_instagram_photo_capture(env: &TestEnv, locator: &str) -> String {
+    let created: Value = serde_json::from_slice(
+        &env.command()
+            .args(["capture", locator, "--policy", "safe-web@1"])
+            .assert()
+            .success()
+            .get_output()
+            .stdout,
+    )
+    .expect("Job de Capture sociale JSON valide");
+    let job = wait_for_agent_job(
+        env,
+        created["job"]["job_id"]
+            .as_str()
+            .expect("identifiant de Job social"),
+    );
+    assert_eq!(job["state"], "succeeded", "{job}");
+    job["capture_id"]
+        .as_str()
+        .expect("identifiant de Capture sociale")
+        .to_string()
+}
+
+fn publish_knowledge_card(env: &TestEnv, capture_id: &str, statements: &[Value]) -> (Value, Value) {
+    let capture = inspect_agent_capture(env, capture_id);
+    let reference = serde_json::json!({
+        "capture_id": capture_id,
+        "artifact_id": capture["manifest"]["proof"]["artifact_id"],
+        "sha256": capture["manifest"]["proof"]["sha256"],
+        "locator": capture["manifest"]["proof"]["locator"],
+    });
+    let output = serde_json::json!({
+        "format_version": 1,
+        "recipe": "knowledge-card",
+        "knowledge_core": {
+            "coverage": [{
+                "reference": reference,
+                "state": "examined",
+                "reason": "fixture-reviewed",
+            }],
+            "statements": statements,
+        },
+    });
+    let finished = run_derive(env, capture_id, "knowledge-card", &output);
+    assert_eq!(finished["state"], "succeeded", "{finished}");
+    let published = inspect_agent_capture(env, capture_id);
+    let derivative = published["derivatives"]
+        .as_array()
+        .and_then(|derivatives| {
+            derivatives
+                .iter()
+                .find(|derivative| derivative["derive_id"] == finished["derive_id"])
+        })
+        .cloned()
+        .expect("Fiche publiée");
+    (derivative, output)
+}
+
+fn publish_knowledge_card_from_reference(
+    env: &TestEnv,
+    capture_id: &str,
+    reference: &Value,
+    statements: &[Value],
+) {
+    let output = serde_json::json!({
+        "format_version": 1,
+        "recipe": "knowledge-card",
+        "knowledge_core": {
+            "coverage": [{
+                "reference": reference,
+                "state": "examined",
+                "reason": "fixture-reviewed",
+            }],
+            "statements": statements,
+        },
+    });
+    let finished = run_derive_reference(env, capture_id, "knowledge-card", reference, &output);
+    assert_eq!(finished["state"], "succeeded", "{finished}");
+}
+
+fn knowledge_statement(id: &str, kind: &str, text: &str, reference: &Value) -> Value {
+    let mut statement = serde_json::json!({
+        "id": id,
+        "kind": kind,
+        "text": text,
+        "anchors": [{"reference": reference}],
+    });
+    if kind == "interpretation" {
+        statement["premises"] = serde_json::json!(["declaration"]);
+    }
+    if kind == "uncertainty" {
+        statement["limitation"] =
+            serde_json::json!("La Capture ne permet pas de confirmer ce point.");
+    }
+    statement
 }
 
 fn assert_readable_transcription(env: &TestEnv, capture_id: &str, capture: &Value) {
@@ -3415,6 +3555,361 @@ fn knowledge_card_publishes_a_versioned_sourced_knowledge_core() {
         serde_json::from_str(read["content"]["text"].as_str().expect("Fiche texte"))
             .expect("Fiche JSON valide");
     assert_eq!(published, output);
+}
+
+#[test]
+fn knowledge_search_returns_complete_statements_with_minimal_provenance() {
+    let env = TestEnv::new("knowledge-search-contract");
+    let capture_id =
+        create_text_capture_with_content(&env, "source.txt", "Contenu brut distinct.\n");
+    let capture = inspect_agent_capture(&env, &capture_id);
+    let reference = artifact_reference(&capture_id, &capture, "proof-source");
+    let kinds = [
+        ("declaration", "attributed-declaration"),
+        ("observation", "observation"),
+        ("recommendation", "attributed-recommendation"),
+        ("interpretation", "interpretation"),
+        ("uncertainty", "uncertainty"),
+    ];
+    let statements: Vec<Value> = kinds
+        .iter()
+        .map(|(id, kind)| {
+            let text = if *id == "declaration" {
+                "École mobile : énoncé directement formulé et entièrement conservé.".to_string()
+            } else {
+                format!("École pour usage mobile : énoncé de type {id} entièrement conservé.")
+            };
+            knowledge_statement(id, kind, &text, &reference)
+        })
+        .collect();
+    let (card, expected) = publish_knowledge_card(&env, &capture_id, &statements);
+
+    let found: Value = serde_json::from_slice(
+        &env.command()
+            .args(["knowledge", "search", "ECOLE-mobile"])
+            .assert()
+            .success()
+            .get_output()
+            .stdout,
+    )
+    .expect("résultats JSON valides");
+    let results = found["results"]
+        .as_array()
+        .expect("Résultats de connaissance");
+    assert_eq!(results.len(), kinds.len());
+    assert_eq!(
+        results
+            .iter()
+            .map(|result| result["kind"].as_str())
+            .collect::<std::collections::BTreeSet<_>>(),
+        kinds
+            .iter()
+            .map(|(_, kind)| Some(*kind))
+            .collect::<std::collections::BTreeSet<_>>()
+    );
+    assert_eq!(results[0]["statement_id"], "declaration");
+    for result in results {
+        assert!(
+            result["text"]
+                .as_str()
+                .is_some_and(|text| text.contains("entièrement conservé"))
+        );
+        assert_eq!(result["reference"], card["reference"]);
+        assert!(result["statement_id"].is_string());
+        assert!(result["source"]["locator"].is_string());
+        assert!(result.get("score").is_none());
+        assert!(result.get("anchors").is_none());
+        assert!(result.get("coverage").is_none());
+    }
+
+    let read: Value = serde_json::from_slice(
+        &env.command()
+            .args([
+                "capture",
+                "read",
+                "--reference",
+                results[0]["reference"].to_string().as_str(),
+            ])
+            .assert()
+            .success()
+            .get_output()
+            .stdout,
+    )
+    .expect("lecture de Fiche JSON valide");
+    let published: Value = serde_json::from_str(
+        read["content"]["text"]
+            .as_str()
+            .expect("Fiche de connaissance texte"),
+    )
+    .expect("Fiche de connaissance JSON valide");
+    assert_eq!(published, expected);
+    assert!(published["knowledge_core"]["statements"][0]["anchors"].is_array());
+
+    let all_words: Value = serde_json::from_slice(
+        &env.command()
+            .args(["knowledge", "search", "ecole absente"])
+            .assert()
+            .success()
+            .get_output()
+            .stdout,
+    )
+    .expect("page vide JSON valide");
+    assert!(all_words["results"].as_array().is_some_and(Vec::is_empty));
+    env.command()
+        .args(["knowledge", "search", "!!!"])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("\"code\":\"invalid_request\""));
+}
+
+#[test]
+fn knowledge_search_paginates_stably_and_rebuilds_its_projection() {
+    let env = TestEnv::new("knowledge-search-pagination");
+    let capture_id = create_text_capture_with_content(&env, "pagination.txt", "Source brute.\n");
+    let capture = inspect_agent_capture(&env, &capture_id);
+    let reference = artifact_reference(&capture_id, &capture, "proof-source");
+    let statements: Vec<Value> = (0..21)
+        .map(|number| {
+            knowledge_statement(
+                &format!("statement-{number:02}"),
+                "observation",
+                &format!("Pagination stable needle {number:02}."),
+                &reference,
+            )
+        })
+        .collect();
+    publish_knowledge_card(&env, &capture_id, &statements);
+
+    let first: Value = serde_json::from_slice(
+        &env.command()
+            .args(["knowledge", "search", "needle"])
+            .assert()
+            .success()
+            .get_output()
+            .stdout,
+    )
+    .expect("première page JSON valide");
+    let first_results = first["results"].as_array().expect("première page");
+    assert_eq!(first_results.len(), 20);
+    let cursor = first["next_cursor"].as_str().expect("curseur opaque");
+    let second: Value = serde_json::from_slice(
+        &env.command()
+            .args(["knowledge", "search", "needle", "--cursor", cursor])
+            .assert()
+            .success()
+            .get_output()
+            .stdout,
+    )
+    .expect("seconde page JSON valide");
+    let second_results = second["results"].as_array().expect("seconde page");
+    assert_eq!(second_results.len(), 1);
+    assert!(second["next_cursor"].is_null());
+    let ids = first_results
+        .iter()
+        .chain(second_results)
+        .map(|result| {
+            result["statement_id"]
+                .as_str()
+                .expect("identifiant d'Énoncé")
+        })
+        .collect::<std::collections::BTreeSet<_>>();
+    assert_eq!(ids.len(), 21);
+
+    env.command()
+        .args(["knowledge", "search", "different", "--cursor", cursor])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("\"code\":\"invalid_cursor\""));
+    env.command()
+        .args(["knowledge", "search", "needle", "--limit", "101"])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("\"code\":\"invalid_pagination\""));
+
+    env.command()
+        .args(["knowledge", "index", "rebuild"])
+        .assert()
+        .success();
+    env.command()
+        .args(["knowledge", "search", "needle", "--cursor", cursor])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("\"code\":\"invalid_cursor\""));
+    let rebuilt: Value = serde_json::from_slice(
+        &env.command()
+            .args(["knowledge", "search", "needle", "--limit", "100"])
+            .assert()
+            .success()
+            .get_output()
+            .stdout,
+    )
+    .expect("résultats reconstruits JSON valides");
+    assert_eq!(rebuilt["results"].as_array().map(Vec::len), Some(21));
+}
+
+#[test]
+fn knowledge_search_keeps_only_the_latest_card_for_one_observed_state() {
+    let env = TestEnv::new("knowledge-search-supersession");
+    let capture_id = create_text_capture_with_content(&env, "state.txt", "Preuve stable.\n");
+    let capture = inspect_agent_capture(&env, &capture_id);
+    let reference = artifact_reference(&capture_id, &capture, "proof-source");
+    let first = knowledge_statement(
+        "same-state",
+        "observation",
+        "Connaissance needle de la première Fiche.",
+        &reference,
+    );
+    let second = knowledge_statement(
+        "same-state",
+        "observation",
+        "Connaissance needle de la dernière Fiche.",
+        &reference,
+    );
+    let (first_card, _) = publish_knowledge_card(&env, &capture_id, &[first]);
+    let (second_card, _) = publish_knowledge_card(&env, &capture_id, &[second]);
+
+    let found: Value = serde_json::from_slice(
+        &env.command()
+            .args(["knowledge", "search", "needle"])
+            .assert()
+            .success()
+            .get_output()
+            .stdout,
+    )
+    .expect("résultat de supersession JSON valide");
+    let results = found["results"]
+        .as_array()
+        .expect("résultats de connaissance");
+    assert_eq!(results.len(), 1);
+    assert_eq!(results[0]["reference"], second_card["reference"]);
+    assert!(
+        results[0]["text"]
+            .as_str()
+            .is_some_and(|text| text.contains("dernière"))
+    );
+
+    for card in [&first_card, &second_card] {
+        env.command()
+            .args([
+                "capture",
+                "read",
+                "--reference",
+                &card["reference"].to_string(),
+            ])
+            .assert()
+            .success();
+    }
+}
+
+#[test]
+fn knowledge_search_returns_structured_errors_for_unavailable_and_degraded_indexes() {
+    let env = TestEnv::new("knowledge-search-index-errors");
+    let capture_id = create_text_capture_with_content(&env, "errors.txt", "Preuve locale.\n");
+    let capture = inspect_agent_capture(&env, &capture_id);
+    let reference = artifact_reference(&capture_id, &capture, "proof-source");
+    publish_knowledge_card(
+        &env,
+        &capture_id,
+        &[knowledge_statement(
+            "error-state",
+            "observation",
+            "Index needle test.",
+            &reference,
+        )],
+    );
+    let repository = env.xdg_data.join("scriptor/v2");
+    fs::remove_dir_all(repository.join("knowledge-index"))
+        .expect("suppression contrôlée de l'Index de fixture");
+    env.command()
+        .args(["knowledge", "search", "needle"])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("\"code\":\"index_unavailable\""));
+
+    env.command()
+        .args(["knowledge", "index", "rebuild"])
+        .assert()
+        .success();
+    fs::write(
+        repository.join("knowledge-index/metadata.json"),
+        br#"{"version":99,"analyzer":"unknown","snapshot":"fixture"}"#,
+    )
+    .expect("écriture de metadata dégradée de fixture");
+    env.command()
+        .args(["knowledge", "search", "needle"])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("\"code\":\"index_degraded\""));
+}
+
+#[test]
+fn knowledge_search_social_variants_supersede_only_when_their_proofs_match() {
+    let env = TestEnv::new("knowledge-search-social-supersession");
+    env.install_binary("yt-dlp", FAKE_INSTAGRAM_YT_DLP);
+    env.install_binary("scriptor-binary-acquirer", FAKE_INSTAGRAM_BINARY_ACQUIRER);
+    env.install_binary("scriptor-page-renderer", "#!/bin/sh\nexit 99\n");
+
+    let first_id = create_instagram_photo_capture(&env, "https://www.instagram.com/p/post-1/");
+    let second_id = create_instagram_photo_capture(
+        &env,
+        "https://www.instagram.com/p/post-1/?utm_source=fixture",
+    );
+    for (capture_id, text) in [
+        (&first_id, "Même post needle, première variante."),
+        (&second_id, "Même post needle, variante la plus récente."),
+    ] {
+        let capture = inspect_agent_capture(&env, capture_id);
+        let reference = artifact_reference(capture_id, &capture, "proof-instagram-metadata");
+        publish_knowledge_card_from_reference(
+            &env,
+            capture_id,
+            &reference,
+            &[knowledge_statement("post", "observation", text, &reference)],
+        );
+    }
+    let same_state: Value = serde_json::from_slice(
+        &env.command()
+            .args(["knowledge", "search", "post needle"])
+            .assert()
+            .success()
+            .get_output()
+            .stdout,
+    )
+    .expect("résultat social JSON valide");
+    assert_eq!(same_state["results"].as_array().map(Vec::len), Some(1));
+
+    env.install_binary(
+        "yt-dlp",
+        &FAKE_INSTAGRAM_YT_DLP.replace("Caption Instagram complete", "Caption modifiee"),
+    );
+    let changed_id = create_instagram_photo_capture(
+        &env,
+        "https://www.instagram.com/p/post-1/?utm_source=changed-proof",
+    );
+    let changed_capture = inspect_agent_capture(&env, &changed_id);
+    let changed_reference =
+        artifact_reference(&changed_id, &changed_capture, "proof-instagram-metadata");
+    publish_knowledge_card_from_reference(
+        &env,
+        &changed_id,
+        &changed_reference,
+        &[knowledge_statement(
+            "post",
+            "observation",
+            "Même post needle, état de preuve modifié.",
+            &changed_reference,
+        )],
+    );
+    let changed_state: Value = serde_json::from_slice(
+        &env.command()
+            .args(["knowledge", "search", "post needle"])
+            .assert()
+            .success()
+            .get_output()
+            .stdout,
+    )
+    .expect("résultats social modifiés JSON valides");
+    assert_eq!(changed_state["results"].as_array().map(Vec::len), Some(2));
 }
 
 #[test]

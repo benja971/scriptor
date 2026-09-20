@@ -128,6 +128,56 @@ Le stockage local des Captures, Jobs, index et Dérivés.
 La projection reconstruisible des contenus publiés par le Référentiel. Elle
 accélère la recherche sans posséder les Captures ni leurs preuves.
 
+**Recherche de connaissance**:
+La capacité qui retrouve des Énoncés attribués publiés, reliés à leur Fiche,
+leurs Ancrages de preuve et leur Source. Elle répond à une recherche
+d'information, pas à une recherche de fichiers ou d'Artefacts bruts. Elle
+retourne une collection complète d'informations correspondantes, ordonnée par
+Pertinence lexicale, sans la réduire à une réponse unique.
+
+**Pertinence lexicale**:
+L'ordre des Résultats de connaissance selon leur correspondance textuelle avec
+la recherche, renforcée lorsqu'une phrase entière correspond. Cette
+correspondance ignore la casse et les accents. Elle ne mesure ni la vérité
+externe, ni l'autorité ou la valeur générale d'une Source.
+
+**Requête de connaissance**:
+Le texte littéral qui demande une Recherche de connaissance. Tous ses mots
+doivent correspondre, sans opérateur ni syntaxe spéciale ; une Requête vide est
+invalide.
+
+**Résultat de connaissance**:
+L'Énoncé attribué individuel retourné par une Recherche de connaissance, avec
+son type, sa Fiche et un résumé minimal de sa Source. Ses Ancrages de preuve
+complets restent lisibles dans sa Fiche. Chaque Énoncé correspondant est un
+Résultat distinct, sans être regroupé avec les autres Énoncés de sa Fiche.
+
+**Identité logique de Source**:
+L'identité stable qui permet de comparer plusieurs Captures d'une même Source.
+Pour une publication sociale, elle est la plateforme et l'identifiant du post
+capturés ; à défaut, elle réutilise l'identité de Source existante. Elle reste
+distincte du Locator saisi, dont plusieurs variantes peuvent viser un même post.
+
+**État observé de Source**:
+Le contenu immuable effectivement conservé d'une Source lors d'une Capture,
+indépendamment de la date d'acquisition et de la Fiche qui l'exploite. Deux
+Captures de même Identité logique de Source ont le même État observé lorsque
+leurs preuves de contenu sont identiques ; une modification de ces preuves crée
+un nouvel État.
+
+**Supersession de Fiche**:
+La relation automatique où une Fiche de connaissance plus récente, issue du
+même État observé de Source et de la même Recette, remplace une Fiche antérieure
+dans la Recherche de connaissance. Une modification de l'État observé produit
+une Fiche distincte, qui ne la supersède pas. La Fiche supersédée demeure
+immuable, lisible et vérifiable par sa Référence.
+
+**Réponse à question**:
+L'usage externe où un Agent sélectionne des résultats de Recherche de
+connaissance, les interprète et peut effectuer d'autres recherches. Elle ne
+fait pas partie de Scriptor et ne transforme pas ses résultats en nouvelle
+affirmation publiée.
+
 **Job**:
 L’exécution persistante d’une Capture ou d’un Dérivé. Il expose son état et
 ses erreurs structurées.
