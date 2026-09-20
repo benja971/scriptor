@@ -2391,16 +2391,25 @@ fn capture_admission_enforces_concurrency_before_launching_a_provider() {
         Duration::from_secs(1)
     ));
     assert!(wait_for_file(&started, Duration::from_secs(1)));
-    env.command()
+    let mut second_worker = std::process::Command::new(env!("CARGO_BIN_EXE_scriptor"))
+        .env("PATH", &env.bin_dir)
+        .env("XDG_CONFIG_HOME", &env.xdg_config)
+        .env("XDG_CACHE_HOME", &env.xdg_cache)
+        .env("XDG_DATA_HOME", &env.xdg_data)
         .args(["capture-worker", "--job-id", "job-62"])
-        .assert()
-        .success();
+        .spawn()
+        .expect("lancement du second Worker");
+    assert!(wait_for_job_state(
+        &second_path,
+        "queued",
+        Duration::from_secs(1)
+    ));
     fs::write(&release, b"release").expect("libération du faux Provider");
     first_worker.wait().expect("attente du premier Worker");
+    second_worker.wait().expect("attente du second Worker");
     let second: Value = serde_json::from_slice(&fs::read(&second_path).expect("lecture du Job"))
         .expect("Job JSON valide");
-    assert_eq!(second["state"], "failed");
-    assert_eq!(second["error"]["code"], "concurrency_limit_exceeded");
+    assert_eq!(second["state"], "succeeded");
 }
 
 #[test]
@@ -4842,7 +4851,7 @@ fn cancelling_a_running_derive_never_publishes_it() {
 }
 
 #[test]
-fn derive_concurrency_failure_keeps_the_recipe_capability() {
+fn queued_derive_starts_after_a_concurrency_slot_is_released() {
     let env = TestEnv::new("derive-concurrency");
     env.install_binary("scriptor-local-derive", FAKE_LOCAL_DERIVE_PROVIDER);
     let capture_id = create_text_capture(&env);
@@ -4879,8 +4888,19 @@ fn derive_concurrency_failure_keeps_the_recipe_capability() {
     )
     .expect("Job de Derive JSON valide");
     let job_id = created["job"]["job_id"].as_str().expect("Job de Derive");
-    let failed = wait_for_agent_job(&env, job_id);
-    assert_eq!(failed["state"], "failed", "{failed}");
-    assert_eq!(failed["error"]["code"], "concurrency_limit_exceeded");
-    assert_eq!(failed["error"]["capability"], "checklist");
+    let job_path = env.xdg_data.join(format!("scriptor/v2/jobs/{job_id}.json"));
+    assert!(wait_for_job_state(
+        &job_path,
+        "queued",
+        Duration::from_secs(1)
+    ));
+    for blocker in ["job-9001", "job-9002"] {
+        fs::remove_file(
+            env.xdg_data
+                .join(format!("scriptor/v2/jobs/{blocker}.json")),
+        )
+        .expect("liberation du slot de concurrence");
+    }
+    let finished = wait_for_agent_job(&env, job_id);
+    assert_eq!(finished["state"], "succeeded", "{finished}");
 }
