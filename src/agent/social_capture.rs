@@ -264,6 +264,11 @@ impl Acquisition for SocialAcquisition<'_> {
                     .get("uploader")
                     .and_then(Value::as_str)
                     .map(str::to_string),
+                account_handle: metadata
+                    .get("channel")
+                    .or_else(|| metadata.get("uploader_id"))
+                    .and_then(Value::as_str)
+                    .map(str::to_string),
                 published_at: metadata
                     .get("upload_date")
                     .and_then(Value::as_str)
@@ -463,6 +468,7 @@ fn acquire_linkedin(
             platform: Some("linkedin".to_string()),
             post_id: post.id,
             author: post.author,
+            account_handle: None,
             published_at: post.published_at,
             media: media_provenance,
         }),

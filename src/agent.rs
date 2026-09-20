@@ -45,7 +45,7 @@ const POLICY_NAME: &str = "safe-local@1";
 const DEFAULT_PAGE_LIMIT: usize = 20;
 const MAX_PAGE_LIMIT: usize = 100;
 const SEARCH_MAX_CANDIDATES: usize = 500;
-const SEARCH_INDEX_VERSION: u8 = 3;
+const SEARCH_INDEX_VERSION: u8 = 4;
 const KNOWLEDGE_INDEX_VERSION: u8 = 1;
 const KNOWLEDGE_ANALYZER_VERSION: &str = "knowledge_v1";
 const KNOWLEDGE_PHRASE_BOOST: f32 = 2.0;
@@ -436,6 +436,8 @@ struct RemoteProvenance {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     author: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    account_handle: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     published_at: Option<String>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     media: Vec<RemoteMediaProvenance>,
@@ -688,6 +690,7 @@ struct SearchFields {
     capture_id: Field,
     source: Field,
     source_sha256: Field,
+    account_handle: Field,
     published_at: Field,
     artifact_id: Field,
     artifact_sha256: Field,
@@ -1477,6 +1480,7 @@ fn resolve_discoveries(job: &Job, parent_capture_id: &str) -> Result<()> {
                             platform: None,
                             post_id: None,
                             author: None,
+                            account_handle: None,
                             published_at: None,
                             media: Vec::new(),
                         },
@@ -3524,6 +3528,7 @@ fn list_captures(cursor: Option<&str>, limit: usize) -> Result<()> {
     print_json(&capture_page(manifests, cursor, limit, &binding)?)
 }
 
+#[allow(clippy::too_many_lines)]
 fn search_captures(query: &str, cursor: Option<&str>, limit: usize) -> Result<()> {
     validate_page_limit(limit)?;
     if let Some(cursor) = cursor {
@@ -3555,6 +3560,9 @@ fn search_captures(query: &str, cursor: Option<&str>, limit: usize) -> Result<()
         source_sha256: schema
             .get_field("source_sha256")
             .context("reading source_sha256 Search field")?,
+        account_handle: schema
+            .get_field("account_handle")
+            .context("reading account_handle Search field")?,
         published_at: schema
             .get_field("published_at")
             .context("reading published_at Search field")?,
@@ -3571,7 +3579,10 @@ fn search_captures(query: &str, cursor: Option<&str>, limit: usize) -> Result<()
             .get_field("text")
             .context("reading text Search field")?,
     };
-    let mut parser = QueryParser::for_index(&index, vec![fields.source, fields.text]);
+    let mut parser = QueryParser::for_index(
+        &index,
+        vec![fields.source, fields.account_handle, fields.text],
+    );
     parser.set_conjunction_by_default();
     let parsed = parser
         .parse_query(query)
@@ -4471,6 +4482,7 @@ fn write_search_index(manifests: &[Manifest]) -> Result<()> {
     let capture_id = schema_builder.add_text_field("capture_id", STRING | STORED);
     let source = schema_builder.add_text_field("source", TEXT | STORED);
     let source_sha256 = schema_builder.add_text_field("source_sha256", STRING | STORED);
+    let account_handle = schema_builder.add_text_field("account_handle", TEXT);
     let published_at = schema_builder.add_text_field("published_at", STRING | STORED);
     let artifact_id = schema_builder.add_text_field("artifact_id", STRING | STORED);
     let artifact_sha256 = schema_builder.add_text_field("artifact_sha256", STRING | STORED);
@@ -4494,6 +4506,7 @@ fn write_search_index(manifests: &[Manifest]) -> Result<()> {
                     capture_id => manifest.capture_id.clone(),
                     source => manifest.source.locator.clone(),
                     source_sha256 => manifest.source.sha256.clone(),
+                    account_handle => manifest.remote_provenance.as_ref().and_then(|provenance| provenance.account_handle.as_deref()).unwrap_or_default(),
                     published_at => manifest.published_at.to_string(),
                     artifact_id => artifact.artifact_id.clone(),
                     artifact_sha256 => artifact.sha256.clone(),
