@@ -829,9 +829,16 @@ fn artifact_reference(capture_id: &str, capture: &Value, artifact_id: &str) -> V
 }
 
 fn create_text_capture(env: &TestEnv) -> String {
-    let source = env.work_dir.join("notes.txt");
-    fs::write(&source, "Une preuve locale.\nEt son contexte utile.\n")
-        .expect("ecriture de la Source texte");
+    create_text_capture_with_content(
+        env,
+        "notes.txt",
+        "Une preuve locale.\nEt son contexte utile.\n",
+    )
+}
+
+fn create_text_capture_with_content(env: &TestEnv, name: &str, content: &str) -> String {
+    let source = env.work_dir.join(name);
+    fs::write(&source, content).expect("ecriture de la Source texte");
     let created: Value = serde_json::from_slice(
         &env.command()
             .args([
@@ -855,6 +862,54 @@ fn create_text_capture(env: &TestEnv) -> String {
         .as_str()
         .expect("identifiant de Capture")
         .to_string()
+}
+
+fn publish_knowledge_card(
+    env: &TestEnv,
+    capture_id: &str,
+    statements: Vec<Value>,
+) -> (Value, Value) {
+    let capture = inspect_agent_capture(env, capture_id);
+    let reference = serde_json::json!({
+        "capture_id": capture_id,
+        "artifact_id": capture["manifest"]["proof"]["artifact_id"],
+        "sha256": capture["manifest"]["proof"]["sha256"],
+        "locator": capture["manifest"]["proof"]["locator"],
+    });
+    let output = serde_json::json!({
+        "format_version": 1,
+        "recipe": "knowledge-card",
+        "knowledge_core": {
+            "coverage": [{
+                "reference": reference,
+                "state": "examined",
+                "reason": "fixture-reviewed",
+            }],
+            "statements": statements,
+        },
+    });
+    let finished = run_derive(env, capture_id, "knowledge-card", &output);
+    assert_eq!(finished["state"], "succeeded", "{finished}");
+    let published = inspect_agent_capture(env, capture_id);
+    let derivative = published["derivatives"]
+        .as_array()
+        .and_then(|derivatives| {
+            derivatives
+                .iter()
+                .find(|derivative| derivative["derive_id"] == finished["derive_id"])
+        })
+        .cloned()
+        .expect("Fiche publiée");
+    (derivative, output)
+}
+
+fn knowledge_statement(id: &str, kind: &str, text: &str, reference: &Value) -> Value {
+    serde_json::json!({
+        "id": id,
+        "kind": kind,
+        "text": text,
+        "anchors": [{"reference": reference}],
+    })
 }
 
 fn assert_readable_transcription(env: &TestEnv, capture_id: &str, capture: &Value) {
@@ -3397,6 +3452,191 @@ fn knowledge_card_publishes_a_versioned_sourced_knowledge_core() {
         serde_json::from_str(read["content"]["text"].as_str().expect("Fiche texte"))
             .expect("Fiche JSON valide");
     assert_eq!(published, output);
+}
+
+#[test]
+fn knowledge_search_returns_complete_statements_with_minimal_provenance() {
+    let env = TestEnv::new("knowledge-search-contract");
+    let capture_id =
+        create_text_capture_with_content(&env, "source.txt", "Contenu brut distinct.\n");
+    let capture = inspect_agent_capture(&env, &capture_id);
+    let reference = artifact_reference(&capture_id, &capture, "proof-source");
+    let kinds = [
+        ("declaration", "attributed-declaration"),
+        ("observation", "observation"),
+        ("recommendation", "attributed-recommendation"),
+        ("interpretation", "interpretation"),
+        ("uncertainty", "uncertainty"),
+    ];
+    let statements = kinds
+        .iter()
+        .map(|(id, kind)| {
+            let text = if *id == "declaration" {
+                "École mobile : énoncé directement formulé et entièrement conservé.".to_string()
+            } else {
+                format!("École pour usage mobile : énoncé de type {id} entièrement conservé.")
+            };
+            knowledge_statement(id, kind, &text, &reference)
+        })
+        .collect();
+    let (card, expected) = publish_knowledge_card(&env, &capture_id, statements);
+
+    let found: Value = serde_json::from_slice(
+        &env.command()
+            .args(["knowledge", "search", "ECOLE-mobile"])
+            .assert()
+            .success()
+            .get_output()
+            .stdout,
+    )
+    .expect("résultats JSON valides");
+    let results = found["results"]
+        .as_array()
+        .expect("Résultats de connaissance");
+    assert_eq!(results.len(), kinds.len());
+    assert_eq!(
+        results
+            .iter()
+            .map(|result| result["kind"].as_str())
+            .collect::<std::collections::BTreeSet<_>>(),
+        kinds
+            .iter()
+            .map(|(_, kind)| Some(*kind))
+            .collect::<std::collections::BTreeSet<_>>()
+    );
+    assert_eq!(results[0]["statement_id"], "declaration");
+    for result in results {
+        assert!(
+            result["text"]
+                .as_str()
+                .is_some_and(|text| text.contains("entièrement conservé"))
+        );
+        assert_eq!(result["reference"], card["reference"]);
+        assert!(result["statement_id"].is_string());
+        assert!(result["source"]["locator"].is_object());
+        assert!(result.get("score").is_none());
+        assert!(result.get("anchors").is_none());
+        assert!(result.get("coverage").is_none());
+    }
+
+    let read: Value = serde_json::from_slice(
+        &env.command()
+            .args([
+                "capture",
+                "read",
+                "--reference",
+                results[0]["reference"].to_string().as_str(),
+            ])
+            .assert()
+            .success()
+            .get_output()
+            .stdout,
+    )
+    .expect("lecture de Fiche JSON valide");
+    let published: Value = serde_json::from_str(
+        read["content"]["text"]
+            .as_str()
+            .expect("Fiche de connaissance texte"),
+    )
+    .expect("Fiche de connaissance JSON valide");
+    assert_eq!(published, expected);
+    assert!(published["knowledge_core"]["statements"][0]["anchors"].is_array());
+
+    let all_words: Value = serde_json::from_slice(
+        &env.command()
+            .args(["knowledge", "search", "ecole absente"])
+            .assert()
+            .success()
+            .get_output()
+            .stdout,
+    )
+    .expect("page vide JSON valide");
+    assert!(all_words["results"].as_array().is_some_and(Vec::is_empty));
+    env.command()
+        .args(["knowledge", "search", "!!!"])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("\"code\":\"invalid_request\""));
+}
+
+#[test]
+fn knowledge_search_paginates_stably_and_rebuilds_its_projection() {
+    let env = TestEnv::new("knowledge-search-pagination");
+    let capture_id = create_text_capture_with_content(&env, "pagination.txt", "Source brute.\n");
+    let capture = inspect_agent_capture(&env, &capture_id);
+    let reference = artifact_reference(&capture_id, &capture, "proof-source");
+    let statements = (0..21)
+        .map(|number| {
+            knowledge_statement(
+                &format!("statement-{number:02}"),
+                "observation",
+                &format!("Pagination stable needle {number:02}."),
+                &reference,
+            )
+        })
+        .collect();
+    publish_knowledge_card(&env, &capture_id, statements);
+
+    let first: Value = serde_json::from_slice(
+        &env.command()
+            .args(["knowledge", "search", "needle"])
+            .assert()
+            .success()
+            .get_output()
+            .stdout,
+    )
+    .expect("première page JSON valide");
+    let first_results = first["results"].as_array().expect("première page");
+    assert_eq!(first_results.len(), 20);
+    let cursor = first["next_cursor"].as_str().expect("curseur opaque");
+    let second: Value = serde_json::from_slice(
+        &env.command()
+            .args(["knowledge", "search", "needle", "--cursor", cursor])
+            .assert()
+            .success()
+            .get_output()
+            .stdout,
+    )
+    .expect("seconde page JSON valide");
+    let second_results = second["results"].as_array().expect("seconde page");
+    assert_eq!(second_results.len(), 1);
+    assert!(second["next_cursor"].is_null());
+    let ids = first_results
+        .iter()
+        .chain(second_results)
+        .map(|result| {
+            result["statement_id"]
+                .as_str()
+                .expect("identifiant d'Énoncé")
+        })
+        .collect::<std::collections::BTreeSet<_>>();
+    assert_eq!(ids.len(), 21);
+
+    env.command()
+        .args(["knowledge", "search", "different", "--cursor", cursor])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("\"code\":\"invalid_cursor\""));
+    env.command()
+        .args(["knowledge", "search", "needle", "--limit", "101"])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("\"code\":\"invalid_pagination\""));
+
+    env.command()
+        .args(["knowledge", "index", "rebuild"])
+        .assert()
+        .success();
+    let rebuilt: Value = serde_json::from_slice(
+        &env.command()
+            .args(["knowledge", "search", "needle", "--limit", "100"])
+            .assert()
+            .success()
+            .get_output()
+            .stdout,
+    )
+    .expect("résultats reconstruits JSON valides");
+    assert_eq!(rebuilt["results"].as_array().map(Vec::len), Some(21));
 }
 
 #[test]
