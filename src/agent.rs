@@ -3671,22 +3671,29 @@ fn search_knowledge(query: &str, cursor: Option<&str>, limit: usize) -> Result<(
     let normalized_query = tokens.join(" ");
     if let Some(cursor) = cursor {
         let cursor = decode_knowledge_cursor(cursor)?;
+        let lock = lock_knowledge_index_shared()?;
         let metadata = read_knowledge_metadata()?;
         if cursor.version != 1
             || cursor.query != normalized_query
             || cursor.snapshot != metadata.snapshot
             || cursor.position > cursor.results.len()
         {
+            unlock_knowledge_index(&lock)?;
             bail!("pagination cursor does not match this operation or snapshot");
         }
-        return print_json(&knowledge_page(cursor, limit)?);
+        let page = knowledge_page(cursor, limit)?;
+        unlock_knowledge_index(&lock)?;
+        return print_json(&page);
     }
+    let lock = lock_knowledge_index_shared()?;
     if let Some(error) = read_knowledge_degradation()? {
+        unlock_knowledge_index(&lock)?;
         return print_json(&AgentError { error });
     }
     let metadata = match read_knowledge_metadata() {
         Ok(metadata) => metadata,
         Err(error) => {
+            unlock_knowledge_index(&lock)?;
             return print_json(&AgentError {
                 error: StructuredError {
                     code: "index_unavailable".to_string(),
@@ -3699,6 +3706,7 @@ fn search_knowledge(query: &str, cursor: Option<&str>, limit: usize) -> Result<(
     if metadata.version != KNOWLEDGE_INDEX_VERSION
         || metadata.analyzer != KNOWLEDGE_ANALYZER_VERSION
     {
+        unlock_knowledge_index(&lock)?;
         return print_json(&AgentError {
             error: StructuredError {
                 code: "index_degraded".to_string(),
@@ -3710,6 +3718,7 @@ fn search_knowledge(query: &str, cursor: Option<&str>, limit: usize) -> Result<(
     let index = match Index::open_in_dir(knowledge_index_path()?) {
         Ok(index) => index,
         Err(error) => {
+            unlock_knowledge_index(&lock)?;
             return print_json(&AgentError {
                 error: StructuredError {
                     code: "index_unavailable".to_string(),
@@ -3750,7 +3759,7 @@ fn search_knowledge(query: &str, cursor: Option<&str>, limit: usize) -> Result<(
             .then_with(|| left.reference.artifact_id.cmp(&right.reference.artifact_id))
             .then_with(|| left.statement_id.cmp(&right.statement_id))
     });
-    print_json(&knowledge_page(
+    let page = knowledge_page(
         KnowledgeCursor {
             version: 1,
             query: normalized_query,
@@ -3759,7 +3768,9 @@ fn search_knowledge(query: &str, cursor: Option<&str>, limit: usize) -> Result<(
             results: results.into_iter().map(|(_, result)| result).collect(),
         },
         limit,
-    )?)
+    )?;
+    unlock_knowledge_index(&lock)?;
+    print_json(&page)
 }
 
 fn knowledge_page(mut cursor: KnowledgeCursor, limit: usize) -> Result<KnowledgePage> {
@@ -4072,7 +4083,7 @@ fn knowledge_index_path() -> Result<PathBuf> {
 }
 
 fn knowledge_metadata_path() -> Result<PathBuf> {
-    Ok(repository_dir()?.join("knowledge-index.json"))
+    Ok(knowledge_index_path()?.join("metadata.json"))
 }
 
 fn knowledge_status_path() -> Result<PathBuf> {
@@ -4091,6 +4102,23 @@ fn lock_knowledge_index() -> Result<File> {
         .open(&path)
         .with_context(|| format!("opening knowledge Index lock {}", path.display()))?;
     file.lock_exclusive().context("locking knowledge Index")?;
+    Ok(file)
+}
+
+fn lock_knowledge_index_shared() -> Result<File> {
+    let directory = repository_dir()?;
+    fs::create_dir_all(&directory)
+        .with_context(|| format!("creating knowledge Index directory {}", directory.display()))?;
+    let path = directory.join("knowledge-index.lock");
+    let file = OpenOptions::new()
+        .create(true)
+        .truncate(false)
+        .read(true)
+        .write(true)
+        .open(&path)
+        .with_context(|| format!("opening knowledge Index lock {}", path.display()))?;
+    file.lock_shared()
+        .context("locking knowledge Index for reading")?;
     Ok(file)
 }
 
@@ -4137,7 +4165,7 @@ fn knowledge_card_records() -> Result<Vec<KnowledgeCardRecord>> {
             if card.format_version != 1 || card.recipe != "knowledge-card" {
                 bail!("knowledge Index has an unsupported knowledge-card format");
             }
-            let supersession_key = knowledge_supersession_key(&manifest, &derivative.recipe)?;
+            let supersession_key = knowledge_supersession_key(&manifest)?;
             records.push(KnowledgeCardRecord {
                 derivative,
                 statements: card.knowledge_core.statements,
@@ -4185,7 +4213,7 @@ fn active_knowledge_cards(mut records: Vec<KnowledgeCardRecord>) -> Vec<Knowledg
     active.into_values().collect()
 }
 
-fn knowledge_supersession_key(manifest: &Manifest, recipe: &KnowledgeRecipe) -> Result<String> {
+fn knowledge_supersession_key(manifest: &Manifest) -> Result<String> {
     let source_identity = manifest
         .remote_provenance
         .as_ref()
@@ -4199,18 +4227,15 @@ fn knowledge_supersession_key(manifest: &Manifest, recipe: &KnowledgeRecipe) -> 
         .unwrap_or_else(|| format!("source:{}", manifest.source.sha256));
     let mut proof_hashes = vec![manifest.proof.sha256.clone()];
     proof_hashes.extend(manifest.artifacts.iter().map(|proof| proof.sha256.clone()));
-    proof_hashes.extend(
-        manifest
-            .extractions
-            .iter()
-            .map(|extraction| extraction.sha256.clone()),
-    );
     proof_hashes.sort_unstable();
     let observed_state = sha256_bytes(
         &serde_json::to_vec(&proof_hashes).context("serializing knowledge observed state")?,
     );
-    let recipe = serde_json::to_string(recipe).context("serializing knowledge Recipe")?;
-    Ok(format!("{recipe}|{source_identity}|{observed_state}"))
+    // The target is an execution detail (and may contain References to a
+    // Capture), not part of the Recipe identity used for supersession.
+    Ok(format!(
+        "knowledge-card@1|{source_identity}|{observed_state}"
+    ))
 }
 
 fn write_knowledge_index(records: &[KnowledgeCardRecord]) -> Result<()> {
@@ -4275,6 +4300,8 @@ fn write_knowledge_index(records: &[KnowledgeCardRecord]) -> Result<()> {
             analyzer: KNOWLEDGE_ANALYZER_VERSION.to_string(),
             snapshot: unique_id(),
         };
+        write_json(&temporary.join("metadata.json"), &metadata)
+            .context("writing knowledge Index metadata")?;
         if path
             .try_exists()
             .context("checking previous knowledge Index")?
@@ -4292,7 +4319,7 @@ fn write_knowledge_index(records: &[KnowledgeCardRecord]) -> Result<()> {
             fs::rename(&temporary, &path)
                 .with_context(|| format!("publishing knowledge Index {}", path.display()))?;
         }
-        write_json(&knowledge_metadata_path()?, &metadata)
+        Ok(())
     })();
     if result.is_err() {
         drop(fs::remove_dir_all(&temporary));
