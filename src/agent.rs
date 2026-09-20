@@ -50,6 +50,7 @@ const KNOWLEDGE_INDEX_VERSION: u8 = 1;
 const KNOWLEDGE_ANALYZER_VERSION: &str = "knowledge_v1";
 const KNOWLEDGE_PHRASE_BOOST: f32 = 2.0;
 const LOCAL_DERIVE_PROVIDER: &str = "scriptor-local-derive";
+const JOB_QUEUE_POLL_INTERVAL: Duration = Duration::from_millis(25);
 const DEFAULT_READ_LENGTH: usize = 8 * 1024;
 const MAX_READ_LENGTH: usize = 1024 * 1024;
 pub const MANIFEST_FORMAT_VERSION: u8 = 1;
@@ -3336,42 +3337,32 @@ fn unresolved_provider_for(error: &anyhow::Error, fallback: &str) -> Provider {
 }
 
 fn start_job(job_id: &str) -> Result<Option<Job>> {
-    let repository_lock = lock_jobs()?;
-    let lock = lock_job(job_id)?;
-    let mut job = read_job(job_id)?;
-    if job.state == "cancelled" {
+    loop {
+        let repository_lock = lock_jobs()?;
+        let lock = lock_job(job_id)?;
+        let mut job = read_job(job_id)?;
+        if job.state == "cancelled" {
+            unlock_job(&lock)?;
+            unlock_jobs(&repository_lock)?;
+            return Ok(None);
+        }
+        let has_capacity =
+            running_jobs()? < usize::from(job.policy.snapshot.limits.concurrency_limit);
+        let is_next = next_queued_job_id()?.as_deref() == Some(job_id);
+        if has_capacity && is_next {
+            job.state = "running".to_string();
+            job.updated_at = now_secs();
+            job.worker_pid = Some(std::process::id());
+            write_job(&job)?;
+            append_job_event(job_id, "running")?;
+            unlock_job(&lock)?;
+            unlock_jobs(&repository_lock)?;
+            return Ok(Some(job));
+        }
         unlock_job(&lock)?;
         unlock_jobs(&repository_lock)?;
-        return Ok(None);
+        thread::sleep(JOB_QUEUE_POLL_INTERVAL);
     }
-    if running_jobs()? >= usize::from(job.policy.snapshot.limits.concurrency_limit) {
-        job.state = "failed".to_string();
-        job.updated_at = now_secs();
-        job.error = Some(StructuredError {
-            code: "concurrency_limit_exceeded".to_string(),
-            message: format!(
-                "{}@{} concurrency budget exceeded",
-                job.policy.id, job.policy.version
-            ),
-            capability: match &job.operation {
-                JobOperation::Derive { recipe, .. } => Some(recipe.kind.as_str().to_string()),
-                _ => None,
-            },
-        });
-        write_job(&job)?;
-        append_job_event(job_id, "failed")?;
-        unlock_job(&lock)?;
-        unlock_jobs(&repository_lock)?;
-        return Ok(None);
-    }
-    job.state = "running".to_string();
-    job.updated_at = now_secs();
-    job.worker_pid = Some(std::process::id());
-    write_job(&job)?;
-    append_job_event(job_id, "running")?;
-    unlock_job(&lock)?;
-    unlock_jobs(&repository_lock)?;
-    Ok(Some(job))
 }
 
 fn complete_job(job_id: &str, capture_id: String, partial: bool) -> Result<()> {
@@ -5059,6 +5050,26 @@ fn running_jobs() -> Result<usize> {
         }
     }
     Ok(active)
+}
+
+fn next_queued_job_id() -> Result<Option<String>> {
+    let mut queued = Vec::new();
+    for entry in fs::read_dir(jobs_dir()?).context("listing queued Jobs")? {
+        let entry = entry.context("reading queued Job directory entry")?;
+        if entry
+            .path()
+            .extension()
+            .is_none_or(|extension| extension != "json")
+        {
+            continue;
+        }
+        let job: Job = read_json(&entry.path())?;
+        if job.state == "queued" {
+            queued.push((job.created_at, job.id));
+        }
+    }
+    queued.sort_unstable();
+    Ok(queued.into_iter().next().map(|(_, id)| id))
 }
 
 fn unlock_job(file: &File) -> Result<()> {
