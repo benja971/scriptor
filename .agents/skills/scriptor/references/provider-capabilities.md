@@ -104,15 +104,15 @@ unavailable; report the resulting terminal or partial state without fallback.
 
 ## Local Dérivés
 
-`scriptor-local-derive` supports `structured-summary`, `proven-claims`,
+`scriptor-local-derive` is embedded in `scriptor`. It supports `structured-summary`, `proven-claims`,
 `checklist`, `markdown-note` and `sourced-answer`. It receives only the selected
 verified Références and returns one immutable Dérivé. Son contenu JSON est
 indexé après publication: `capture search` renvoie la Référence de l'artefact
 de Dérivé qui a effectivement correspondu, pas la Preuve principale par défaut.
 
-The Provider engine is not distributed with Scriptor and must already exist in
-`PATH`. Its absence is a terminal Job error, not permission to install a model,
-call a remote Provider or synthesize the Dérivé directly.
+Scriptor runs this local Provider in a separate process without a second
+installed executable. It does not authorize model installation, remote calls
+or direct synthesis outside the Provider contract.
 
 Requested and effective parameters use a closed non-secret schema:
 
