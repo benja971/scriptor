@@ -12,8 +12,8 @@ use super::{
     Recipe, RecipeKind, RecipeTarget, Reference, append_job_event, append_json_line,
     artifact_for as capture_artifact_for, captures_dir, file_size, lock_capture_ledger, lock_job,
     now_secs, provider_path, read_job, read_json, read_json_lines, rebuild_knowledge_index,
-    record_knowledge_degradation, reference_for_artifact, sha256_file, unique_id, unlock_job,
-    write_job, write_json,
+    rebuild_search_index, record_index_degradation, record_knowledge_degradation,
+    reference_for_artifact, sha256_file, unique_id, unlock_job, write_job, write_json,
 };
 use crate::resource::ResourceBudget;
 
@@ -732,6 +732,9 @@ fn commit_derivative(publication: &StagedPublication<'_>, derivative: &Derivativ
         return Err(error);
     }
     unlock_job(&ledger_lock)?;
+    if let Err(error) = rebuild_search_index() {
+        record_index_degradation(&error);
+    }
     if let Err(error) = rebuild_knowledge_index() {
         record_knowledge_degradation(&error);
     }

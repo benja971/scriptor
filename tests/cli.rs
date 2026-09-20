@@ -864,11 +864,7 @@ fn create_text_capture_with_content(env: &TestEnv, name: &str, content: &str) ->
         .to_string()
 }
 
-fn publish_knowledge_card(
-    env: &TestEnv,
-    capture_id: &str,
-    statements: Vec<Value>,
-) -> (Value, Value) {
+fn publish_knowledge_card(env: &TestEnv, capture_id: &str, statements: &[Value]) -> (Value, Value) {
     let capture = inspect_agent_capture(env, capture_id);
     let reference = serde_json::json!({
         "capture_id": capture_id,
@@ -904,12 +900,20 @@ fn publish_knowledge_card(
 }
 
 fn knowledge_statement(id: &str, kind: &str, text: &str, reference: &Value) -> Value {
-    serde_json::json!({
+    let mut statement = serde_json::json!({
         "id": id,
         "kind": kind,
         "text": text,
         "anchors": [{"reference": reference}],
-    })
+    });
+    if kind == "interpretation" {
+        statement["premises"] = serde_json::json!(["declaration"]);
+    }
+    if kind == "uncertainty" {
+        statement["limitation"] =
+            serde_json::json!("La Capture ne permet pas de confirmer ce point.");
+    }
+    statement
 }
 
 fn assert_readable_transcription(env: &TestEnv, capture_id: &str, capture: &Value) {
@@ -3468,7 +3472,7 @@ fn knowledge_search_returns_complete_statements_with_minimal_provenance() {
         ("interpretation", "interpretation"),
         ("uncertainty", "uncertainty"),
     ];
-    let statements = kinds
+    let statements: Vec<Value> = kinds
         .iter()
         .map(|(id, kind)| {
             let text = if *id == "declaration" {
@@ -3479,7 +3483,7 @@ fn knowledge_search_returns_complete_statements_with_minimal_provenance() {
             knowledge_statement(id, kind, &text, &reference)
         })
         .collect();
-    let (card, expected) = publish_knowledge_card(&env, &capture_id, statements);
+    let (card, expected) = publish_knowledge_card(&env, &capture_id, &statements);
 
     let found: Value = serde_json::from_slice(
         &env.command()
@@ -3513,7 +3517,7 @@ fn knowledge_search_returns_complete_statements_with_minimal_provenance() {
         );
         assert_eq!(result["reference"], card["reference"]);
         assert!(result["statement_id"].is_string());
-        assert!(result["source"]["locator"].is_object());
+        assert!(result["source"]["locator"].is_string());
         assert!(result.get("score").is_none());
         assert!(result.get("anchors").is_none());
         assert!(result.get("coverage").is_none());
@@ -3565,7 +3569,7 @@ fn knowledge_search_paginates_stably_and_rebuilds_its_projection() {
     let capture_id = create_text_capture_with_content(&env, "pagination.txt", "Source brute.\n");
     let capture = inspect_agent_capture(&env, &capture_id);
     let reference = artifact_reference(&capture_id, &capture, "proof-source");
-    let statements = (0..21)
+    let statements: Vec<Value> = (0..21)
         .map(|number| {
             knowledge_statement(
                 &format!("statement-{number:02}"),
@@ -3575,7 +3579,7 @@ fn knowledge_search_paginates_stably_and_rebuilds_its_projection() {
             )
         })
         .collect();
-    publish_knowledge_card(&env, &capture_id, statements);
+    publish_knowledge_card(&env, &capture_id, &statements);
 
     let first: Value = serde_json::from_slice(
         &env.command()

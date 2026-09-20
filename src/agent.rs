@@ -3727,9 +3727,10 @@ fn search_knowledge(query: &str, cursor: Option<&str>, limit: usize) -> Result<(
         .map_err(|error| anyhow::anyhow!(error))
         .context("opening knowledge Index reader")?;
     let searcher = reader.searcher();
-    let limit = usize::try_from(searcher.num_docs()).context("counting knowledge statements")?;
+    let result_limit =
+        usize::try_from(searcher.num_docs()).context("counting knowledge statements")?;
     let hits = searcher
-        .search(&query, &TopDocs::with_limit(limit).order_by_score())
+        .search(&query, &TopDocs::with_limit(result_limit).order_by_score())
         .map_err(|error| anyhow::anyhow!(error))
         .context("searching knowledge statements")?;
     let mut results = hits
