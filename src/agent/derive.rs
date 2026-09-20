@@ -814,9 +814,16 @@ fn invoke_provider(
         job.policy.snapshot.limits.disk_byte_limit,
     )
     .with_cancellation(&is_cancelled);
+    let mut command = Command::new(provider_binary);
+    if provider_name == "scriptor-local-derive"
+        && std::env::current_exe()
+            .is_ok_and(|current_executable| current_executable == provider_binary)
+    {
+        command.arg("_local-derive");
+    }
     let process = budget
         .output(
-            Command::new(provider_binary)
+            command
                 .args(["--request"])
                 .arg(request_path)
                 .args(["--output"])

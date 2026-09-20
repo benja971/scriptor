@@ -49,6 +49,7 @@ const SEARCH_INDEX_VERSION: u8 = 4;
 const KNOWLEDGE_INDEX_VERSION: u8 = 1;
 const KNOWLEDGE_ANALYZER_VERSION: &str = "knowledge_v1";
 const KNOWLEDGE_PHRASE_BOOST: f32 = 2.0;
+const LOCAL_DERIVE_PROVIDER: &str = "scriptor-local-derive";
 const DEFAULT_READ_LENGTH: usize = 8 * 1024;
 const MAX_READ_LENGTH: usize = 1024 * 1024;
 pub const MANIFEST_FORMAT_VERSION: u8 = 1;
@@ -3302,13 +3303,18 @@ fn provider(
 }
 
 fn provider_path(name: &str) -> Result<PathBuf> {
-    std::env::var_os("PATH")
-        .and_then(|path| {
-            std::env::split_paths(&path)
-                .map(|directory| directory.join(name))
-                .find(|candidate| candidate.is_file())
-        })
-        .with_context(|| format!("resolving Provider binary `{name}`"))
+    let from_path = std::env::var_os("PATH").and_then(|path| {
+        std::env::split_paths(&path)
+            .map(|directory| directory.join(name))
+            .find(|candidate| candidate.is_file())
+    });
+    if let Some(path) = from_path {
+        return Ok(path);
+    }
+    if name == LOCAL_DERIVE_PROVIDER {
+        return std::env::current_exe().context("resolving bundled local Derive Provider");
+    }
+    Err(anyhow::anyhow!("resolving Provider binary `{name}`"))
 }
 
 fn unresolved_provider(name: &str) -> Provider {
@@ -4854,7 +4860,7 @@ fn policy_for(value: &str) -> Result<Policy> {
         "tesseract".to_string(),
     ];
     let allowed_recipes = if value == POLICY_NAME {
-        allowed_providers.push("scriptor-local-derive".to_string());
+        allowed_providers.push(LOCAL_DERIVE_PROVIDER.to_string());
         vec![
             RecipeKind::KnowledgeCard,
             RecipeKind::StructuredSummary,
@@ -4900,7 +4906,7 @@ fn normalize_policy(id: String, version: u8, snapshot: PolicySnapshot) -> Result
         "pdftotext",
         "pdfinfo",
         "tesseract",
-        "scriptor-local-derive",
+        LOCAL_DERIVE_PROVIDER,
     ];
     const WEB_PROVIDERS: &[&str] = &[
         "ffmpeg",

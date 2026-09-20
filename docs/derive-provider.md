@@ -25,8 +25,8 @@ précédent concerne la même Capture et la même Recette, puis conserve ce lien
 dans le nouveau Job. Chaque tentative garde un `job_id` distinct et chaque
 succès publie un nouveau `derive_id`.
 
-La Policy `safe-local@1` interdit les appels distants, autorise
-le binaire `scriptor-local-derive` et les Recettes suivantes :
+La Policy `safe-local@1` interdit les appels distants, autorise le Provider
+local intégré `scriptor-local-derive` et les Recettes suivantes :
 
 - `structured-summary`
 - `proven-claims`
@@ -37,10 +37,10 @@ le binaire `scriptor-local-derive` et les Recettes suivantes :
 
 ## Interface du Provider
 
-Scriptor appelle le Provider ainsi :
+Scriptor lance son Provider local intégré dans un processus séparé ainsi :
 
 ```console
-scriptor-local-derive --request <request.json> --output <artifact>
+scriptor _local-derive --request <request.json> --output <artifact>
 ```
 
 Avant l'appel, Scriptor écrit `context.json` dans le répertoire du Dérivé. Ce
@@ -151,8 +151,9 @@ autorisés sont `language`, `model`, `model_sha256` et `style`. `max_tokens` et
 Tout autre champ, objet imbriqué ou type est refusé avant persistance. Ce schéma
 exclut notamment secrets, jetons, mots de passe, cookies et autorisations.
 
-Le binaire livré `scriptor-local-derive` produit `knowledge-card` sans modèle
-ni appel distant. Il transforme le texte local sélectionné en Déclarations
-attribuées extractives et publie une Incertitude explicite pour une entrée sans
-texte exploitable. Pour préserver le contrat générique des autres Recettes, il
+Le binaire livré `scriptor` contient le Provider local
+`scriptor-local-derive`. Il produit `knowledge-card` sans modèle ni appel
+distant. Il transforme le texte local sélectionné en Déclarations attribuées
+extractives et publie une Incertitude explicite pour une entrée sans texte
+exploitable. Pour préserver le contrat générique des autres Recettes, il
 retourne une liste de claims vide et versionnée.

@@ -1,6 +1,6 @@
+use std::ffi::OsString;
 use std::fs;
 use std::path::PathBuf;
-use std::process::ExitCode;
 
 use anyhow::{Context, Result};
 use clap::Parser;
@@ -50,18 +50,8 @@ struct ExcludedCandidate {
     reason: String,
 }
 
-fn main() -> ExitCode {
-    match run() {
-        Ok(()) => ExitCode::SUCCESS,
-        Err(error) => {
-            eprintln!("{error:#}");
-            ExitCode::FAILURE
-        }
-    }
-}
-
-fn run() -> Result<()> {
-    let cli = Cli::parse();
+pub fn run(arguments: Vec<OsString>) -> Result<()> {
+    let cli = Cli::parse_from(arguments);
     let request: Request = read_json(&cli.request).context("reading Derive request")?;
     let context: InferenceContext =
         read_json(&request.context.path).context("reading bounded inference context")?;
