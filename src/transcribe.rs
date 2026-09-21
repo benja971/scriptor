@@ -1,4 +1,5 @@
 use std::env;
+#[cfg(test)]
 use std::ffi::OsStr;
 use std::path::{Path, PathBuf};
 use std::process::Command;
@@ -6,35 +7,48 @@ use std::process::Command;
 use anyhow::{Context, Result, bail};
 
 use crate::binary::ensure_present_in;
+use crate::resource::ResourceBudget;
 
-/// Transcrit `audio_wav` avec `whisper-cli`, en utilisant le modèle situé à
-/// `model_path`, la langue `language` et `threads` threads. Écrit le
-/// résultat en `.txt` à côté de `output_basename` et retourne son chemin.
-///
-/// # Errors
-///
-/// Retourne une erreur si le binaire `whisper-cli` est absent du `PATH`, si
-/// le process ne peut pas être lancé, ou si `whisper-cli` termine avec un
-/// code de sortie non nul (le message d'erreur inclut alors stdout/stderr du
-/// process).
-pub fn transcribe(
+pub fn transcribe_limited(
     model_path: &Path,
     audio_wav: &Path,
     language: &str,
     threads: u32,
     output_basename: &Path,
+    budget: &ResourceBudget<'_>,
 ) -> Result<PathBuf> {
     let path_env = env::var_os("PATH").unwrap_or_default();
-    transcribe_with_path(
-        model_path,
-        audio_wav,
-        language,
-        threads,
-        output_basename,
-        &path_env,
-    )
+    ensure_present_in("whisper-cli", &path_env)?;
+    let mut command = Command::new("whisper-cli");
+    command
+        .env("PATH", path_env)
+        .arg("-m")
+        .arg(model_path)
+        .arg("-f")
+        .arg(audio_wav)
+        .arg("-t")
+        .arg(threads.to_string())
+        .arg("-l")
+        .arg(language)
+        .arg("-otxt")
+        .arg("-of")
+        .arg(output_basename)
+        .args(["-np", "-nt"]);
+    let output = budget
+        .output(&mut command)
+        .context("failed to launch `whisper-cli`")?;
+    if !output.status.success() {
+        bail!(
+            "`whisper-cli` failed (exit code {:?})\nstdout:\n{}\nstderr:\n{}",
+            output.status.code(),
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr),
+        );
+    }
+    Ok(output_basename.with_extension("txt"))
 }
 
+#[cfg(test)]
 fn transcribe_with_path(
     model_path: &Path,
     audio_wav: &Path,

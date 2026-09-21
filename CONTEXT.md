@@ -1,49 +1,183 @@
 # scriptor
 
-CLI de transcription audio/vidéo vers texte, 100% local via whisper.cpp.
+CLI de capture vérifiable de sources locales et web.
 
 ## Language
 
+**Capture**:
+L’enregistrement immuable publié pour une Source, ses preuves, extractions,
+artefacts, capacités et provenance.
+
 **Source**:
-L'entrée fournie en argument au CLI : soit un chemin de fichier local (audio ou
-vidéo), soit une URL (Instagram, TikTok, YouTube, lien direct...). Une Source
-distante doit d'abord être téléchargée (via yt-dlp) avant de rejoindre le même
-Pipeline qu'une Source locale.
-_Avoid_: entrée, input, cible, média
+Le fichier local ou Locator web demandé à `scriptor capture`.
 
-**Pipeline**:
-La séquence de traitement appliquée à une Source jusqu'à produire sa Sortie :
-téléchargement (si Source distante) → extraction audio → transcription →
-écriture de la Sortie → nettoyage des fichiers temporaires.
-_Avoid_: traitement, job, workflow
+**Artefact**:
+Le fichier immuable publié par une Capture ou un Dérivé, identifié par son
+hash et, lorsqu’il existe, son Locator. Une Preuve et une Extraction sont des
+Artefacts.
 
-**Worker**:
-Le process qui exécute réellement le Pipeline en arrière-plan, détaché du
-process CLI initial. Le CLI lance le Worker puis rend la main immédiatement ;
-le Worker notifie la fin du Pipeline via notify-send.
-_Avoid_: daemon, process de fond, tâche de fond
+**Preuve**:
+L’artefact source conservé afin de vérifier une Capture. Une publication
+sociale conserve ses métadonnées et ses médias comme preuves.
 
-**Sortie**:
-Le dossier produit par le traitement d'une Source, contenant `transcription.txt`
-(le texte transcrit, précédé d'un en-tête `Source : <chemin ou URL>`) et, si la
-Source contenait un flux vidéo, un sous-dossier `frames/` (les Frames
-extraites). Pour une Source distante, contient aussi les artefacts
-intermédiaires dont la conservation a été demandée (`source.<ext>` : vidéo
-brute téléchargée, `video-muted.<ext>` : vidéo sans son, `audio.mka` : audio
-d'origine) — absents par défaut, activés via la configuration ou les options
-`--keep-*`. Emplacement selon le type de Source : à côté du fichier (Source
-locale), ou dans le dossier de sortie configuré (Source distante, qui n'a pas
-d'emplacement local à côté duquel écrire).
-_Avoid_: résultat, output, transcript, fichier de sortie
+**Extraction**:
+Le contenu produit à partir d’une Preuve, comme une caption, une
+transcription Whisper ou une keyframe.
 
-**Modèle**:
-Le modèle ggml whisper utilisé par le Worker pour la transcription, désigné
-par son nom (ex. `small`) dans la configuration.
-_Avoid_: modèle whisper, checkpoint
+**Dérivé**:
+L’artefact immuable produit explicitement depuis une Capture par une Recette,
+avec ses références de Preuves ou Extractions. Il est lisible par un Agent
+selon un contrat stable et inspectable par un humain à partir des mêmes
+éléments publiés.
 
-**Frame**:
-Une image extraite par le Worker d'une Source vidéo, à intervalle fixe et aux
-changements de scène (détection ffmpeg), dédoublonnées entre elles, puis
-écrites dans le sous-dossier `frames/` de la Sortie. Absentes si la Source est
-un fichier audio sans flux vidéo.
-_Avoid_: image, capture, screenshot, thumbnail
+**Fiche de connaissance sourcée**:
+Le premier Dérivé explicitement demandé pour rendre une Capture réutilisable
+et contrôlable, sans répondre à une question particulière. Elle expose des
+éléments attribués à cette Capture et leurs preuves, plutôt que des vérités
+établies par Scriptor.
+
+**Noyau de connaissance**:
+La structure stable partagée par les Dérivés de connaissance : les Énoncés
+attribués et leurs preuves. Il reste indépendant de l’usage métier qui les
+organise ou les met en avant.
+
+**Couverture du Dérivé**:
+L’état des Artefacts textuels et visuels qu’un Dérivé a examinés, exclus ou n’a
+pas pu exploiter. Elle borne explicitement ce que sa Fiche peut représenter.
+
+**Profil de dérivation**:
+La configuration JSON versionnée qui adapte un Dérivé de connaissance à un
+usage métier, sans modifier son Noyau de connaissance ni contourner la
+provenance de ses Énoncés attribués.
+
+**Énoncé attribué**:
+L’élément atomique d’une Fiche de connaissance sourcée. Il relie une seule
+proposition à un ou plusieurs fragments de Preuves ou d’Extractions, sans
+présenter cette proposition comme une vérité externe établie.
+
+**Ancrage de preuve**:
+Le lien d’un Énoncé attribué vers l’Artefact qui le soutient, éventuellement
+réduit à un fragment localisable. Il permet de remonter de la Fiche au matériau
+conservé.
+
+**Déclaration attribuée**:
+L’Énoncé attribué qui reformule une affirmation de la Source. Elle ne constitue
+ni une citation directe ni une validation de cette affirmation.
+
+**Observation**:
+L’Énoncé attribué qui décrit directement ce qui est présent dans une Preuve ou
+une Extraction, sans en déduire intention, causalité ou validité.
+
+**Recommandation attribuée**:
+L’Énoncé attribué qui rapporte ce que la Source conseille de faire. Elle n’est
+pas un conseil donné par Scriptor.
+
+**Interprétation**:
+L’Énoncé attribué qui conclut une proposition à partir de prémisses référencées.
+Elle reste distincte de ce que la Source a déclaré ou montré directement.
+
+**Incertitude**:
+L’Énoncé attribué qui exprime qu’une proposition ne peut pas être établie à
+partir de la Capture, avec la limite concrète qui l’explique.
+
+**Vérification externe**:
+La démarche explicite et distincte qui évalue une proposition au moyen d’un
+corpus de Sources supplémentaire. Elle ne modifie pas l’attribution publiée
+par une Fiche de connaissance sourcée.
+
+**Recette**:
+La forme typée et autorisée d’un Dérivé, appliquée à une Capture entière ou à
+des références sélectionnées.
+
+**Contexte d’inférence**:
+Le paquet borné et déclaré de Références d’une Capture qu’une Recette transmet
+réellement à un Provider pour produire un Dérivé.
+
+**Capacité**:
+L’opération indépendante enregistrée pour une Capture, avec son Provider, son
+état et, le cas échéant, son erreur structurée.
+
+**Provider**:
+Le programme ou composant qui réalise une capacité de Capture, avec ses
+paramètres et dépendances versionnées.
+
+**PageRenderer**:
+Le Provider Web qui produit le DOM stabilisé, le Markdown, les découvertes et
+les preuves visuelles d’une page publique.
+
+**Découverte**:
+Une Source révélée par une Capture Web, avec sa preuve parente, son locator et
+son ordre d’observation. Elle peut être poursuivie explicitement par l’Agent.
+
+**Doublon**:
+Une Capture existante pour la même identité de Source, réutilisée seulement si
+la Policy l’autorise.
+
+**Contrat agent**:
+L’interface JSON stable de Scriptor pour créer, suivre, inspecter, lire,
+rechercher et dériver des Captures.
+
+**Policy**:
+Le document versionné qui autorise les opérations, Providers, appels distants
+et budgets d’une Capture.
+
+**Référentiel**:
+Le stockage local des Captures, Jobs, index et Dérivés.
+
+**Index de recherche**:
+La projection reconstruisible des contenus publiés par le Référentiel. Elle
+accélère la recherche sans posséder les Captures ni leurs preuves.
+
+**Recherche de connaissance**:
+La capacité qui retrouve des Énoncés attribués publiés, reliés à leur Fiche,
+leurs Ancrages de preuve et leur Source. Elle répond à une recherche
+d'information, pas à une recherche de fichiers ou d'Artefacts bruts. Elle
+retourne une collection complète d'informations correspondantes, ordonnée par
+Pertinence lexicale, sans la réduire à une réponse unique.
+
+**Pertinence lexicale**:
+L'ordre des Résultats de connaissance selon leur correspondance textuelle avec
+la recherche, renforcée lorsqu'une phrase entière correspond. Cette
+correspondance ignore la casse et les accents. Elle ne mesure ni la vérité
+externe, ni l'autorité ou la valeur générale d'une Source.
+
+**Requête de connaissance**:
+Le texte littéral qui demande une Recherche de connaissance. Tous ses mots
+doivent correspondre, sans opérateur ni syntaxe spéciale ; une Requête vide est
+invalide.
+
+**Résultat de connaissance**:
+L'Énoncé attribué individuel retourné par une Recherche de connaissance, avec
+son type, sa Fiche et un résumé minimal de sa Source. Ses Ancrages de preuve
+complets restent lisibles dans sa Fiche. Chaque Énoncé correspondant est un
+Résultat distinct, sans être regroupé avec les autres Énoncés de sa Fiche.
+
+**Identité logique de Source**:
+L'identité stable qui permet de comparer plusieurs Captures d'une même Source.
+Pour une publication sociale, elle est la plateforme et l'identifiant du post
+capturés ; à défaut, elle réutilise l'identité de Source existante. Elle reste
+distincte du Locator saisi, dont plusieurs variantes peuvent viser un même post.
+
+**État observé de Source**:
+Le contenu immuable effectivement conservé d'une Source lors d'une Capture,
+indépendamment de la date d'acquisition et de la Fiche qui l'exploite. Deux
+Captures de même Identité logique de Source ont le même État observé lorsque
+leurs preuves de contenu sont identiques ; une modification de ces preuves crée
+un nouvel État.
+
+**Supersession de Fiche**:
+La relation automatique où une Fiche de connaissance plus récente, issue du
+même État observé de Source et de la même Recette, remplace une Fiche antérieure
+dans la Recherche de connaissance. Une modification de l'État observé produit
+une Fiche distincte, qui ne la supersède pas. La Fiche supersédée demeure
+immuable, lisible et vérifiable par sa Référence.
+
+**Réponse à question**:
+L'usage externe où un Agent sélectionne des résultats de Recherche de
+connaissance, les interprète et peut effectuer d'autres recherches. Elle ne
+fait pas partie de Scriptor et ne transforme pas ses résultats en nouvelle
+affirmation publiée.
+
+**Job**:
+L’exécution persistante d’une Capture ou d’un Dérivé. Il expose son état et
+ses erreurs structurées.

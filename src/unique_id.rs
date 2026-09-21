@@ -1,6 +1,5 @@
 //! Génération d'identifiants uniques (pid du process courant + horodatage
-//! nanoseconde), utilisés pour nommer sans collision le fichier de log du
-//! Worker (`main.rs`) et son dossier temporaire (`worker.rs`).
+//! nanoseconde) pour les fichiers temporaires et objets du Référentiel.
 
 use std::time::{SystemTime, UNIX_EPOCH};
 

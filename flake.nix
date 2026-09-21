@@ -1,5 +1,5 @@
 {
-  description = "scriptor dev shell";
+  description = "scriptor capture development shell";
 
   inputs.nixpkgs.url = "github:NixOS/nixpkgs/nixos-unstable";
 
@@ -7,6 +7,55 @@
     let
       system = "x86_64-linux";
       pkgs = import nixpkgs { inherit system; };
+      playwrightBrowsers = pkgs.playwright-driver.selectBrowsers {
+        withWebkit = false;
+        withChromiumHeadlessShell = true;
+      };
+      lightpanda = pkgs.stdenvNoCC.mkDerivation {
+        pname = "lightpanda";
+        version = "0.4.1";
+        src = pkgs.fetchurl {
+          url = "https://github.com/lightpanda-io/browser/releases/download/0.4.1/lightpanda-x86_64-linux";
+          hash = "sha256-HUCAHnLAvGGyy9PzVivPxG3nt54FaPM/aGtk8uWHYQo=";
+        };
+        dontUnpack = true;
+        installPhase = ''
+          install -Dm755 "$src" "$out/bin/lightpanda"
+        '';
+      };
+      webScripts = pkgs.runCommand "scriptor-web-scripts" { } ''
+        mkdir -p "$out"
+        cp ${./scripts/page-renderer.mjs} "$out/page-renderer.mjs"
+        cp ${./scripts/binary-acquirer.mjs} "$out/binary-acquirer.mjs"
+        cp ${./scripts/web-safety.mjs} "$out/web-safety.mjs"
+      '';
+      pageRenderer = pkgs.writeShellApplication {
+        name = "scriptor-page-renderer";
+        runtimeInputs = [ pkgs.nodejs pkgs.curl pkgs.playwright-test playwrightBrowsers lightpanda ];
+        text = ''
+          export NODE_PATH="${pkgs.playwright-test}/lib/node_modules"
+          export PLAYWRIGHT_BROWSERS_PATH="${playwrightBrowsers}"
+          exec node ${webScripts}/page-renderer.mjs "$@"
+        '';
+      };
+      pageRendererTest = pkgs.writeShellApplication {
+        name = "scriptor-page-renderer-test";
+        runtimeInputs = [ pkgs.nodejs pkgs.curl pkgs.playwright-test playwrightBrowsers lightpanda ];
+        text = ''
+          export NODE_PATH="${pkgs.playwright-test}/lib/node_modules"
+          export PLAYWRIGHT_BROWSERS_PATH="${playwrightBrowsers}"
+          export SCRIPTOR_PAGE_RENDERER_MODULE="${webScripts}/page-renderer.mjs"
+          export SCRIPTOR_BINARY_ACQUIRER_MODULE="${webScripts}/binary-acquirer.mjs"
+          exec node ${./scripts/page-renderer.test.mjs}
+        '';
+      };
+      binaryAcquirer = pkgs.writeShellApplication {
+        name = "scriptor-binary-acquirer";
+        runtimeInputs = [ pkgs.nodejs pkgs.curl ];
+        text = ''
+          exec node ${webScripts}/binary-acquirer.mjs "$@"
+        '';
+      };
     in {
       devShells.${system}.default = pkgs.mkShell {
         buildInputs = [
@@ -17,8 +66,13 @@
           pkgs.rustfmt
 
           pkgs.ffmpeg
+          pkgs.poppler-utils
+          pkgs.tesseract
           pkgs.whisper-cpp
           pkgs.yt-dlp
+          pageRenderer
+          pageRendererTest
+          binaryAcquirer
         ];
       };
     };

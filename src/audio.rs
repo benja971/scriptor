@@ -1,4 +1,5 @@
 use std::env;
+#[cfg(test)]
 use std::ffi::OsStr;
 use std::path::Path;
 use std::process::Command;
@@ -6,21 +7,38 @@ use std::process::Command;
 use anyhow::{Context, Result, bail};
 
 use crate::binary::ensure_present_in;
+use crate::resource::ResourceBudget;
 
-/// Extrait la piste audio de `input` vers `output_wav`, au format PCM16 mono
-/// 16 kHz, via `ffmpeg`.
-///
-/// # Errors
-///
-/// Retourne une erreur si le binaire `ffmpeg` est absent du `PATH`, si le
-/// process ne peut pas être lancé, ou si `ffmpeg` termine avec un code de
-/// sortie non nul (le message d'erreur inclut alors stdout/stderr du
-/// process).
-pub fn extract_audio(input: &Path, output_wav: &Path) -> Result<()> {
+pub fn extract_audio_limited(
+    input: &Path,
+    output_wav: &Path,
+    budget: &ResourceBudget<'_>,
+) -> Result<()> {
     let path_env = env::var_os("PATH").unwrap_or_default();
-    extract_audio_with_path(input, output_wav, &path_env)
+    ensure_present_in("ffmpeg", &path_env)?;
+    let mut command = Command::new("ffmpeg");
+    command
+        .env("PATH", path_env)
+        .arg("-y")
+        .arg("-i")
+        .arg(input)
+        .args(["-ar", "16000", "-ac", "1", "-c:a", "pcm_s16le"])
+        .arg(output_wav);
+    let output = budget
+        .output(&mut command)
+        .context("failed to launch `ffmpeg`")?;
+    if !output.status.success() {
+        bail!(
+            "`ffmpeg` failed (exit code {:?})\nstdout:\n{}\nstderr:\n{}",
+            output.status.code(),
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr),
+        );
+    }
+    Ok(())
 }
 
+#[cfg(test)]
 fn extract_audio_with_path(input: &Path, output_wav: &Path, path_env: &OsStr) -> Result<()> {
     ensure_present_in("ffmpeg", path_env)?;
 
