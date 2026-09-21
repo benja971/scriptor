@@ -1278,8 +1278,13 @@ fn enqueue_job(
 }
 
 fn run_worker(job_id: &str) -> Result<()> {
-    let Some(job) = start_job(job_id)? else {
-        return Ok(());
+    let job = match start_job(job_id) {
+        Ok(Some(job)) => job,
+        Ok(None) => return Ok(()),
+        Err(error) => {
+            fail_job(job_id, &error)?;
+            return Ok(());
+        }
     };
 
     if let JobOperation::Continue {
@@ -5134,13 +5139,21 @@ fn mime_for_source(source: &Path) -> &'static str {
     }
 }
 
+const WORKER_REGISTRATION_GRACE_SECS: u64 = 30;
+
 fn reconcile_interrupted(job_id: &str) -> Result<Job> {
     let lock = lock_job(job_id)?;
     let mut job = read_job(job_id)?;
+    let awaiting_worker_registration = job.state == "queued"
+        && job.worker_pid.is_none()
+        && now_secs().saturating_sub(job.created_at) < WORKER_REGISTRATION_GRACE_SECS;
     let has_no_live_worker = job
         .worker_pid
         .is_none_or(|pid| !Path::new("/proc").join(pid.to_string()).exists());
-    if matches!(job.state.as_str(), "queued" | "running") && has_no_live_worker {
+    if matches!(job.state.as_str(), "queued" | "running")
+        && has_no_live_worker
+        && !awaiting_worker_registration
+    {
         let published_derive = derive::reconcile_published(&job)?;
         job.state = if published_derive.is_some() {
             "succeeded".to_string()
@@ -5373,7 +5386,11 @@ fn running_jobs() -> Result<usize> {
         {
             continue;
         }
-        let job: Job = read_json(&entry.path())?;
+        let job: Job = match read_json(&entry.path()) {
+            Ok(job) => job,
+            Err(error) if is_not_found(&error) => continue,
+            Err(error) => return Err(error),
+        };
         if job.state == "running" && !matches!(job.operation, JobOperation::KnowledgeBatch { .. }) {
             active = active.checked_add(1).context("counting active Jobs")?;
         }
@@ -5392,7 +5409,11 @@ fn next_queued_job_id() -> Result<Option<String>> {
         {
             continue;
         }
-        let job: Job = read_json(&entry.path())?;
+        let job: Job = match read_json(&entry.path()) {
+            Ok(job) => job,
+            Err(error) if is_not_found(&error) => continue,
+            Err(error) => return Err(error),
+        };
         if job.state == "queued" {
             queued.push((job.created_at, job.id));
         }
@@ -5507,6 +5528,14 @@ fn read_json<T: for<'de> Deserialize<'de>>(path: &Path) -> Result<T> {
     let file = File::open(path).with_context(|| format!("opening {}", path.display()))?;
     serde_json::from_reader(BufReader::new(file))
         .with_context(|| format!("reading {}", path.display()))
+}
+
+fn is_not_found(error: &anyhow::Error) -> bool {
+    error.chain().any(|cause| {
+        cause
+            .downcast_ref::<std::io::Error>()
+            .is_some_and(|error| error.kind() == std::io::ErrorKind::NotFound)
+    })
 }
 
 fn append_json_line<T: Serialize>(path: &Path, value: &T) -> Result<()> {

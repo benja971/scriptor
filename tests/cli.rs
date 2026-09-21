@@ -1036,7 +1036,7 @@ fn cli_reports_its_package_version() {
         .arg("--version")
         .assert()
         .success()
-        .stdout("scriptor 0.3.0-alpha.2\n")
+        .stdout("scriptor 0.3.0-alpha.3\n")
         .stderr(predicate::str::is_empty());
 }
 
@@ -1172,7 +1172,16 @@ fn queued_job_without_worker_is_reconciled_as_interrupted() {
     let env = TestEnv::new("queued-without-worker");
     let source = env.work_dir.join("source.txt");
     fs::write(&source, "persisted Source").expect("écriture de la Source");
-    write_capture_worker_job(&env, "job-99", &source, &[], 30);
+    let path = write_capture_worker_job(&env, "job-99", &source, &[], 30);
+    let mut stale: Value =
+        serde_json::from_slice(&fs::read(&path).expect("lecture du Job")).expect("Job JSON valide");
+    stale["created_at"] = Value::from(0);
+    stale["updated_at"] = Value::from(0);
+    fs::write(
+        &path,
+        serde_json::to_vec(&stale).expect("sérialisation du Job de test"),
+    )
+    .expect("écriture du Job de test");
 
     let job: Value = serde_json::from_slice(
         &env.command()
@@ -1258,6 +1267,8 @@ fn interrupted_capture_can_be_retried_only_as_the_same_request() {
         serde_json::from_slice(&fs::read(&interrupted_path).expect("lecture du Job interrompu"))
             .expect("Job interrompu JSON valide");
     interrupted_job["policy"] = created_probe["job"]["policy"].clone();
+    interrupted_job["created_at"] = Value::from(0);
+    interrupted_job["updated_at"] = Value::from(0);
     fs::write(
         &interrupted_path,
         serde_json::to_vec(&interrupted_job).expect("sérialisation du Job interrompu"),
@@ -5272,6 +5283,7 @@ fn queued_derive_starts_after_a_concurrency_slot_is_released() {
     )
     .expect("Job de Derive JSON valide");
     let job_id = created["job"]["job_id"].as_str().expect("Job de Derive");
+    assert!(created["job"]["worker_pid"].is_u64(), "{created}");
     let job_path = env.xdg_data.join(format!("scriptor/v2/jobs/{job_id}.json"));
     assert!(wait_for_job_state(
         &job_path,
@@ -5287,4 +5299,23 @@ fn queued_derive_starts_after_a_concurrency_slot_is_released() {
     }
     let finished = wait_for_agent_job(&env, job_id);
     assert_eq!(finished["state"], "succeeded", "{finished}");
+}
+
+#[test]
+fn newly_queued_job_is_not_reconciled_before_its_worker_can_register() {
+    let env = TestEnv::new("queued-job-startup");
+    let source = env.work_dir.join("source.txt");
+    fs::write(&source, "Source").expect("écriture Source");
+    write_capture_worker_job(&env, "job-9911", &source, &[], 30);
+
+    let job: Value = serde_json::from_slice(
+        &env.command()
+            .args(["job", "get", "job-9911"])
+            .assert()
+            .success()
+            .get_output()
+            .stdout,
+    )
+    .expect("Job JSON valide");
+    assert_eq!(job["state"], "queued", "{job}");
 }
