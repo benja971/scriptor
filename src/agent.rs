@@ -51,6 +51,7 @@ const KNOWLEDGE_ANALYZER_VERSION: &str = "knowledge_v1";
 const KNOWLEDGE_PHRASE_BOOST: f32 = 2.0;
 const LOCAL_DERIVE_PROVIDER: &str = "scriptor-local-derive";
 const JOB_QUEUE_POLL_INTERVAL: Duration = Duration::from_millis(25);
+const MAX_BATCH_SOURCE_FILE_BYTES: u64 = 1024 * 1024;
 const DEFAULT_READ_LENGTH: usize = 8 * 1024;
 const MAX_READ_LENGTH: usize = 1024 * 1024;
 pub const MANIFEST_FORMAT_VERSION: u8 = 1;
@@ -96,8 +97,10 @@ enum KnowledgeSubcommand {
 
 #[derive(Args)]
 struct KnowledgeBatchCommand {
-    #[arg(long = "source", required = true)]
+    #[arg(long = "source")]
     sources: Vec<String>,
+    #[arg(long = "source-file")]
+    source_files: Vec<PathBuf>,
     #[arg(long = "capture-policy")]
     capture_policy: String,
     #[arg(long = "derive-policy")]
@@ -908,9 +911,15 @@ fn run_knowledge_batch_command(command: KnowledgeBatchCommand) -> Result<()> {
     {
         bail!("knowledge batch requires an allowed local knowledge-card Provider");
     }
+    let mut sources = command.sources;
+    for source_file in command.source_files {
+        sources.extend(read_batch_sources(&source_file)?);
+    }
+    if sources.is_empty() {
+        bail!("knowledge batch requires --source or --source-file");
+    }
     let mut seen = HashSet::new();
-    let sources = command
-        .sources
+    let sources = sources
         .into_iter()
         .filter(|source| seen.insert(source.clone()))
         .collect();
@@ -924,6 +933,32 @@ fn run_knowledge_batch_command(command: KnowledgeBatchCommand) -> Result<()> {
         },
         None,
     )
+}
+
+fn read_batch_sources(path: &Path) -> Result<Vec<String>> {
+    let metadata = fs::metadata(path)
+        .with_context(|| format!("reading knowledge batch Source file {}", path.display()))?;
+    if !metadata.is_file() {
+        bail!(
+            "knowledge batch Source file must be a regular file: {}",
+            path.display()
+        );
+    }
+    if metadata.len() > MAX_BATCH_SOURCE_FILE_BYTES {
+        bail!(
+            "knowledge batch Source file exceeds {} bytes: {}",
+            MAX_BATCH_SOURCE_FILE_BYTES,
+            path.display()
+        );
+    }
+    let content = fs::read_to_string(path)
+        .with_context(|| format!("reading knowledge batch Source file {}", path.display()))?;
+    Ok(content
+        .lines()
+        .map(str::trim)
+        .filter(|line| !line.is_empty() && !line.starts_with('#'))
+        .map(str::to_string)
+        .collect())
 }
 
 fn run_derive_command(command: DeriveCommand) -> Result<()> {

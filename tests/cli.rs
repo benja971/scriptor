@@ -3735,6 +3735,60 @@ fn knowledge_batch_publishes_readable_cards_in_source_order() {
 }
 
 #[test]
+fn knowledge_batch_reads_a_deduplicated_source_file() {
+    let env = TestEnv::new("knowledge-batch-source-file");
+    let first = env.work_dir.join("first.txt");
+    let second = env.work_dir.join("second.txt");
+    let list = env.work_dir.join("links.txt");
+    fs::write(&first, "Premier signal batchfileone.").expect("écriture première Source");
+    fs::write(&second, "Second signal batchfiletwo.").expect("écriture seconde Source");
+    fs::write(
+        &list,
+        format!(
+            "# liens choisis\n{}\n\n{}\n{}\n",
+            first.display(),
+            second.display(),
+            first.display()
+        ),
+    )
+    .expect("écriture liste de Sources");
+    let created: Value = serde_json::from_slice(
+        &env.command()
+            .args([
+                "knowledge",
+                "batch",
+                "--source-file",
+                list.to_str().expect("liste UTF-8"),
+                "--capture-policy",
+                "safe-local@1",
+                "--derive-policy",
+                "safe-local@1",
+                "--recipe",
+                "knowledge-card",
+                "--provider",
+                "scriptor-local-derive",
+            ])
+            .assert()
+            .success()
+            .get_output()
+            .stdout,
+    )
+    .expect("Job de lot JSON valide");
+    let finished = wait_for_agent_job(
+        &env,
+        created["job"]["job_id"]
+            .as_str()
+            .expect("identifiant du Job parent"),
+    );
+
+    assert_eq!(finished["state"], "succeeded", "{finished}");
+    let items = finished["batch_items"].as_array().expect("bilan de lot");
+    assert_eq!(items.len(), 2);
+    assert_eq!(items[0]["source"], first.to_string_lossy().as_ref());
+    assert_eq!(items[1]["source"], second.to_string_lossy().as_ref());
+}
+
+#[test]
 fn knowledge_batch_keeps_a_published_card_when_another_source_is_rejected() {
     let env = TestEnv::new("knowledge-batch-capture-failure");
     let missing = env.work_dir.join("missing.txt");

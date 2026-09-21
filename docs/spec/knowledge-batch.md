@@ -28,9 +28,11 @@ conserve chaque Job enfant, Capture, Dérivé, Fiche et erreur.
 
 ## Implementation Decisions
 
-- Commande : `knowledge batch --source <url>` répétable, `--capture-policy`,
+- Commande : `knowledge batch --source <url>` répétable ou `--source-file
+  <chemin>` pour une liste UTF-8 locale, `--capture-policy`,
   `--derive-policy`, `--provider scriptor-local-derive` et `--recipe
-  knowledge-card` obligatoires.
+  knowledge-card` obligatoires. Les lignes vides et celles qui commencent par
+  `#` sont ignorées.
 - Le parent est un Job distinct. Il termine `partial` dès qu'une Source échoue,
   est refusée ou ne publie pas de Capture utilisable. Une annulation du parent
   le laisse `cancelled`.
