@@ -48,3 +48,4 @@ jobs:
         with:
           files: scriptor-linux-x86_64
           body_path: CHANGES.md
+          prerelease: ${{ contains(github.ref_name, '-') }}

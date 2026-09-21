@@ -895,6 +895,13 @@ pub(super) fn list(capture_id: &str) -> Result<Vec<Derivative>> {
     Ok(derivatives)
 }
 
+pub(super) fn reference_for(capture_id: &str, derive_id: &str) -> Result<Option<Reference>> {
+    Ok(list(capture_id)?
+        .into_iter()
+        .find(|derivative| derivative.derive_id == derive_id)
+        .map(|derivative| derivative.reference))
+}
+
 pub(super) fn artifact_for(
     capture_id: &str,
     artifact_id: &str,

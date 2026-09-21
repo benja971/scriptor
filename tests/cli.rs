@@ -3660,6 +3660,325 @@ fn knowledge_search_returns_complete_statements_with_minimal_provenance() {
 }
 
 #[test]
+fn knowledge_batch_publishes_readable_cards_in_source_order() {
+    let env = TestEnv::new("knowledge-batch-success");
+    let first = env.work_dir.join("first.txt");
+    let second = env.work_dir.join("second.txt");
+    fs::write(&first, "Premier signal batchalpha.").expect("écriture première Source");
+    fs::write(&second, "Second signal batchbeta.").expect("écriture seconde Source");
+
+    let created: Value = serde_json::from_slice(
+        &env.command()
+            .args([
+                "knowledge",
+                "batch",
+                "--source",
+                first.to_str().expect("première Source UTF-8"),
+                "--source",
+                second.to_str().expect("seconde Source UTF-8"),
+                "--capture-policy",
+                "safe-local@1",
+                "--derive-policy",
+                "safe-local@1",
+                "--recipe",
+                "knowledge-card",
+                "--provider",
+                "scriptor-local-derive",
+            ])
+            .assert()
+            .success()
+            .get_output()
+            .stdout,
+    )
+    .expect("Job de lot JSON valide");
+    let finished = wait_for_agent_job(
+        &env,
+        created["job"]["job_id"]
+            .as_str()
+            .expect("identifiant du Job parent"),
+    );
+
+    assert_eq!(finished["state"], "succeeded", "{finished}");
+    let items = finished["batch_items"].as_array().expect("bilan de lot");
+    assert_eq!(items.len(), 2);
+    assert_eq!(items[0]["source"], first.to_string_lossy().as_ref());
+    assert_eq!(items[1]["source"], second.to_string_lossy().as_ref());
+    for item in items {
+        assert_eq!(item["error"], Value::Null, "{item}");
+        assert!(item["capture_job_id"].is_string(), "{item}");
+        assert!(item["capture_id"].is_string(), "{item}");
+        assert!(item["derive_job_id"].is_string(), "{item}");
+        assert!(item["derive_id"].is_string(), "{item}");
+        let reference = item["reference"].to_string();
+        let read: Value = serde_json::from_slice(
+            &env.command()
+                .args(["capture", "read", "--reference", &reference])
+                .assert()
+                .success()
+                .get_output()
+                .stdout,
+        )
+        .expect("lecture de Fiche JSON valide");
+        assert_eq!(read["reference"], item["reference"]);
+        assert_eq!(read["reference"]["capture_id"], item["capture_id"]);
+    }
+    let search: Value = serde_json::from_slice(
+        &env.command()
+            .args(["knowledge", "search", "batchalpha"])
+            .assert()
+            .success()
+            .get_output()
+            .stdout,
+    )
+    .expect("recherche de Fiche JSON valide");
+    assert!(!search["results"].as_array().expect("résultats").is_empty());
+}
+
+#[test]
+fn knowledge_batch_keeps_a_published_card_when_another_source_is_rejected() {
+    let env = TestEnv::new("knowledge-batch-capture-failure");
+    let missing = env.work_dir.join("missing.txt");
+    let valid = env.work_dir.join("valid.txt");
+    fs::write(&valid, "Signal batchvalid.").expect("écriture Source valide");
+    let created: Value = serde_json::from_slice(
+        &env.command()
+            .args([
+                "knowledge",
+                "batch",
+                "--source",
+                missing.to_str().expect("Source absente UTF-8"),
+                "--source",
+                valid.to_str().expect("Source valide UTF-8"),
+                "--capture-policy",
+                "safe-local@1",
+                "--derive-policy",
+                "safe-local@1",
+                "--recipe",
+                "knowledge-card",
+                "--provider",
+                "scriptor-local-derive",
+            ])
+            .assert()
+            .success()
+            .get_output()
+            .stdout,
+    )
+    .expect("Job de lot JSON valide");
+    let finished = wait_for_agent_job(
+        &env,
+        created["job"]["job_id"]
+            .as_str()
+            .expect("identifiant du Job parent"),
+    );
+
+    assert_eq!(finished["state"], "partial", "{finished}");
+    let items = finished["batch_items"].as_array().expect("bilan de lot");
+    assert_eq!(items[0]["error"]["code"], "capture_rejected");
+    assert!(items[0]["capture_id"].is_null());
+    assert_eq!(items[1]["error"], Value::Null);
+    assert!(items[1]["capture_id"].is_string());
+    assert!(items[1]["reference"].is_object());
+}
+
+#[test]
+fn knowledge_batch_keeps_its_capture_when_the_card_fails() {
+    let env = TestEnv::new("knowledge-batch-derive-failure");
+    env.install_binary("scriptor-local-derive", FAKE_LOCAL_DERIVE_PROVIDER_FAILURE);
+    let source = env.work_dir.join("source.txt");
+    fs::write(&source, "Signal batchderivefailure.").expect("écriture Source");
+    let created: Value = serde_json::from_slice(
+        &env.command()
+            .args([
+                "knowledge",
+                "batch",
+                "--source",
+                source.to_str().expect("Source UTF-8"),
+                "--capture-policy",
+                "safe-local@1",
+                "--derive-policy",
+                "safe-local@1",
+                "--recipe",
+                "knowledge-card",
+                "--provider",
+                "scriptor-local-derive",
+            ])
+            .assert()
+            .success()
+            .get_output()
+            .stdout,
+    )
+    .expect("Job de lot JSON valide");
+    let finished = wait_for_agent_job(
+        &env,
+        created["job"]["job_id"]
+            .as_str()
+            .expect("identifiant du Job parent"),
+    );
+
+    assert_eq!(finished["state"], "partial", "{finished}");
+    let item = &finished["batch_items"][0];
+    assert!(item["capture_id"].is_string(), "{item}");
+    assert!(item["derive_job_id"].is_string(), "{item}");
+    assert_eq!(item["error"]["code"], "derive_provider_failed");
+    assert!(item["reference"].is_null());
+}
+
+#[test]
+fn knowledge_batch_does_not_derive_a_partial_capture() {
+    let env = TestEnv::new("knowledge-batch-partial-capture");
+    env.write_config(&env.work_dir.join("out"));
+    env.install_binary("whisper-cli", FAKE_WHISPER_CLI_FAILURE);
+    let source = env.write_media_file("partial.mp4");
+    let created: Value = serde_json::from_slice(
+        &env.command()
+            .args([
+                "knowledge",
+                "batch",
+                "--source",
+                source.to_str().expect("Source UTF-8"),
+                "--capture-policy",
+                "safe-local@1",
+                "--derive-policy",
+                "safe-local@1",
+                "--recipe",
+                "knowledge-card",
+                "--provider",
+                "scriptor-local-derive",
+            ])
+            .assert()
+            .success()
+            .get_output()
+            .stdout,
+    )
+    .expect("Job de lot JSON valide");
+    let finished = wait_for_agent_job(
+        &env,
+        created["job"]["job_id"]
+            .as_str()
+            .expect("identifiant du Job parent"),
+    );
+
+    assert_eq!(finished["state"], "partial", "{finished}");
+    let item = &finished["batch_items"][0];
+    assert!(item["capture_id"].is_string(), "{item}");
+    assert!(item["derive_job_id"].is_null(), "{item}");
+    assert_eq!(item["error"]["code"], "capture_not_usable");
+}
+
+#[test]
+fn knowledge_batch_refuses_a_saved_collection_url() {
+    let env = TestEnv::new("knowledge-batch-saved-url");
+    let created: Value = serde_json::from_slice(
+        &env.command()
+            .args([
+                "knowledge",
+                "batch",
+                "--source",
+                "https://www.instagram.com/example/saved/collection/",
+                "--capture-policy",
+                "safe-web@1",
+                "--derive-policy",
+                "safe-local@1",
+                "--recipe",
+                "knowledge-card",
+                "--provider",
+                "scriptor-local-derive",
+            ])
+            .assert()
+            .success()
+            .get_output()
+            .stdout,
+    )
+    .expect("Job de lot JSON valide");
+    let finished = wait_for_agent_job(
+        &env,
+        created["job"]["job_id"]
+            .as_str()
+            .expect("identifiant du Job parent"),
+    );
+
+    assert_eq!(finished["state"], "partial", "{finished}");
+    assert_eq!(
+        finished["batch_items"][0]["error"]["code"],
+        "capture_rejected"
+    );
+    assert!(finished["batch_items"][0]["capture_job_id"].is_null());
+}
+
+#[test]
+fn cancelling_a_knowledge_batch_does_not_start_its_next_source() {
+    let env = TestEnv::new("knowledge-batch-cancellation");
+    env.write_config(&env.work_dir.join("out"));
+    let started = env.work_dir.join("provider-started");
+    let release = env.work_dir.join("provider-release");
+    env.install_binary(
+        "ffmpeg",
+        &format!(
+            "#!/bin/sh\nset -eu\nprintf x > \"{}\"\nwhile [ ! -f \"{}\" ]; do :; done\n",
+            started.display(),
+            release.display()
+        ),
+    );
+    let first = env.write_media_file("first.mp4");
+    let second = env.write_media_file("second.mp4");
+    let created: Value = serde_json::from_slice(
+        &env.command()
+            .args([
+                "knowledge",
+                "batch",
+                "--source",
+                first.to_str().expect("première Source UTF-8"),
+                "--source",
+                second.to_str().expect("seconde Source UTF-8"),
+                "--capture-policy",
+                "safe-local@1",
+                "--derive-policy",
+                "safe-local@1",
+                "--recipe",
+                "knowledge-card",
+                "--provider",
+                "scriptor-local-derive",
+            ])
+            .assert()
+            .success()
+            .get_output()
+            .stdout,
+    )
+    .expect("Job de lot JSON valide");
+    let parent_id = created["job"]["job_id"]
+        .as_str()
+        .expect("identifiant du Job parent");
+    assert!(wait_for_file(&started, Duration::from_secs(5)));
+    let cancelled: Value = serde_json::from_slice(
+        &env.command()
+            .args(["job", "cancel", parent_id])
+            .assert()
+            .success()
+            .get_output()
+            .stdout,
+    )
+    .expect("annulation JSON valide");
+    assert_eq!(cancelled["state"], "cancelled");
+    fs::write(&release, b"release").expect("libération du Provider");
+    std::thread::sleep(Duration::from_millis(100));
+    let jobs_dir = env.xdg_data.join("scriptor/v2/jobs");
+    let sources = fs::read_dir(jobs_dir)
+        .expect("lecture des Jobs")
+        .filter_map(Result::ok)
+        .filter(|entry| {
+            entry
+                .path()
+                .extension()
+                .is_some_and(|extension| extension == "json")
+        })
+        .filter_map(|entry| fs::read(entry.path()).ok())
+        .filter_map(|bytes| serde_json::from_slice::<Value>(&bytes).ok())
+        .filter(|job| job["operation"]["kind"] == "capture")
+        .collect::<Vec<_>>();
+    assert_eq!(sources.len(), 1, "{sources:?}");
+}
+
+#[test]
 fn knowledge_search_paginates_stably_and_rebuilds_its_projection() {
     let env = TestEnv::new("knowledge-search-pagination");
     let capture_id = create_text_capture_with_content(&env, "pagination.txt", "Source brute.\n");
