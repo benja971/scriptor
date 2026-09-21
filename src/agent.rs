@@ -9,7 +9,7 @@ use std::thread;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use anyhow::{Context, Result, bail};
-use clap::{Args, Parser, Subcommand, ValueEnum};
+use clap::{Args, Parser, Subcommand, ValueEnum, error::ErrorKind};
 use fs2::FileExt;
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
@@ -57,7 +57,7 @@ const MAX_READ_LENGTH: usize = 1024 * 1024;
 pub const MANIFEST_FORMAT_VERSION: u8 = 1;
 
 #[derive(Parser)]
-#[command(name = "scriptor")]
+#[command(name = "scriptor", version)]
 struct AgentCli {
     #[command(subcommand)]
     command: AgentCommand,
@@ -861,6 +861,10 @@ struct ReadRequest {
 pub fn run(arguments: Vec<OsString>) -> Result<()> {
     let cli = match AgentCli::try_parse_from(arguments) {
         Ok(cli) => cli,
+        Err(error) if error.kind() == ErrorKind::DisplayVersion => {
+            print!("{}", error.render());
+            return Ok(());
+        }
         Err(error) => return print_agent_error("invalid_command", error.to_string()),
     };
     let result = match cli.command {

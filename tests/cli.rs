@@ -1030,6 +1030,17 @@ fn assert_capture_searches(env: &TestEnv, query: &str, capture_id: &str) {
 }
 
 #[test]
+fn cli_reports_its_package_version() {
+    let env = TestEnv::new("version");
+    env.command()
+        .arg("--version")
+        .assert()
+        .success()
+        .stdout("scriptor 0.3.0-alpha.2\n")
+        .stderr(predicate::str::is_empty());
+}
+
+#[test]
 fn capture_returns_a_persistent_job_then_publishes_an_inspectable_capture() {
     let env = TestEnv::new("capture-contract");
     let source = env.write_media_file("notes.txt");
