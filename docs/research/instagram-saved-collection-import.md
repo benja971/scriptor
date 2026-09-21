@@ -99,18 +99,21 @@ Critère de sortie : une liste locale de dix permaliens publics produit dix
 résultats individuels et aucun secret, cookie ou URL `/saved/` n'apparaît dans
 le Référentiel, les manifests ou les logs.
 
-### Pas avant validation explicite
+### Helper local à geste explicite
 
-Un helper navigateur peut être étudié plus tard, seulement s'il réduit une
-friction mesurée. Il doit être déclenché par un geste explicite de l'utilisateur
-sur l'onglet actif, extraire uniquement les `href` de permaliens publics déjà
-visibles, puis lui faire relire et copier la liste. Il ne doit avoir ni
-permission cookies, ni interception réseau, ni chargement automatique de
-pages, ni synchronisation périodique.
+Le helper [`scripts/instagram-visible-permalinks.js`](../../scripts/instagram-visible-permalinks.js)
+est déclenché manuellement par l'utilisateur dans l'onglet actif. Il extrait
+seulement les permaliens de publications déjà rendus dans le DOM, les normalise
+et les copie pour relecture dans le presse-papiers. Il ne demande ni permission
+cookies, ni interception réseau, ni chargement automatique de pages, ni
+synchronisation périodique.
 
-Même ce helper exige une revue des conditions Instagram en vigueur. L'absence
-d'API officielle pour Saved rend une automatisation authentifiée fragile et
-potentiellement incompatible avec les règles de la plateforme.
+L'utilisateur colle ensuite ces lignes dans un fichier local UTF-8 et appelle
+`scriptor knowledge batch --source-file <chemin>` avec les Policies explicites.
+Ce helper n'est pas un import automatisé de collection : l'utilisateur reste
+responsable de l'ouverture, du défilement, de la sélection et de la relecture.
+L'absence d'API officielle pour Saved rend toute automatisation authentifiée
+fragile et potentiellement incompatible avec les règles de la plateforme.
 
 ## Inconnues à lever avant toute extension
 

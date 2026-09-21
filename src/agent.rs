@@ -1,4 +1,4 @@
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::ffi::OsString;
 use std::fs::{self, File, OpenOptions};
 use std::io::{BufReader, Read, Seek, SeekFrom, Write};
@@ -51,6 +51,7 @@ const KNOWLEDGE_ANALYZER_VERSION: &str = "knowledge_v1";
 const KNOWLEDGE_PHRASE_BOOST: f32 = 2.0;
 const LOCAL_DERIVE_PROVIDER: &str = "scriptor-local-derive";
 const JOB_QUEUE_POLL_INTERVAL: Duration = Duration::from_millis(25);
+const MAX_BATCH_SOURCE_FILE_BYTES: u64 = 1024 * 1024;
 const DEFAULT_READ_LENGTH: usize = 8 * 1024;
 const MAX_READ_LENGTH: usize = 1024 * 1024;
 pub const MANIFEST_FORMAT_VERSION: u8 = 1;
@@ -83,6 +84,7 @@ struct KnowledgeCommand {
 
 #[derive(Subcommand)]
 enum KnowledgeSubcommand {
+    Batch(KnowledgeBatchCommand),
     Search {
         query: String,
         #[arg(long)]
@@ -91,6 +93,22 @@ enum KnowledgeSubcommand {
         limit: usize,
     },
     Index(KnowledgeIndexCommand),
+}
+
+#[derive(Args)]
+struct KnowledgeBatchCommand {
+    #[arg(long = "source")]
+    sources: Vec<String>,
+    #[arg(long = "source-file")]
+    source_files: Vec<PathBuf>,
+    #[arg(long = "capture-policy")]
+    capture_policy: String,
+    #[arg(long = "derive-policy")]
+    derive_policy: String,
+    #[arg(long, value_enum)]
+    recipe: RecipeKind,
+    #[arg(long)]
+    provider: String,
 }
 
 #[derive(Args)]
@@ -270,6 +288,19 @@ pub struct Job {
     child_capture_ids: Vec<String>,
     #[serde(default)]
     checkpoint: Option<ResolutionCheckpoint>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    batch_items: Vec<BatchItem>,
+    error: Option<StructuredError>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct BatchItem {
+    source: String,
+    capture_job_id: Option<String>,
+    capture_id: Option<String>,
+    derive_job_id: Option<String>,
+    derive_id: Option<String>,
+    reference: Option<Reference>,
     error: Option<StructuredError>,
 }
 
@@ -289,6 +320,11 @@ enum JobOperation {
         recipe: Recipe,
         provider: String,
         parameters: Value,
+    },
+    KnowledgeBatch {
+        sources: Vec<String>,
+        derive_policy: Policy,
+        provider: String,
     },
 }
 
@@ -844,6 +880,7 @@ pub fn run(arguments: Vec<OsString>) -> Result<()> {
 
 fn run_knowledge_command(command: KnowledgeCommand) -> Result<()> {
     match command.command {
+        KnowledgeSubcommand::Batch(command) => run_knowledge_batch_command(command),
         KnowledgeSubcommand::Search {
             query,
             cursor,
@@ -855,6 +892,73 @@ fn run_knowledge_command(command: KnowledgeCommand) -> Result<()> {
             cards: rebuild_knowledge_index()?,
         }),
     }
+}
+
+fn run_knowledge_batch_command(command: KnowledgeBatchCommand) -> Result<()> {
+    let capture_policy = policy_for(&command.capture_policy)?;
+    let derive_policy = policy_for(&command.derive_policy)?;
+    if command.recipe != RecipeKind::KnowledgeCard {
+        bail!("knowledge batch requires --recipe knowledge-card");
+    }
+    if !derive_policy
+        .snapshot
+        .allowed_recipes
+        .contains(&RecipeKind::KnowledgeCard)
+        || !derive_policy
+            .snapshot
+            .allowed_providers
+            .contains(&command.provider)
+    {
+        bail!("knowledge batch requires an allowed local knowledge-card Provider");
+    }
+    let mut sources = command.sources;
+    for source_file in command.source_files {
+        sources.extend(read_batch_sources(&source_file)?);
+    }
+    if sources.is_empty() {
+        bail!("knowledge batch requires --source or --source-file");
+    }
+    let mut seen = HashSet::new();
+    let sources = sources
+        .into_iter()
+        .filter(|source| seen.insert(source.clone()))
+        .collect();
+    create_job(
+        "knowledge-batch".to_string(),
+        capture_policy,
+        JobOperation::KnowledgeBatch {
+            sources,
+            derive_policy,
+            provider: command.provider,
+        },
+        None,
+    )
+}
+
+fn read_batch_sources(path: &Path) -> Result<Vec<String>> {
+    let metadata = fs::metadata(path)
+        .with_context(|| format!("reading knowledge batch Source file {}", path.display()))?;
+    if !metadata.is_file() {
+        bail!(
+            "knowledge batch Source file must be a regular file: {}",
+            path.display()
+        );
+    }
+    if metadata.len() > MAX_BATCH_SOURCE_FILE_BYTES {
+        bail!(
+            "knowledge batch Source file exceeds {} bytes: {}",
+            MAX_BATCH_SOURCE_FILE_BYTES,
+            path.display()
+        );
+    }
+    let content = fs::read_to_string(path)
+        .with_context(|| format!("reading knowledge batch Source file {}", path.display()))?;
+    Ok(content
+        .lines()
+        .map(str::trim)
+        .filter(|line| !line.is_empty() && !line.starts_with('#'))
+        .map(str::to_string)
+        .collect())
 }
 
 fn run_derive_command(command: DeriveCommand) -> Result<()> {
@@ -1118,6 +1222,16 @@ fn create_job(
     operation: JobOperation,
     retry_of: Option<String>,
 ) -> Result<()> {
+    let job = enqueue_job(source, policy, operation, retry_of)?;
+    print_json(&CreatedJob { job: &job })
+}
+
+fn enqueue_job(
+    source: String,
+    policy: Policy,
+    operation: JobOperation,
+    retry_of: Option<String>,
+) -> Result<Job> {
     let now = now_secs();
     let job = Job {
         id: format!("job-{}", unique_id()),
@@ -1133,6 +1247,7 @@ fn create_job(
         retry_of,
         child_capture_ids: Vec::new(),
         checkpoint: None,
+        batch_items: Vec::new(),
         error: None,
     };
     write_job(&job)?;
@@ -1150,16 +1265,12 @@ fn create_job(
         Ok(worker) => worker,
         Err(error) => {
             fail_job(&job.id, &error.into())?;
-            return print_json(&CreatedJob {
-                job: &read_job(&job.id)?,
-            });
+            return read_job(&job.id);
         }
     };
     register_worker(&job.id, worker.id())?;
 
-    print_json(&CreatedJob {
-        job: &read_job(&job.id)?,
-    })
+    read_job(&job.id)
 }
 
 fn run_worker(job_id: &str) -> Result<()> {
@@ -1172,6 +1283,13 @@ fn run_worker(job_id: &str) -> Result<()> {
     } = &job.operation
     {
         return match resolve_discoveries(&job, parent_capture_id) {
+            Ok(()) => Ok(()),
+            Err(error) => fail_job(job_id, &error),
+        };
+    }
+
+    if matches!(job.operation, JobOperation::KnowledgeBatch { .. }) {
+        return match run_knowledge_batch(&job) {
             Ok(()) => Ok(()),
             Err(error) => fail_job(job_id, &error),
         };
@@ -1193,6 +1311,211 @@ fn run_worker(job_id: &str) -> Result<()> {
         Ok(Publication::Cancelled) => Ok(()),
         Err(error) => fail_job(job_id, &error),
     }
+}
+
+#[allow(clippy::too_many_lines)]
+fn run_knowledge_batch(job: &Job) -> Result<()> {
+    let JobOperation::KnowledgeBatch {
+        sources,
+        derive_policy,
+        provider,
+    } = &job.operation
+    else {
+        bail!("Knowledge batch Worker received a non-batch Job");
+    };
+    let mut partial = false;
+    for source in sources {
+        if read_job(&job.id)?.state == "cancelled" {
+            return Ok(());
+        }
+        let mut item = BatchItem {
+            source: source.clone(),
+            capture_job_id: None,
+            capture_id: None,
+            derive_job_id: None,
+            derive_id: None,
+            reference: None,
+            error: None,
+        };
+        let capture_source = match admit_batch_source(source, &job.policy) {
+            Ok(source) => source,
+            Err(error) => {
+                partial = true;
+                item.error = Some(batch_item_error("capture_rejected", &error));
+                append_batch_item(&job.id, item)?;
+                continue;
+            }
+        };
+        let capture_job = enqueue_job(
+            capture_source,
+            job.policy.clone(),
+            JobOperation::Capture { renderer: None },
+            None,
+        )?;
+        item.capture_job_id = Some(capture_job.id.clone());
+        let Some(capture_job) = wait_for_batch_child(&job.id, &capture_job.id)? else {
+            return Ok(());
+        };
+        item.capture_id.clone_from(&capture_job.capture_id);
+        if capture_job.state != "succeeded" {
+            partial = true;
+            item.error = Some(batch_child_error(
+                &capture_job,
+                "capture_not_usable",
+                "Capture did not publish a usable result",
+            ));
+            append_batch_item(&job.id, item)?;
+            continue;
+        }
+        let Some(capture_id) = capture_job.capture_id else {
+            partial = true;
+            item.error = Some(batch_message_error(
+                "capture_not_usable",
+                "Capture succeeded without a capture_id",
+            ));
+            append_batch_item(&job.id, item)?;
+            continue;
+        };
+        let target = RecipeTarget::Capture {
+            capture_id: capture_id.clone(),
+        };
+        if let Err(error) = derive::admit(
+            &capture_id,
+            RecipeKind::KnowledgeCard,
+            provider,
+            &target,
+            derive_policy,
+        ) {
+            partial = true;
+            item.error = Some(batch_item_error("derive_rejected", &error));
+            append_batch_item(&job.id, item)?;
+            continue;
+        }
+        let derive_job = enqueue_job(
+            capture_id.clone(),
+            derive_policy.clone(),
+            JobOperation::Derive {
+                capture_id: capture_id.clone(),
+                recipe: Recipe {
+                    kind: RecipeKind::KnowledgeCard,
+                    target,
+                },
+                provider: provider.clone(),
+                parameters: Value::Object(serde_json::Map::new()),
+            },
+            None,
+        )?;
+        item.derive_job_id = Some(derive_job.id.clone());
+        let Some(derive_job) = wait_for_batch_child(&job.id, &derive_job.id)? else {
+            return Ok(());
+        };
+        item.derive_id.clone_from(&derive_job.derive_id);
+        if derive_job.state != "succeeded" {
+            partial = true;
+            item.error = Some(batch_child_error(
+                &derive_job,
+                "derive_not_published",
+                "Derive did not publish a knowledge card",
+            ));
+            append_batch_item(&job.id, item)?;
+            continue;
+        }
+        let Some(derive_id) = derive_job.derive_id else {
+            partial = true;
+            item.error = Some(batch_message_error(
+                "derive_not_published",
+                "Derive succeeded without a derive_id",
+            ));
+            append_batch_item(&job.id, item)?;
+            continue;
+        };
+        item.reference = derive::reference_for(&capture_id, &derive_id)?;
+        if item.reference.is_none() {
+            partial = true;
+            item.error = Some(batch_message_error(
+                "derive_not_published",
+                "Derive succeeded without a readable knowledge-card Reference",
+            ));
+        }
+        append_batch_item(&job.id, item)?;
+    }
+    complete_knowledge_batch_job(&job.id, partial)
+}
+
+fn admit_batch_source(source: &str, policy: &Policy) -> Result<String> {
+    let admitted = admission::admit(Path::new(source), policy)?;
+    if let admission::Source::Web(url) = &admitted {
+        let parsed = Url::parse(url).context("parsing batch Web Source")?;
+        if parsed
+            .path_segments()
+            .is_some_and(|mut segments| segments.any(|segment| segment == "saved"))
+        {
+            bail!("knowledge batch refuses private saved-collection URLs");
+        }
+    }
+    Ok(admitted.into_job_source())
+}
+
+fn wait_for_batch_child(parent_job_id: &str, child_job_id: &str) -> Result<Option<Job>> {
+    loop {
+        if read_job(parent_job_id)?.state == "cancelled" {
+            return Ok(None);
+        }
+        let child = reconcile_interrupted(child_job_id)?;
+        if is_terminal(&child.state) {
+            return Ok(Some(child));
+        }
+        thread::sleep(JOB_QUEUE_POLL_INTERVAL);
+    }
+}
+
+fn append_batch_item(job_id: &str, item: BatchItem) -> Result<()> {
+    let lock = lock_job(job_id)?;
+    let mut job = read_job(job_id)?;
+    if job.state != "cancelled" {
+        job.batch_items.push(item);
+        job.updated_at = now_secs();
+        write_job(&job)?;
+        append_job_event(job_id, "batch_item_finished")?;
+    }
+    unlock_job(&lock)
+}
+
+fn complete_knowledge_batch_job(job_id: &str, partial: bool) -> Result<()> {
+    let lock = lock_job(job_id)?;
+    let mut job = read_job(job_id)?;
+    if job.state != "cancelled" {
+        job.state = if partial {
+            "partial".to_string()
+        } else {
+            "succeeded".to_string()
+        };
+        job.updated_at = now_secs();
+        job.worker_pid = None;
+        write_job(&job)?;
+        append_job_event(job_id, &job.state)?;
+    }
+    unlock_job(&lock)
+}
+
+fn batch_item_error(code: &str, error: &anyhow::Error) -> StructuredError {
+    batch_message_error(code, format!("{error:#}"))
+}
+
+fn batch_message_error(code: &str, message: impl Into<String>) -> StructuredError {
+    StructuredError {
+        code: code.to_string(),
+        message: message.into(),
+        capability: None,
+    }
+}
+
+fn batch_child_error(child: &Job, fallback_code: &str, fallback_message: &str) -> StructuredError {
+    child.error.clone().unwrap_or_else(|| StructuredError {
+        code: fallback_code.to_string(),
+        message: fallback_message.to_string(),
+        capability: None,
+    })
 }
 
 #[allow(clippy::too_many_lines)]
@@ -1714,7 +2037,7 @@ impl JobOperation {
     fn discovery_ids(&self) -> &[String] {
         match self {
             Self::Continue { discovery_ids, .. } => discovery_ids,
-            Self::Capture { .. } | Self::Derive { .. } => &[],
+            Self::Capture { .. } | Self::Derive { .. } | Self::KnowledgeBatch { .. } => &[],
         }
     }
 }
@@ -1851,7 +2174,9 @@ fn publish_capture(job: &Job) -> Result<Publication> {
 const fn selected_renderer(job: &Job) -> Option<WebRenderer> {
     match job.operation {
         JobOperation::Capture { renderer } => renderer,
-        JobOperation::Continue { .. } | JobOperation::Derive { .. } => None,
+        JobOperation::Continue { .. }
+        | JobOperation::Derive { .. }
+        | JobOperation::KnowledgeBatch { .. } => None,
     }
 }
 
@@ -5045,7 +5370,7 @@ fn running_jobs() -> Result<usize> {
             continue;
         }
         let job: Job = read_json(&entry.path())?;
-        if job.state == "running" {
+        if job.state == "running" && !matches!(job.operation, JobOperation::KnowledgeBatch { .. }) {
             active = active.checked_add(1).context("counting active Jobs")?;
         }
     }
