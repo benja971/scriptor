@@ -51,11 +51,29 @@ Les deux Fiches ont été lues par leur Référence exacte, avec `offset: 0` et
 lecture bornée à 8192 octets. Elles déclarent les Preuves, la caption examinée
 et les limites de couverture visuelle/OCR.
 
+## Correction et rerun
+
+Le Provider conservait déjà les métadonnées et la caption mais annulait la
+Capture lorsque les médias publics étaient indisponibles. Le correctif publie
+alors la Capture `partial` et le lot dérive sa caption non vide et vérifiable.
+Les autres Captures partielles restent non dérivables.
+
+Le rerun du 2026-09-22, `job-3215913-1790036607614966731`, atteint :
+
+| Mesure | Résultat |
+| --- | --- |
+| Sources | 36 |
+| État du lot | `succeeded` |
+| Fiches publiées ou réutilisées | 36 |
+| Échecs | 0 |
+
+Les requêtes `responsive design` et `database tables` retournent des Énoncés
+attribués de Fiches nouvelles, respectivement les sources `developer_lokesh`
+et `roadsidecoder`.
+
 ## Verdict
 
-Le contrat de lot, la réutilisation, la Fiche et la recherche locale sont
-opérationnels sur les sources disponibles. La validation de corpus prévue par
-l'issue #80 n'est pas satisfaisante : la collection ne contient que 36 sources
-visibles au lieu des 50 à 100 visées, et l'acquisition publique Instagram
-échoue pour 34 d'entre elles. Une amélioration du Provider Instagram est
-nécessaire avant de déclarer l'import de collection utilisable à grande échelle.
+Le contrat de lot, la Capture publique Instagram, la Fiche et la recherche
+locale sont opérationnels sur toute la collection visible. La collection ne
+contenait que 36 sources, en dessous de l'objectif initial de 50 à 100, mais la
+validation réelle du flux complet est positive sur son corpus disponible.

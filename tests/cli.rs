@@ -332,6 +332,11 @@ printf 'photo' > "$out/payload"
 printf '{"requested_url":"%s","final_url":"%s","mime":"image/jpeg","sha256":"55c64d0fcd6f9d5f7c828093857e3fdfda68478bb4e9bd24d481ef391c7804e8","size_bytes":5,"redirect_chain":["%s"]}' "$url" "$url" "$url" > "$out/metadata.json"
 "#;
 
+const FAKE_INSTAGRAM_BINARY_ACQUIRER_FAILURE: &str = r"#!/bin/sh
+echo 'Instagram media unavailable' >&2
+exit 1
+";
+
 const FAKE_INSTAGRAM_BUDGET_BINARY_ACQUIRER: &str = r#"#!/bin/sh
 set -eu
 url=""
@@ -3939,6 +3944,50 @@ fn knowledge_batch_does_not_derive_a_partial_capture() {
     assert!(item["capture_id"].is_string(), "{item}");
     assert!(item["derive_job_id"].is_null(), "{item}");
     assert_eq!(item["error"]["code"], "capture_not_usable");
+}
+
+#[test]
+fn knowledge_batch_derives_a_partial_instagram_capture_with_a_caption() {
+    let env = TestEnv::new("knowledge-batch-instagram-caption");
+    env.install_binary("yt-dlp", FAKE_INSTAGRAM_YT_DLP);
+    env.install_binary(
+        "scriptor-binary-acquirer",
+        FAKE_INSTAGRAM_BINARY_ACQUIRER_FAILURE,
+    );
+    let created: Value = serde_json::from_slice(
+        &env.command()
+            .args([
+                "knowledge",
+                "batch",
+                "--source",
+                "https://www.instagram.com/p/caption-only/",
+                "--capture-policy",
+                "safe-web@1",
+                "--derive-policy",
+                "safe-local@1",
+                "--recipe",
+                "knowledge-card",
+                "--provider",
+                "scriptor-local-derive",
+            ])
+            .assert()
+            .success()
+            .get_output()
+            .stdout,
+    )
+    .expect("Job de lot JSON valide");
+    let finished = wait_for_agent_job(
+        &env,
+        created["job"]["job_id"]
+            .as_str()
+            .expect("identifiant du Job parent"),
+    );
+
+    assert_eq!(finished["state"], "succeeded", "{finished}");
+    let item = &finished["batch_items"][0];
+    assert!(item["capture_id"].is_string(), "{item}");
+    assert!(item["derive_id"].is_string(), "{item}");
+    assert!(item["reference"].is_object(), "{item}");
 }
 
 #[test]

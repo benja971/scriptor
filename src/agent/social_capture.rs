@@ -223,7 +223,7 @@ impl Acquisition for SocialAcquisition<'_> {
             });
         }
         if artifacts.is_empty() {
-            bail!("Instagram metadata media acquisition failed");
+            partial = true;
         }
         let canonical_url = metadata
             .get("webpage_url")

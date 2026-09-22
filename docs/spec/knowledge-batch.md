@@ -12,8 +12,10 @@ concurrence est atteinte.
 `scriptor knowledge batch` crée un Job parent persistant depuis une liste
 explicite de Sources. Pour chaque Source, il lance une Capture avec une Policy
 de Capture explicite, attend son état terminal, puis lance `knowledge-card`
-avec une Policy locale explicite lorsque la Capture a réussi. Le bilan du parent
-conserve chaque Job enfant, Capture, Dérivé, Fiche et erreur.
+avec une Policy locale explicite lorsque la Capture a réussi. Une Capture
+Instagram `partial` reste dérivable uniquement si sa caption non vide est une
+Extraction vérifiable. Le bilan du parent conserve chaque Job enfant, Capture,
+Dérivé, Fiche et erreur.
 
 ## User Stories
 
@@ -38,8 +40,10 @@ conserve chaque Job enfant, Capture, Dérivé, Fiche et erreur.
   le laisse `cancelled`.
 - Le parent lance les enfants séquentiellement. La file de Jobs existante porte
   seule la concurrence, les budgets et l'annulation de chaque enfant.
-- Une Capture partielle avec `capture_id` ne déclenche pas de Dérivé dans ce
-  premier jalon. Son état reste visible dans le bilan.
+- Une Capture partielle avec `capture_id` ne déclenche pas de Dérivé, sauf une
+  Capture Instagram dont `extraction-caption` est non vide et vérifiable. Ce
+  cas préserve une information textuelle sourcée lorsque les médias publics
+  sont refusés. Toute autre Capture partielle reste visible sans Dérivé.
 - Le bilan contient, dans ordre d'entrée, Source, Job Capture, `capture_id`,
   Job Dérivé, `derive_id`, Référence Fiche et erreur structurée éventuelle.
 - Les Sources sont dédupliquées avant création du parent puis validées une à
@@ -51,8 +55,8 @@ conserve chaque Job enfant, Capture, Dérivé, Fiche et erreur.
 ## Testing Decisions
 
 - Tests CLI JSON couvrent succès complet, Capture refusée ou partielle, Dérivé
-  échoué, annulation parent, ordre de bilan et absence de Dérivé après Capture
-  partielle.
+  échoué, annulation parent, ordre de bilan, exception Instagram à caption et
+  absence de Dérivé après les autres Captures partielles.
 - Les tests utilisent Sources locales et Providers contrôlés dans un XDG isolé.
 - Un test lit la Fiche par Référence retournée dans le bilan et vérifie son
   appartenance à la Capture correspondante.

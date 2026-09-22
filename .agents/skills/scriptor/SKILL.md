@@ -67,7 +67,9 @@ quote local paths and URLs as a single argument.
    creation response. Treat any mismatch as a Contrat agent failure and stop.
    For `succeeded`, continue to Capture inspection. For `partial`, inspect the
    published Capture when `capture_id` is present so its usable results and
-   errors can be reported, then stop. For `failed`, `cancelled` or
+   errors can be reported, then stop. A `knowledge batch` may derive a partial
+   Instagram Capture only when its published caption is non-empty and
+   verifiable; other partial Captures remain non-derivable. For `failed`, `cancelled` or
    `interrupted`, report and stop.
 
 4. Inspect the successful Capture before choosing or starting any Dérivé:
