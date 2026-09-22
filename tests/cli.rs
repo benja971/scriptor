@@ -4006,6 +4006,51 @@ fn knowledge_batch_derives_a_partial_instagram_capture_with_a_caption() {
 }
 
 #[test]
+fn knowledge_batch_deduplicates_instagram_permalink_variants() {
+    let env = TestEnv::new("knowledge-batch-instagram-permalinks");
+    env.install_binary("yt-dlp", FAKE_INSTAGRAM_YT_DLP);
+    env.install_binary(
+        "scriptor-binary-acquirer",
+        FAKE_INSTAGRAM_BINARY_ACQUIRER_FAILURE,
+    );
+    let created: Value = serde_json::from_slice(
+        &env.command()
+            .args([
+                "knowledge",
+                "batch",
+                "--source",
+                "https://www.instagram.com/reel/post-1/",
+                "--source",
+                "https://www.instagram.com/alice/reel/post-1/?utm_source=saved",
+                "--capture-policy",
+                "safe-web@1",
+                "--derive-policy",
+                "safe-local@1",
+                "--recipe",
+                "knowledge-card",
+                "--provider",
+                "scriptor-local-derive",
+            ])
+            .assert()
+            .success()
+            .get_output()
+            .stdout,
+    )
+    .expect("Job de lot JSON valide");
+    let finished = wait_for_agent_job(
+        &env,
+        created["job"]["job_id"]
+            .as_str()
+            .expect("identifiant du Job parent"),
+    );
+
+    assert_eq!(finished["state"], "succeeded", "{finished}");
+    let items = finished["batch_items"].as_array().expect("bilan de lot");
+    assert_eq!(items.len(), 1, "{finished}");
+    assert_eq!(items[0]["source"], "https://www.instagram.com/reel/post-1/");
+}
+
+#[test]
 fn knowledge_batch_refuses_a_saved_collection_url() {
     let env = TestEnv::new("knowledge-batch-saved-url");
     let created: Value = serde_json::from_slice(

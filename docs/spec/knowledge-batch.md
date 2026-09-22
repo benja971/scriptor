@@ -47,8 +47,10 @@ Dérivé, Fiche et erreur.
 - Le bilan contient, dans ordre d'entrée, Source, Job Capture, `capture_id`,
   Job Dérivé, `derive_id`, Référence Fiche et erreur structurée éventuelle.
 - Les Sources sont dédupliquées avant création du parent puis validées une à
-  une. Aucune découverte, URL Saved, cookie ou session de navigateur n'est
-  acceptée.
+  une. Les permaliens Instagram publics reconnus (`/p/`, `/reel/`, `/tv/`,
+  avec ou sans segment de compte) sont ramenés à leur forme canonique avant
+  cette déduplication. Les autres Sources restent inchangées. Aucune
+  découverte, URL Saved, cookie ou session de navigateur n'est acceptée.
 - Une reprise explicite est un nouveau lot avec seulement Sources choisies par
   l'utilisateur. Le premier jalon ne relance jamais automatiquement un échec.
 
@@ -60,6 +62,8 @@ Dérivé, Fiche et erreur.
 - Les tests utilisent Sources locales et Providers contrôlés dans un XDG isolé.
 - Un test lit la Fiche par Référence retournée dans le bilan et vérifie son
   appartenance à la Capture correspondante.
+- Un test vérifie que deux variantes de permalien Instagram du même post ne
+  lancent qu'une seule Capture dans le lot.
 
 ## Out of Scope
 
