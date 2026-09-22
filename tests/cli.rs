@@ -293,6 +293,21 @@ done
 printf '{"id":"post-1","webpage_url":"https://www.instagram.com/p/post-1/","uploader":"alice","channel":"alice_handle","upload_date":"20260914","description":"Caption Instagram complete","thumbnails":[{"url":"https://93.184.216.34/photo.jpg"}]}'
 "#;
 
+const FAKE_INSTAGRAM_YT_DLP_WITH_REQUESTED_URL: &str = r#"#!/bin/sh
+set -eu
+ignored_config=0
+url=""
+for arg in "$@"; do
+  [ "$arg" != "--ignore-config" ] || ignored_config=1
+  url="$arg"
+done
+[ "$ignored_config" = "1" ]
+for arg in "$@"; do
+  [ "$arg" != "--version" ] || { printf '2026.08.19\n'; exit 0; }
+done
+printf '{"id":"post-1","webpage_url":"%s","uploader":"alice","channel":"alice_handle","upload_date":"20260914","description":"Caption Instagram complete","thumbnails":[{"url":"https://93.184.216.34/photo.jpg"}]}' "$url"
+"#;
+
 const FAKE_INSTAGRAM_VIDEO_YT_DLP: &str = r#"#!/bin/sh
 set -eu
 ignored_config=0
@@ -4286,15 +4301,13 @@ fn knowledge_search_returns_structured_errors_for_unavailable_and_degraded_index
 #[test]
 fn knowledge_search_social_variants_supersede_only_when_their_proofs_match() {
     let env = TestEnv::new("knowledge-search-social-supersession");
-    env.install_binary("yt-dlp", FAKE_INSTAGRAM_YT_DLP);
+    env.install_binary("yt-dlp", FAKE_INSTAGRAM_YT_DLP_WITH_REQUESTED_URL);
     env.install_binary("scriptor-binary-acquirer", FAKE_INSTAGRAM_BINARY_ACQUIRER);
     env.install_binary("scriptor-page-renderer", "#!/bin/sh\nexit 99\n");
 
     let first_id = create_instagram_photo_capture(&env, "https://www.instagram.com/p/post-1/");
-    let second_id = create_instagram_photo_capture(
-        &env,
-        "https://www.instagram.com/p/post-1/?utm_source=fixture",
-    );
+    let second_id =
+        create_instagram_photo_capture(&env, "https://www.instagram.com/alice/p/post-1/");
     for (capture_id, text) in [
         (&first_id, "Même post needle, première variante."),
         (&second_id, "Même post needle, variante la plus récente."),
@@ -4321,7 +4334,8 @@ fn knowledge_search_social_variants_supersede_only_when_their_proofs_match() {
 
     env.install_binary(
         "yt-dlp",
-        &FAKE_INSTAGRAM_YT_DLP.replace("Caption Instagram complete", "Caption modifiee"),
+        &FAKE_INSTAGRAM_YT_DLP_WITH_REQUESTED_URL
+            .replace("Caption Instagram complete", "Caption modifiee"),
     );
     let changed_id = create_instagram_photo_capture(
         &env,
@@ -4351,6 +4365,46 @@ fn knowledge_search_social_variants_supersede_only_when_their_proofs_match() {
     )
     .expect("résultats social modifiés JSON valides");
     assert_eq!(changed_state["results"].as_array().map(Vec::len), Some(2));
+}
+
+#[test]
+fn knowledge_search_excludes_hashtag_only_statements() {
+    let env = TestEnv::new("knowledge-search-hashtag-only");
+    let capture_id = create_text_capture_with_content(&env, "source.txt", "Preuve locale.\n");
+    let capture = inspect_agent_capture(&env, &capture_id);
+    let reference = artifact_reference(&capture_id, &capture, "proof-source");
+    publish_knowledge_card(
+        &env,
+        &capture_id,
+        &[
+            knowledge_statement(
+                "hashtags",
+                "attributed-declaration",
+                "La Source indique : #agent #claude",
+                &reference,
+            ),
+            knowledge_statement(
+                "content",
+                "attributed-declaration",
+                "La Source indique : Un agent doit être évalué avant livraison.",
+                &reference,
+            ),
+        ],
+    );
+    let found: Value = serde_json::from_slice(
+        &env.command()
+            .args(["knowledge", "search", "agent"])
+            .assert()
+            .success()
+            .get_output()
+            .stdout,
+    )
+    .expect("résultat de recherche JSON valide");
+    let results = found["results"]
+        .as_array()
+        .expect("résultats de connaissance");
+    assert_eq!(results.len(), 1);
+    assert_eq!(results[0]["statement_id"], "content");
 }
 
 #[test]
