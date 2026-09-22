@@ -1366,7 +1366,12 @@ fn run_knowledge_batch(job: &Job) -> Result<()> {
             return Ok(());
         };
         item.capture_id.clone_from(&capture_job.capture_id);
-        if capture_job.state != "succeeded" {
+        let capture_is_usable = match capture_job.state.as_str() {
+            "succeeded" => true,
+            "partial" => capture_has_usable_caption(capture_job.capture_id.as_deref())?,
+            _ => false,
+        };
+        if !capture_is_usable {
             partial = true;
             item.error = Some(batch_child_error(
                 &capture_job,
@@ -1449,6 +1454,18 @@ fn run_knowledge_batch(job: &Job) -> Result<()> {
         append_batch_item(&job.id, item)?;
     }
     complete_knowledge_batch_job(&job.id, partial)
+}
+
+fn capture_has_usable_caption(capture_id: Option<&str>) -> Result<bool> {
+    let Some(capture_id) = capture_id else {
+        return Ok(false);
+    };
+    let manifest: Manifest = read_json(&captures_dir()?.join(capture_id).join("manifest.json"))?;
+    Ok(manifest.extractions.iter().any(|extraction| {
+        extraction.artifact_id == "extraction-caption"
+            && extraction.mime == "text/plain"
+            && extraction.size_bytes > 0
+    }))
 }
 
 fn admit_batch_source(source: &str, policy: &Policy) -> Result<String> {
