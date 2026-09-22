@@ -1056,7 +1056,7 @@ fn cli_reports_its_package_version() {
         .arg("--version")
         .assert()
         .success()
-        .stdout("scriptor 0.3.0-alpha.5\n")
+        .stdout("scriptor 0.3.0-alpha.6\n")
         .stderr(predicate::str::is_empty());
 }
 
