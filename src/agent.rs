@@ -46,7 +46,7 @@ const DEFAULT_PAGE_LIMIT: usize = 20;
 const MAX_PAGE_LIMIT: usize = 100;
 const SEARCH_MAX_CANDIDATES: usize = 500;
 const SEARCH_INDEX_VERSION: u8 = 4;
-const KNOWLEDGE_INDEX_VERSION: u8 = 1;
+const KNOWLEDGE_INDEX_VERSION: u8 = 2;
 const KNOWLEDGE_ANALYZER_VERSION: &str = "knowledge_v1";
 const KNOWLEDGE_PHRASE_BOOST: f32 = 2.0;
 const LOCAL_DERIVE_PROVIDER: &str = "scriptor-local-derive";
@@ -4573,18 +4573,25 @@ fn active_knowledge_cards(mut records: Vec<KnowledgeCardRecord>) -> Vec<Knowledg
 }
 
 fn knowledge_supersession_key(manifest: &Manifest) -> Result<String> {
-    let source_identity = manifest
-        .remote_provenance
-        .as_ref()
-        .and_then(|remote| {
-            remote
-                .platform
-                .as_ref()
-                .zip(remote.post_id.as_ref())
-                .map(|(platform, post_id)| format!("social:{platform}:{post_id}"))
-        })
+    let social_source = manifest.remote_provenance.as_ref().and_then(|remote| {
+        remote
+            .platform
+            .as_ref()
+            .zip(remote.post_id.as_ref())
+            .map(|(platform, post_id)| format!("social:{platform}:{post_id}"))
+    });
+    let source_identity = social_source
+        .clone()
         .unwrap_or_else(|| format!("source:{}", manifest.source.sha256));
-    let mut proof_hashes = vec![manifest.proof.sha256.clone()];
+    let mut proof_hashes = if social_source.is_some() {
+        manifest
+            .extractions
+            .iter()
+            .map(|extraction| extraction.sha256.clone())
+            .collect()
+    } else {
+        vec![manifest.proof.sha256.clone()]
+    };
     proof_hashes.extend(manifest.artifacts.iter().map(|proof| proof.sha256.clone()));
     proof_hashes.sort_unstable();
     let observed_state = sha256_bytes(
@@ -4631,6 +4638,9 @@ fn write_knowledge_index(records: &[KnowledgeCardRecord]) -> Result<()> {
             let reference_json = serde_json::to_string(&record.derivative.reference)
                 .context("serializing knowledge Card Reference")?;
             for statement in &record.statements {
+                if is_metadata_only_statement(&statement.text) {
+                    continue;
+                }
                 let text_tokens = knowledge_tokens(&statement.text);
                 if text_tokens.is_empty() {
                     continue;
@@ -4684,6 +4694,29 @@ fn write_knowledge_index(records: &[KnowledgeCardRecord]) -> Result<()> {
         drop(fs::remove_dir_all(&temporary));
     }
     result
+}
+
+fn is_metadata_only_statement(text: &str) -> bool {
+    let text = text
+        .strip_prefix("La Source indique :")
+        .unwrap_or(text)
+        .trim();
+    let mut has_marker = false;
+    let mut has_token = false;
+    for token in text.split_whitespace() {
+        let token = token.trim_matches(|character: char| {
+            !character.is_alphanumeric() && character != '#' && character != '@'
+        });
+        if token.is_empty() {
+            continue;
+        }
+        has_token = true;
+        if !token.starts_with(['#', '@']) {
+            return false;
+        }
+        has_marker = true;
+    }
+    has_token && has_marker
 }
 
 fn register_knowledge_analyzer(index: &Index) {
