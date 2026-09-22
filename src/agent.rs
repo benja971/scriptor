@@ -925,6 +925,7 @@ fn run_knowledge_batch_command(command: KnowledgeBatchCommand) -> Result<()> {
     let mut seen = HashSet::new();
     let sources = sources
         .into_iter()
+        .map(canonical_batch_source)
         .filter(|source| seen.insert(source.clone()))
         .collect();
     create_job(
@@ -937,6 +938,41 @@ fn run_knowledge_batch_command(command: KnowledgeBatchCommand) -> Result<()> {
         },
         None,
     )
+}
+
+fn canonical_batch_source(source: String) -> String {
+    let Ok(mut url) = Url::parse(&source) else {
+        return source;
+    };
+    if !matches!(url.scheme(), "http" | "https")
+        || !url.username().is_empty()
+        || url.password().is_some()
+        || url.port().is_some()
+        || !matches!(url.host_str(), Some("instagram.com" | "www.instagram.com"))
+    {
+        return source;
+    }
+    let Some(segments) = url.path_segments().map(Iterator::collect::<Vec<_>>) else {
+        return source;
+    };
+    let canonical_path = match segments.as_slice() {
+        [kind @ ("p" | "reel" | "tv"), post_id, ""]
+        | [kind @ ("p" | "reel" | "tv"), post_id]
+        | [_, kind @ ("p" | "reel" | "tv"), post_id, ""]
+        | [_, kind @ ("p" | "reel" | "tv"), post_id]
+            if !post_id.is_empty() =>
+        {
+            format!("/{kind}/{post_id}/")
+        }
+        _ => return source,
+    };
+    if url.set_host(Some("www.instagram.com")).is_err() {
+        return source;
+    }
+    url.set_path(&canonical_path);
+    url.set_query(None);
+    url.set_fragment(None);
+    url.to_string()
 }
 
 fn read_batch_sources(path: &Path) -> Result<Vec<String>> {
